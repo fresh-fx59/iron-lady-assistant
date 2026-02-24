@@ -173,7 +173,7 @@ async def handle_message(message: Message) -> None:
                     break
 
                 match event.event_type:
-                    case bridge.StreamEventType.TOOL_START | bridge.StreamEventType.TOOL_INPUT:
+                    case bridge.StreamEventType.TOOL_USE:
                         if event.tool_name:
                             await progress.report_tool(event.tool_name, event.tool_input)
                     case bridge.StreamEventType.RESULT:

@@ -1,6 +1,7 @@
 import asyncio
 import json
 import logging
+import os
 import re
 import time
 from dataclasses import dataclass
@@ -14,9 +15,7 @@ logger = logging.getLogger(__name__)
 
 class StreamEventType(Enum):
     """Types of events that can be streamed from Claude."""
-    TOOL_START = "tool_start"
-    TOOL_INPUT = "tool_input"
-    TEXT_DELTA = "text_delta"
+    TOOL_USE = "tool_use"
     RESULT = "result"
     ERROR = "error"
 
@@ -27,7 +26,6 @@ class StreamEvent:
     event_type: StreamEventType
     tool_name: str | None = None
     tool_input: str | None = None
-    text: str | None = None
     response: "ClaudeResponse | None" = None
 
 
@@ -43,57 +41,73 @@ class ClaudeResponse:
     idle_timeout: bool = False
 
 
-def _try_extract_tool_input(tool_name: str, partial_json: str) -> str | None:
-    """Try to extract a meaningful tool input from partial JSON.
+def _extract_tool_input(tool_name: str, input_data: dict) -> str | None:
+    """Extract the primary argument from a tool's complete input dict."""
+    tool = tool_name.lower()
+    match tool:
+        case "bash":
+            cmd = input_data.get("command", "")
+            return (cmd[:80] + "...") if len(cmd) > 80 else cmd
+        case "read" | "edit" | "write":
+            return input_data.get("file_path")
+        case "grep" | "glob":
+            return input_data.get("pattern")
+        case "task" | "askuserquestion":
+            desc = input_data.get("description", "")
+            return (desc[:60] + "...") if len(desc) > 60 else desc
+        case _:
+            if input_data:
+                s = json.dumps(input_data, separators=(",", ":"))
+                return (s[:80] + "...") if len(s) > 80 else s
+            return None
 
-    For different tools, we try to extract the primary argument:
-    - Bash: command
-    - Read/Edit/Write: file_path
-    - Grep: pattern
-    - Glob: pattern
-    - Task, AskUserQuestion: description
+
+def _extract_tool_input_partial(tool_name: str, partial_json: str) -> str | None:
+    """Try to extract a meaningful tool input from partial/accumulating JSON.
+
+    Called during streaming as input_json_delta chunks arrive. Attempts JSON
+    parse first, then falls back to regex extraction from the partial string.
     """
-    tool_name = tool_name.lower()
+    tool = tool_name.lower()
 
-    # Try to parse as JSON and extract the relevant field
+    # Try full JSON parse (works once enough has accumulated)
     try:
         data = json.loads(partial_json)
-        match tool_name:
-            case "bash":
-                return data.get("command")
-            case "read" | "edit" | "write":
-                return data.get("file_path")
-            case "grep" | "glob":
-                return data.get("pattern")
-            case "task" | "askuserquestion":
-                return data.get("description")
-            case _:
-                # For other tools, return the whole json compactly
-                return json.dumps(data, separators=(",", ":"))
+        return _extract_tool_input(tool_name, data)
     except json.JSONDecodeError:
         pass
 
-    # Fallback: use regex to extract the most common fields
-    match tool_name:
-        case "bash":
-            m = re.search(r'"command"\s*:\s*"([^"]+)', partial_json)
-            if m:
-                return m.group(1)[:50] + "..." if len(m.group(1)) > 50 else m.group(1)
-        case "read" | "edit" | "write":
-            m = re.search(r'"file_path"\s*:\s*"([^"]+)', partial_json)
-            if m:
-                return m.group(1)
-        case "grep" | "glob":
-            m = re.search(r'"pattern"\s*:\s*"([^"]+)', partial_json)
-            if m:
-                return m.group(1)[:40] + "..." if len(m.group(1)) > 40 else m.group(1)
-        case "task" | "askuserquestion":
-            m = re.search(r'"description"\s*:\s*"([^"]+)', partial_json)
-            if m:
-                return m.group(1)[:40] + "..." if len(m.group(1)) > 40 else m.group(1)
+    # Regex fallback for partial JSON
+    _FIELD_MAP = {
+        "bash": ("command", 80),
+        "read": ("file_path", 200),
+        "edit": ("file_path", 200),
+        "write": ("file_path", 200),
+        "grep": ("pattern", 60),
+        "glob": ("pattern", 60),
+        "task": ("description", 60),
+        "askuserquestion": ("description", 60),
+    }
+    entry = _FIELD_MAP.get(tool)
+    if entry:
+        field, max_len = entry
+        m = re.search(rf'"{field}"\s*:\s*"([^"]+)', partial_json)
+        if m:
+            val = m.group(1)
+            return (val[:max_len] + "...") if len(val) > max_len else val
 
-    # If we can't extract anything meaningful, return None
     return None
+
+
+def _subprocess_env() -> dict[str, str]:
+    """Build a clean env for the claude subprocess.
+
+    Strips CLAUDECODE to prevent the nested-session guard from blocking
+    the child process when the bot itself is launched from inside Claude Code.
+    """
+    env = os.environ.copy()
+    env.pop("CLAUDECODE", None)
+    return env
 
 
 async def stream_message(
@@ -105,22 +119,29 @@ async def stream_message(
 ) -> AsyncGenerator[StreamEvent, None]:
     """Stream Claude's response as events with idle timeout.
 
-    Yields StreamEvent objects as they occur during processing.
-    The idle timeout only triggers when Claude stops producing output.
+    Uses ``--output-format stream-json --verbose --include-partial-messages``
+    to get real-time tool activity.  Each stdout line is a JSON object whose
+    ``type`` field determines the payload:
 
-    Args:
-        prompt: The message to send to Claude
-        session_id: Optional session ID for conversation continuity
-        model: Model to use (sonnet/opus/haiku)
-        working_dir: Working directory for file operations
-        process_handle: Optional dict to store the process handle for cancellation.
-                       Will be populated with {"proc": proc} if provided.
+      - ``stream_event`` — wraps a raw Anthropic API streaming event in
+        ``.event`` (content_block_start, content_block_delta, …).  These
+        arrive in real-time while Claude is generating.
+      - ``assistant`` — a complete assistant message with all content blocks
+        (text and/or tool_use).  Arrives after the API call for a turn ends.
+      - ``user`` — tool results fed back to Claude (skipped).
+      - ``system`` — session init (skipped).
+      - ``result`` — final result with cost / session_id / duration.
+
+    We emit ``TOOL_USE`` events from **both** ``stream_event`` (real-time)
+    and ``assistant`` (fallback).  The :class:`ProgressReporter` deduplicates.
     """
     cmd = [
         "claude",
         "-p",
         prompt,
-        "--output-format", "json",
+        "--output-format", "stream-json",
+        "--verbose",
+        "--include-partial-messages",
         "--model", model,
         "--dangerously-skip-permissions",
     ]
@@ -130,14 +151,19 @@ async def stream_message(
     logger.info("Running: %s", " ".join(cmd[:6]) + " ...")
 
     start = time.monotonic()
+    # Track the tool currently being streamed via stream_event deltas
     current_tool: str | None = None
-    accumulated_input_json: str = ""
+    accumulated_input: str = ""
+    # Set of tools already reported via stream_event so assistant fallback
+    # can skip them to avoid double-reporting with stale input text.
+    reported_tools: set[str] = set()
 
     proc = await asyncio.create_subprocess_exec(
         *cmd,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
         cwd=working_dir,
+        env=_subprocess_env(),
     )
 
     if process_handle is not None:
@@ -151,7 +177,6 @@ async def stream_message(
                     timeout=config.IDLE_TIMEOUT
                 )
             except asyncio.TimeoutError:
-                # Idle timeout - kill the process
                 logger.warning("Claude process idle timeout (%d s)", config.IDLE_TIMEOUT)
                 proc.kill()
                 await proc.wait()
@@ -183,41 +208,63 @@ async def stream_message(
                 data = json.loads(line_str)
                 event_type = data.get("type")
 
-                if event_type == "content_block_start":
-                    # A tool is being started
-                    block = data.get("content_block", {})
-                    if block.get("type") == "tool_use":
-                        tool_name = block.get("name")
-                        current_tool = tool_name
-                        accumulated_input_json = ""
-                        yield StreamEvent(
-                            event_type=StreamEventType.TOOL_START,
-                            tool_name=tool_name,
-                        )
+                # ── Real-time API streaming events ──────────────
+                if event_type == "stream_event":
+                    inner = data.get("event", {})
+                    inner_type = inner.get("type")
 
-                elif event_type == "content_block_delta":
-                    # Tool input is being streamed
-                    if current_tool:
-                        delta = data.get("delta", {})
-                        if "input_json_delta" in delta:
-                            accumulated_input_json += delta["input_json_delta"]
-                            # Try to extract meaningful input
-                            tool_input = _try_extract_tool_input(current_tool, accumulated_input_json)
+                    if inner_type == "content_block_start":
+                        block = inner.get("content_block", {})
+                        if block.get("type") == "tool_use":
+                            current_tool = block.get("name", "")
+                            accumulated_input = ""
+                            yield StreamEvent(
+                                event_type=StreamEventType.TOOL_USE,
+                                tool_name=current_tool,
+                            )
+
+                    elif inner_type == "content_block_delta":
+                        delta = inner.get("delta", {})
+                        if current_tool and delta.get("type") == "input_json_delta":
+                            accumulated_input += delta.get("partial_json", "")
+                            tool_input = _extract_tool_input_partial(
+                                current_tool, accumulated_input
+                            )
                             if tool_input:
+                                reported_tools.add(current_tool)
                                 yield StreamEvent(
-                                    event_type=StreamEventType.TOOL_INPUT,
+                                    event_type=StreamEventType.TOOL_USE,
                                     tool_name=current_tool,
                                     tool_input=tool_input,
                                 )
-                        elif "text" in delta:
-                            # Regular text delta
-                            yield StreamEvent(
-                                event_type=StreamEventType.TEXT_DELTA,
-                                text=delta["text"],
-                            )
 
+                    elif inner_type == "content_block_stop":
+                        current_tool = None
+                        accumulated_input = ""
+
+                # ── Complete assistant message (fallback) ───────
+                elif event_type == "assistant":
+                    message = data.get("message", {})
+                    for block in message.get("content", []):
+                        if block.get("type") == "tool_use":
+                            tool_name = block.get("name", "")
+                            # Skip if we already reported this tool via
+                            # stream_event with a parsed input.
+                            if tool_name in reported_tools:
+                                continue
+                            tool_input = _extract_tool_input(
+                                tool_name, block.get("input", {})
+                            )
+                            yield StreamEvent(
+                                event_type=StreamEventType.TOOL_USE,
+                                tool_name=tool_name,
+                                tool_input=tool_input,
+                            )
+                    # Reset for next turn
+                    reported_tools.clear()
+
+                # ── Final result ────────────────────────────────
                 elif event_type == "result":
-                    # Final result
                     result_text = data.get("result", "")
                     is_error = bool(data.get("is_error"))
                     cost_usd = float(data.get("total_cost_usd", 0))
@@ -226,7 +273,6 @@ async def stream_message(
                     if is_error:
                         result_text = result_text or "Claude returned an error."
 
-                    # Record metrics
                     status = "error" if is_error else "success"
                     metrics.CLAUDE_REQUESTS_TOTAL.labels(model=model, status=status).inc()
                     elapsed = time.monotonic() - start
@@ -248,6 +294,8 @@ async def stream_message(
                         )
                     )
                     return
+
+                # Skip "system", "user", etc.
 
             except json.JSONDecodeError:
                 logger.warning("Failed to parse stream line: %s", line_str[:100])

@@ -1,13 +1,13 @@
 # Claude Code as Telegram Assistant
 
-**Current version: `0.7.0`** — defined in `src/config.py` as `VERSION`.
+**Current version: `0.8.0`** — defined in `src/config.py` as `VERSION`.
 
 Telegram bot that bridges messages to Claude Code's `--print` mode via subprocess, providing a conversational AI assistant through Telegram.
 
 ## Architecture
 
 - **aiogram 3.x** async Telegram bot with long-polling
-- **asyncio subprocess** runs `claude -p` per message with `--output-format stream-json` and `--dangerously-skip-permissions`
+- **asyncio subprocess** runs `claude -p` per message with `--output-format stream-json --verbose --include-partial-messages` and `--dangerously-skip-permissions`
 - **`--resume <session_id>`** for conversation continuity
 - **Streaming output** with idle timeout (default 120s) — kills process only when Claude stops producing output
 - **Live progress updates** show current Claude activity (Reading, Editing, Running commands, etc.)
@@ -20,7 +20,7 @@ src/
 ├── main.py       # Entry point, dispatcher setup, polling, metrics server
 ├── config.py     # Env vars: BOT_TOKEN, ALLOWED_USER_IDS, DEFAULT_MODEL, IDLE_TIMEOUT, PROGRESS_DEBOUNCE_SECONDS
 ├── bot.py        # Telegram handlers: /start, /new, /model, /status, /cancel, messages
-├── bridge.py     # Runs `claude -p` subprocess, yields stream events (TOOL_START, TOOL_INPUT, RESULT)
+├── bridge.py     # Runs `claude -p` subprocess, yields stream events (TOOL_USE, RESULT)
 ├── progress.py   # ProgressReporter: manages live progress message with debounced edits
 ├── sessions.py   # Maps chat_id → claude session_id, persists to sessions.json
 ├── formatter.py  # Markdown→HTML conversion, message splitting
@@ -114,3 +114,25 @@ Rules:
 2. **Update the version** in this file's header to match
 3. Use **semver**: bump patch for fixes, minor for features, major for breaking changes
 4. The commit message format is: `v<version>: <description>`
+
+## Streaming Format (stream-json)
+
+The CLI flags `--output-format stream-json --verbose --include-partial-messages` produce newline-delimited JSON on stdout. Each line has a `type` field:
+
+| `type` | Description | Relevant fields |
+|--------|-------------|-----------------|
+| `system` | Session init | Skipped |
+| `stream_event` | Real-time API streaming event (wraps Anthropic SSE) | `.event.type`, `.event.content_block`, `.event.delta` |
+| `assistant` | Complete assistant message after a turn | `.message.content[]` (text/tool_use blocks) |
+| `user` | Tool results fed back to Claude | Skipped |
+| `result` | Final output with metadata | `.result`, `.session_id`, `.is_error`, `.total_cost_usd`, `.num_turns`, `.duration_ms` |
+
+### stream_event inner types used for progress
+
+- `content_block_start` → `.content_block.type == "tool_use"` → tool name in `.content_block.name`
+- `content_block_delta` → `.delta.type == "input_json_delta"` → partial JSON in `.delta.partial_json`
+- `content_block_stop` → signals end of a content block
+
+### Subprocess env
+
+The `CLAUDECODE` env var is stripped from the child process to bypass the nested-session guard when developing inside Claude Code.

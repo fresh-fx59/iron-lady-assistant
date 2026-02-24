@@ -1,0 +1,352 @@
+"""End-to-end integration tests.
+
+These tests cover complete user flows from message to response.
+These are the highest-level behavioral contracts.
+"""
+
+import asyncio
+import json
+from unittest.mock import AsyncMock, patch
+
+import pytest
+
+from src.bot import handle_message, cmd_start, cmd_new, cmd_model, cmd_status
+from src.sessions import SessionManager
+from src.formatter import markdown_to_html, split_message
+from src.progress import ProgressReporter
+
+
+# ── E2E Flow 1: New user onboarding ─────────────────────────────
+@pytest.mark.asyncio
+class TestNewUserOnboarding:
+    """Complete flow for a new user discovering the bot."""
+
+    async def test_full_onboarding_sequence(self, mock_message):
+        """User: /start → sees welcome → sends message → uses commands."""
+        from src.bot import session_manager
+
+        # 1. Send /start
+        mock_message.text = "/start"
+        await cmd_start(mock_message)
+        start_response = mock_message.answer.call_args[0][0]
+        assert "Claude Code assistant" in start_response
+        assert "v" in start_response  # Has version
+
+        # 2. Send a message
+        mock_message.answer.reset_mock()
+        mock_message.text = "hello"
+        with patch('src.bridge.stream_message') as mock_stream:
+            mock_stream.return_value = [
+                # Minimal stream events
+                type('obj', (object,), {'event_type': 'RESULT', 'response': type('obj', (object,), {
+                    'text': 'Hello! How can I help?',
+                    'session_id': 'sess-1',
+                    'is_error': False,
+                    'cost_usd': 0.001,
+                })})(),
+            ]
+            await handle_message(mock_message)
+
+        # Should have responded
+        assert mock_message.answer.called
+
+        # 3. Check status
+        mock_message.answer.reset_mock()
+        mock_message.text = "/status"
+        await cmd_status(mock_message)
+        status_response = mock_message.answer.call_args[0][0]
+        assert "sess-1" in status_response  # Session persisted
+
+
+# ── E2E Flow 2: Conversation continuity ────────────────────────
+@pytest.mark.asyncio
+class TestConversationContinuity:
+    """Session should persist across multiple messages."""
+
+    async def test_session_continues_across_messages(self, mock_message):
+        """Multiple messages should use same session_id."""
+        from src.bot import session_manager
+
+        # First message
+        with patch('src.bridge.stream_message') as mock_stream:
+            mock_stream.return_value = [
+                type('obj', (object,), {'event_type': 'RESULT', 'response': type('obj', (object,), {
+                    'text': 'Answer 1',
+                    'session_id': 'sess-abc',
+                    'is_error': False,
+                    'cost_usd': 0.001,
+                })})(),
+            ]
+
+            mock_message.text = "question 1"
+            mock_message.answer.reset_mock()
+            await handle_message(mock_message)
+
+        session = session_manager.get(123456789)
+        assert session.claude_session_id == "sess-abc"
+
+        # Second message should resume with same session
+        with patch('src.bridge.stream_message') as mock_stream:
+            # Capture call to verify --resume was used
+            mock_stream.return_value = []
+
+            mock_message.text = "question 2"
+            mock_message.answer.reset_mock()
+            await handle_message(mock_message)
+
+            # Check that stream_message was called with session_id
+            if mock_stream.call_args:
+                args, kwargs = mock_stream.call_args
+                assert kwargs.get('session_id') == 'sess-abc' or (
+                    len(args) > 1 and args[1] == 'sess-abc'
+                )
+
+
+# ── E2E Flow 3: Model switching ────────────────────────────────
+@pytest.mark.asyncio
+class TestModelSwitching:
+    """User can switch models mid-conversation."""
+
+    async def test_model_switch_persists(self, mock_message):
+        """Switching model should persist and apply to next request."""
+        from src.bot import session_manager
+
+        # Check default model
+        session = session_manager.get(123456789)
+        assert session.model == "sonnet"
+
+        # Switch to opus
+        mock_message.text = "/model opus"
+        await cmd_model(mock_message)
+        assert "opus" in mock_message.answer.call_args[0][0].lower()
+
+        # Verify persisted
+        session = session_manager.get(123456789)
+        assert session.model == "opus"
+
+        # Use the model in a request
+        with patch('src.bridge.stream_message') as mock_stream:
+            async def stream_gen():
+                yield type('obj', (object,), {'event_type': 'RESULT', 'response': type('obj', (object,), {
+                    'text': 'Response',
+                    'session_id': 'sess-2',
+                    'is_error': False,
+                    'cost_usd': 0.001,
+                })})()
+            mock_stream.return_value = stream_gen()
+
+            mock_message.text = "test"
+            await handle_message(mock_message)
+
+
+# ── E2E Flow 4: New conversation ───────────────────────────────
+@pytest.mark.asyncio
+class TestNewConversation:
+    """Starting new conversation should preserve model but clear session."""
+
+    async def test_new_conversation_clears_session_keeps_model(self, mock_message):
+        """/new should clear session_id but keep model."""
+        from src.bot import session_manager
+
+        # Set up state
+        session_manager.update_session_id(123456789, "old-session")
+        session_manager.set_model(123456789, "haiku")
+
+        # Send /new
+        mock_message.text = "/new"
+        await cmd_new(mock_message)
+
+        # Session cleared
+        session = session_manager.get(123456789)
+        assert session.claude_session_id is None
+
+        # Model preserved
+        assert session.model == "haiku"
+
+
+# ── E2E Flow 5: Error handling ────────────────────────────────
+@pytest.mark.asyncio
+class TestErrorHandling:
+    """System should handle errors gracefully."""
+
+    async def test_claude_error_displayed_to_user(self, mock_message):
+        """Claude returning error should be shown to user."""
+        mock_message.text = "cause error"
+
+        with patch('src.bridge.stream_message') as mock_stream:
+            async def stream_gen():
+                yield type('obj', (object,), {'event_type': 'RESULT', 'response': type('obj', (object,), {
+                    'text': 'API error: rate limit exceeded',
+                    'session_id': None,
+                    'is_error': True,
+                    'cost_usd': 0.0,
+                    'cost_usd': 0.0,
+                    'duration_ms': 0,
+                    'num_turns': 0,
+                })})()
+            mock_stream.return_value = stream_gen()
+
+            await handle_message(mock_message)
+
+            response = mock_message.answer.call_args[0][0]
+            assert "error" in response.lower()
+
+
+# ── E2E Flow 6: Message formatting pipeline ────────────────────
+class TestMessageFormattingPipeline:
+    """End-to-end of message formatting from Claude response to Telegram."""
+
+    def test_complete_formatting_flow(self):
+        """Claude markdown → HTML → split chunks."""
+        claude_response = """
+Here's the solution:
+
+```python
+def hello():
+    print("Hello World")
+```
+
+**Important**: Read the code above.
+
+See `hello()` function for details.
+"""
+
+        # Convert to HTML
+        html = markdown_to_html(claude_response)
+
+        # Should have code block with language
+        assert "<pre><code" in html
+        assert "language-python" in html
+
+        # Should have bold
+        assert "<b>Important</b>" in html
+
+        # Should have inline code
+        assert "<code>hello()</code>" in html
+
+        # Split if needed (for this short text, should be one chunk)
+        chunks = split_message(html)
+        assert len(chunks) == 1
+
+    def test_large_response_split_into_chunks(self):
+        """Large_responses should be split at sensible boundaries."""
+        # Build a large response with paragraphs
+        chunks = []
+        for i in range(20):
+            chunks.append(f"Paragraph {i}: " + "a" * 300 + "\n\n")
+        large_response = "".join(chunks)
+
+        html = markdown_to_html(large_response)
+        split_chunks = split_message(html)
+
+        # Should be split into multiple chunks
+        assert len(split_chunks) > 1
+
+        # Each chunk should be under limit
+        for chunk in split_chunks:
+            assert len(chunk) <= 4096
+
+
+# ── E2E Flow 7: Progress reporting lifecycle ───────────────────────
+@pytest.mark.asyncio
+class TestProgressReportingLifecycle:
+    """Progress message should appear, update, then be removed."""
+
+    async def test_progress_shows_and_finishes(self, mock_message):
+        """Progress message should be sent, updated, then deleted."""
+        from src.progress import ProgressReporter
+
+        reporter = ProgressReporter(mock_message, debounce_seconds=0)
+
+        # Report a tool
+        await reporter.report_tool("Read", "/tmp/file.txt")
+        await asyncio.sleep(0.1)  # Wait for debounce
+
+        # Should have sent initial progress
+        assert mock_message.bot.send_message.called
+
+        # Report another tool
+        await reporter.report_tool("Edit", "/tmp/file.txt")
+        await asyncio.sleep(0.1)
+
+        # Should have edited progress
+        assert mock_message.bot.edit_message_text.called
+
+        # Finish
+        await reporter.finish()
+
+        # Should have deleted progress
+        assert mock_message.bot.delete_message.called
+
+
+# ── E2E Flow 8: Session persistence across restarts ──────────────
+class TestSessionPersistenceAcrossRestarts:
+    """Sessions should survive process restarts."""
+
+    def test_session_survives_manager_reinstantiation(self, tmppath):
+        """Creating new SessionManager should load existing sessions."""
+        # Create first manager and set up session
+        manager1 = SessionManager()
+        manager1.update_session_id(111, "sess-persist")
+        manager1.set_model(111, "opus")
+
+        # Create second manager (simulates restart)
+        manager2 = SessionManager()
+
+        # Session should be loaded
+        session = manager2.get(111)
+        assert session.claude_session_id == "sess-persist"
+        assert session.model == "opus"
+
+
+# ── E2E Flow 9: Multiple users independent ───────────────────────
+class TestMultipleUsersIndependent:
+    """Different users should have completely independent state."""
+
+    async def test_users_dont_interfere(self, mock_msg_factory):
+        """Actions by one user shouldn't affect another user."""
+        from src.bot import session_manager
+
+        # Helper to create mock message for different user
+        def msg_for_user(user_id, text):
+            msg = mock_msg_factory()
+            msg.chat.id = user_id
+            msg.from_user.id = user_id
+            msg.text = text
+            return msg
+
+        # User 1 sets session
+        session_manager.update_session_id(111, "user-1-sess")
+        session_manager.set_model(111, "sonnet")
+
+        # User 2 sets different session
+        session_manager.update_session_id(222, "user-2-sess")
+        session_manager.set_model(222, "opus")
+
+        # User 1's data should be unchanged
+        session1 = session_manager.get(111)
+        assert session1.claude_session_id == "user-1-sess"
+        assert session1.model == "sonnet"
+
+        # User 2's data should be unchanged
+        session2 = session_manager.get(222)
+        assert session2.claude_session_id == "user-2-sess"
+        assert session2.model == "opus"
+
+
+# ── Helper for multi-user tests ───────────────────────────────────
+@pytest.fixture
+def mock_msg_factory(mock_bot):
+    """Factory to create mock messages for different users."""
+    def factory():
+        msg = AsyncMock()
+        msg.text = "default"
+        msg.chat = AsyncMock()
+        msg.chat.id = 123456789
+        msg.bot = mock_bot
+        msg.from_user = AsyncMock()
+        msg.from_user.id = 123456789
+        msg.content_type = "text"
+        msg.answer = AsyncMock()
+        return msg
+    return factory

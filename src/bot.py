@@ -153,7 +153,7 @@ async def _keep_typing(message: Message) -> None:
     """Send typing indicator every 5 seconds."""
     try:
         while True:
-            await message.answer_chat_action(ChatAction.TYPING)
+            await message.bot.send_chat_action(chat_id=message.chat.id, action=ChatAction.TYPING)
             await asyncio.sleep(5)
     except asyncio.CancelledError:
         return

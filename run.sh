@@ -4,11 +4,11 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 
-# Activate venv if it exists
-if [ -d "venv" ]; then
-    source venv/bin/activate
-elif [ -d ".venv" ]; then
-    source .venv/bin/activate
+# Create venv and install deps if missing
+if [ ! -d "venv" ]; then
+    python3 -m venv venv
+    venv/bin/pip install --quiet -r requirements.txt
 fi
 
+source venv/bin/activate
 exec python3 -m src.main

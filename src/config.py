@@ -12,6 +12,11 @@ ALLOWED_USER_IDS: set[int] = {
 }
 
 DEFAULT_MODEL: str = os.getenv("DEFAULT_MODEL", "sonnet")
-CLAUDE_WORKING_DIR: str | None = os.getenv("CLAUDE_WORKING_DIR") or None
+_raw_working_dir = os.getenv("CLAUDE_WORKING_DIR") or None
+CLAUDE_WORKING_DIR: str | None = (
+    os.path.expanduser(_raw_working_dir) if _raw_working_dir else None
+)
+if CLAUDE_WORKING_DIR:
+    os.makedirs(CLAUDE_WORKING_DIR, exist_ok=True)
 MAX_RESPONSE_TIMEOUT: int = int(os.getenv("MAX_RESPONSE_TIMEOUT", "300"))
 METRICS_PORT: int = int(os.getenv("METRICS_PORT", "9101"))

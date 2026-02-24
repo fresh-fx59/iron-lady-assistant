@@ -43,17 +43,24 @@ src/
 
 ## Deployment (systemd)
 
-```bash
-# Create venv and install dependencies
-python3 -m venv venv
-venv/bin/pip install -r requirements.txt
+`run.sh` auto-creates the venv and installs dependencies if missing — fully hands-off on boot. The systemd service has:
+- `Restart=always` + `RestartSec=5` — auto-restarts on crash
+- `WantedBy=multi-user.target` — starts on boot
+- `After=network-online.target` — waits for network
 
-# Copy and enable the service
+One-time setup:
+
+```bash
 sudo cp telegram-bot.service /etc/systemd/system/
 sudo systemctl daemon-reload
 sudo systemctl enable --now telegram-bot.service
+```
 
-# Check status
+After that, it starts automatically on every boot and restarts on failure with no interaction needed.
+
+Useful commands:
+
+```bash
 sudo systemctl status telegram-bot.service
 journalctl -u telegram-bot.service -f
 ```

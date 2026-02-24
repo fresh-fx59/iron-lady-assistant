@@ -19,6 +19,13 @@
       "env": {
         "ANTHROPIC_BASE_URL": "http://0.0.0.0:4000",
         "ANTHROPIC_AUTH_TOKEN": "any-placeholder-value"
+     },
+     {
+      "name": "glm4.7-flash-lm-studio",
+      "description": "GLM-4.7 Flash MLX (LM Studio :1235)",
+      "env": {
+        "ANTHROPIC_BASE_URL": "http://0.0.0.0:1235",
+        "ANTHROPIC_AUTH_TOKEN": "any-placeholder-value"
       }
     }
   ],

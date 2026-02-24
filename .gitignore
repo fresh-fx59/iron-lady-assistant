@@ -10,3 +10,5 @@ sessions.json
 dist/
 build/
 .eggs/
+work-dir/
+resume-work.md

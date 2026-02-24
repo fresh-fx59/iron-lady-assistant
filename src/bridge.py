@@ -32,7 +32,7 @@ async def send_message(
         prompt,
         "--output-format", "json",
         "--model", model,
-        "--permission-mode", "dontAsk",
+        "--dangerously-skip-permissions",
     ]
     if session_id:
         cmd.extend(["--resume", session_id])

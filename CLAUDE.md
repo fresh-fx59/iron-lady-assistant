@@ -13,12 +13,13 @@ Telegram bot that bridges messages to Claude Code's `--print` mode via subproces
 
 ```
 src/
-├── main.py       # Entry point, dispatcher setup, polling
-├── config.py     # Env vars: BOT_TOKEN, ALLOWED_USER_IDS, DEFAULT_MODEL
+├── main.py       # Entry point, dispatcher setup, polling, metrics server start
+├── config.py     # Env vars: BOT_TOKEN, ALLOWED_USER_IDS, DEFAULT_MODEL, METRICS_PORT
 ├── bot.py        # Telegram handlers: /start, /new, /model, /status, messages
 ├── bridge.py     # Runs `claude -p` subprocess, parses JSON response
 ├── sessions.py   # Maps chat_id → claude session_id, persists to sessions.json
-└── formatter.py  # Markdown→HTML conversion, message splitting
+├── formatter.py  # Markdown→HTML conversion, message splitting
+└── metrics.py    # Prometheus metrics: counters, histograms, gauges
 ```
 
 ## Setup
@@ -34,3 +35,49 @@ src/
 - `/new` — Start fresh conversation
 - `/model [sonnet|opus|haiku]` — Switch model
 - `/status` — Show current session info
+
+## Deployment (systemd)
+
+```bash
+# Install dependencies
+pip install -r requirements.txt
+
+# Copy and enable the service
+sudo cp telegram-bot.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now telegram-bot.service
+
+# Check status
+sudo systemctl status telegram-bot.service
+journalctl -u telegram-bot.service -f
+```
+
+## Prometheus Monitoring
+
+The bot exposes metrics on port `9101` (configurable via `METRICS_PORT`).
+
+### Exposed Metrics
+
+| Metric | Type | Labels | Description |
+|--------|------|--------|-------------|
+| `telegrambot_messages_total` | Counter | `status` | Messages received (success/error/unauthorized/busy) |
+| `telegrambot_claude_requests_total` | Counter | `model`, `status` | Claude CLI invocations (success/error/timeout) |
+| `telegrambot_claude_response_duration_seconds` | Histogram | `model` | Claude response latency |
+| `telegrambot_claude_cost_usd_total` | Counter | `model` | Cumulative API cost in USD |
+| `telegrambot_claude_turns_total` | Counter | `model` | Cumulative agentic turns |
+| `telegrambot_active_sessions` | Gauge | — | Active chat sessions |
+| `process_*` | various | — | Python process metrics (auto-exported) |
+
+### Add to Prometheus
+
+Add a scrape job to your `prometheus.yml`:
+
+```yaml
+  - job_name: 'telegram_bot'
+    static_configs:
+      - targets: ['YOUR_SERVER_IP:9101']
+        labels:
+          alias: 'Telegram-Claude-Bot'
+```
+
+Then reload: `docker exec prometheus kill -HUP 1`

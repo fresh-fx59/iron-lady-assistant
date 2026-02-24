@@ -1,0 +1,22 @@
+[Unit]
+Description=Telegram Claude Code Bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=claude-developer
+WorkingDirectory=/home/claude-developer/claude-code-as-assistant
+ExecStart=/home/claude-developer/claude-code-as-assistant/run.sh
+Restart=always
+RestartSec=5
+EnvironmentFile=/home/claude-developer/claude-code-as-assistant/.env
+
+# Hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=/home/claude-developer
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

@@ -8,6 +8,7 @@ from aiogram.enums import ChatAction
 from . import bridge, config
 from .sessions import SessionManager
 from .formatter import markdown_to_html, split_message, strip_html
+from . import metrics
 
 logger = logging.getLogger(__name__)
 router = Router()
@@ -92,10 +93,12 @@ async def cmd_status(message: Message) -> None:
 @router.message(F.text)
 async def handle_message(message: Message) -> None:
     if not _is_authorized(message.from_user and message.from_user.id):
+        metrics.MESSAGES_TOTAL.labels(status="unauthorized").inc()
         return
 
     lock = _get_lock(message.chat.id)
     if lock.locked():
+        metrics.MESSAGES_TOTAL.labels(status="busy").inc()
         await message.answer("Still processing your previous message, please wait...")
         return
 
@@ -123,6 +126,10 @@ async def handle_message(message: Message) -> None:
         # Update session ID if we got one back
         if response.session_id and response.session_id != session.claude_session_id:
             session_manager.update_session_id(message.chat.id, response.session_id)
+
+        # Track metrics
+        status = "error" if response.is_error else "success"
+        metrics.MESSAGES_TOTAL.labels(status=status).inc()
 
         # Format and send response
         if response.is_error:

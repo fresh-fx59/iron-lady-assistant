@@ -1,7 +1,10 @@
 import asyncio
 import json
 import logging
+import time
 from dataclasses import dataclass
+
+from . import metrics
 
 logger = logging.getLogger(__name__)
 
@@ -36,6 +39,8 @@ async def send_message(
 
     logger.info("Running: %s", " ".join(cmd[:6]) + " ...")
 
+    start = time.monotonic()
+
     proc = await asyncio.create_subprocess_exec(
         *cmd,
         stdout=asyncio.subprocess.PIPE,
@@ -50,6 +55,9 @@ async def send_message(
     except asyncio.TimeoutError:
         proc.kill()
         await proc.wait()
+        elapsed = time.monotonic() - start
+        metrics.CLAUDE_REQUESTS_TOTAL.labels(model=model, status="timeout").inc()
+        metrics.CLAUDE_RESPONSE_DURATION.labels(model=model).observe(elapsed)
         return ClaudeResponse(
             text="Request timed out. Try a simpler question or start a /new conversation.",
             session_id=session_id,
@@ -59,6 +67,7 @@ async def send_message(
             num_turns=0,
         )
 
+    elapsed = time.monotonic() - start
     stdout_text = stdout.decode()
     stderr_text = stderr.decode()
 
@@ -67,6 +76,8 @@ async def send_message(
 
     if proc.returncode != 0 and not stdout_text.strip():
         error_msg = stderr_text.strip() or f"Claude exited with code {proc.returncode}"
+        metrics.CLAUDE_REQUESTS_TOTAL.labels(model=model, status="error").inc()
+        metrics.CLAUDE_RESPONSE_DURATION.labels(model=model).observe(elapsed)
         return ClaudeResponse(
             text=f"Error: {error_msg}",
             session_id=session_id,
@@ -79,7 +90,9 @@ async def send_message(
     try:
         data = json.loads(stdout_text)
     except json.JSONDecodeError:
-        # If JSON parsing fails but we have output, return it as plain text
+        status = "success" if stdout_text.strip() else "error"
+        metrics.CLAUDE_REQUESTS_TOTAL.labels(model=model, status=status).inc()
+        metrics.CLAUDE_RESPONSE_DURATION.labels(model=model).observe(elapsed)
         if stdout_text.strip():
             return ClaudeResponse(
                 text=stdout_text.strip(),
@@ -99,14 +112,27 @@ async def send_message(
         )
 
     result_text = data.get("result", "")
-    if data.get("is_error"):
+    is_error = bool(data.get("is_error"))
+    cost_usd = float(data.get("total_cost_usd", 0))
+    num_turns = int(data.get("num_turns", 0))
+
+    if is_error:
         result_text = result_text or "Claude returned an error."
+
+    # Record metrics
+    status = "error" if is_error else "success"
+    metrics.CLAUDE_REQUESTS_TOTAL.labels(model=model, status=status).inc()
+    metrics.CLAUDE_RESPONSE_DURATION.labels(model=model).observe(elapsed)
+    if cost_usd > 0:
+        metrics.CLAUDE_COST_USD.labels(model=model).inc(cost_usd)
+    if num_turns > 0:
+        metrics.CLAUDE_TURNS_TOTAL.labels(model=model).inc(num_turns)
 
     return ClaudeResponse(
         text=result_text,
         session_id=data.get("session_id", session_id),
-        is_error=bool(data.get("is_error")),
-        cost_usd=float(data.get("total_cost_usd", 0)),
+        is_error=is_error,
+        cost_usd=cost_usd,
         duration_ms=float(data.get("duration_ms", 0)),
-        num_turns=int(data.get("num_turns", 0)),
+        num_turns=num_turns,
     )

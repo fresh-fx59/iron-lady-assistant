@@ -1,6 +1,6 @@
 # Claude Code as Telegram Assistant
 
-**Current version: `0.9.2`** — defined in `src/config.py` as `VERSION`.
+**Current version: `0.9.3`** — defined in `src/config.py` as `VERSION`.
 
 Telegram bot that bridges messages to Claude Code's `--print` mode via subprocess, providing a conversational AI assistant through Telegram.
 
@@ -10,7 +10,7 @@ Telegram bot that bridges messages to Claude Code's `--print` mode via subproces
 - **asyncio subprocess** runs `claude -p` per message with `--output-format stream-json --verbose --include-partial-messages` and `--dangerously-skip-permissions`
 - **`--resume <session_id>`** for conversation continuity
 - **Streaming output** with idle timeout (default 120s) — checks if subprocess is still alive on timeout; only fails if process actually dies
-- **Live progress updates** show current Claude activity (Reading, Editing, Running commands, etc.)
+- **Live progress updates** show current Claude activity (Reading, Editing, Running commands, etc.) with heartbeat animation for long-running tasks
 - **Per-chat state** with asyncio.Lock prevents overlapping Claude invocations
 
 ## Project Structure

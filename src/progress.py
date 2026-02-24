@@ -10,12 +10,24 @@ from . import config
 
 logger = logging.getLogger(__name__)
 
+# Animated status messages for heartbeat
+_HEARTBEAT_MESSAGES = [
+    "🔄 Working...",
+    "🔄 Still working...",
+    "🔄 Continuing...",
+    "🔄 Processing...",
+    "🔄 Nearly there...",
+    "🔄 Working...",
+]
+_HEARTBEAT_INTERVAL = 5.0  # Update every 5 seconds during heartbeat
+
 
 class ProgressReporter:
     """Manages a single editable Telegram message showing Claude's current activity.
 
     Shows recent tool actions (Reading, Editing, Running, etc.) with debounced edits
-    to avoid hitting Telegram rate limits.
+    to avoid hitting Telegram rate limits. Also has a heartbeat animation to show
+    activity when Claude is working on long-running tasks.
     """
 
     def __init__(self, message: Message, debounce_seconds: float | None = None):
@@ -30,6 +42,8 @@ class ProgressReporter:
         self._dirty: bool = False
         self._task: asyncio.Task | None = None
         self._shutdown: bool = False
+        self._heartbeat_task: asyncio.Task | None = None
+        self._heartbeat_index: int = 0
 
     async def report_tool(self, tool_name: str, tool_input: str | None) -> None:
         """Report a tool action being performed.
@@ -38,6 +52,9 @@ class ProgressReporter:
             tool_name: Name of the tool (e.g., "Bash", "Read", "Edit")
             tool_input: Primary argument (e.g., command, file_path, pattern)
         """
+        # Stop heartbeat when we get new activity - it will restart after debounce
+        self._stop_heartbeat()
+
         # Translate tool events to human-readable lines
         text = self._format_tool_action(tool_name, tool_input)
 
@@ -88,6 +105,7 @@ class ProgressReporter:
         """Debounced update of the progress message.
 
         Wait for the debounce period, then update if there are still uncommitted changes.
+        Start heartbeat animation after updating.
         """
         try:
             await asyncio.sleep(self._debounce_seconds)
@@ -101,7 +119,7 @@ class ProgressReporter:
             # Build the message text
             if self._history:
                 lines = list(self._history)
-                text = "🔄 <b>Working...</b>\n" + "\n".join(f"• {line}" for line in lines)
+                text = f"🔄 <b>Working...</b>\n" + "\n".join(f"• {line}" for line in lines)
             else:
                 text = "🔄 <b>Working...</b>"
 
@@ -138,8 +156,72 @@ class ProgressReporter:
                     if "message is not modified" not in str(e).lower():
                         logger.warning("Failed to update progress message: %s", e)
 
+            # Start heartbeat animation after the update
+            self._start_heartbeat()
+
         except asyncio.CancelledError:
             # Task was cancelled by a newer one
+            pass
+
+    def _start_heartbeat(self) -> None:
+        """Start the heartbeat animation task."""
+        if self._heartbeat_task and not self._heartbeat_task.done():
+            self._heartbeat_task.cancel()
+        self._heartbeat_task = asyncio.create_task(self._heartbeat_animate())
+
+    def _stop_heartbeat(self) -> None:
+        """Stop the heartbeat animation task."""
+        if self._heartbeat_task and not self._heartbeat_task.done():
+            self._heartbeat_task.cancel()
+        self._heartbeat_task = None
+        self._heartbeat_index = 0
+
+    async def _heartbeat_animate(self) -> None:
+        """Animate the progress message to show ongoing activity.
+
+        Rotates through status messages to indicate Claude is still working
+        even without new tool events.
+        """
+        try:
+            while True and not self._shutdown:
+                await asyncio.sleep(_HEARTBEAT_INTERVAL)
+
+                if self._shutdown:
+                    return
+
+                if self._progress_message_id is None:
+                    return
+
+                # Rotate to next heartbeat message
+                self._heartbeat_index = (self._heartbeat_index + 1) % len(_HEARTBEAT_MESSAGES)
+                status = _HEARTBEAT_MESSAGES[self._heartbeat_index]
+
+                # Build updated text
+                if self._history:
+                    lines = list(self._history)
+                    text = f"{status}\n" + "\n".join(f"• {line}" for line in lines)
+                else:
+                    text = status
+
+                # Only update if text changed
+                if text == self._last_update_text:
+                    continue
+
+                try:
+                    await self._bot.edit_message_text(
+                        chat_id=self._chat_id,
+                        message_id=self._progress_message_id,
+                        text=text,
+                        parse_mode="HTML",
+                    )
+                    self._last_update_text = text
+                except TelegramAPIError as e:
+                    # Ignore errors - message might have been deleted
+                    if "message is not modified" not in str(e).lower():
+                        logger.debug("Heartbeat update failed (likely deleted): %s", e)
+                    return
+
+        except asyncio.CancelledError:
             pass
 
     async def finish(self) -> None:
@@ -148,6 +230,7 @@ class ProgressReporter:
         Deletes the progress message if it exists.
         """
         self._shutdown = True
+        self._stop_heartbeat()
 
         if self._task and not self._task.done():
             self._task.cancel()
@@ -169,6 +252,7 @@ class ProgressReporter:
     async def show_cancelled(self) -> None:
         """Update the progress message to show cancellation before deletion."""
         self._shutdown = True
+        self._stop_heartbeat()
 
         if self._progress_message_id is not None:
             try:
@@ -186,6 +270,7 @@ class ProgressReporter:
     async def show_idle_timeout(self) -> None:
         """Update the progress message to show idle timeout before deletion."""
         self._shutdown = True
+        self._stop_heartbeat()
 
         if self._progress_message_id is not None:
             try:

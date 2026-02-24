@@ -178,7 +178,12 @@ async def stream_message(
                     timeout=config.IDLE_TIMEOUT
                 )
             except asyncio.TimeoutError:
-                logger.warning("Claude process idle timeout (%d s)", config.IDLE_TIMEOUT)
+                # Check if process is still alive - if so, it's just doing work without output
+                if proc.returncode is None:
+                    logger.debug("Readline timeout but process still running, continuing to wait...")
+                    continue
+                # Process has actually died - report the timeout error
+                logger.warning("Claude process idle timeout (%d s) - process terminated", config.IDLE_TIMEOUT)
                 proc.kill()
                 await proc.wait()
                 elapsed = time.monotonic() - start

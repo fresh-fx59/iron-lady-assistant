@@ -1,18 +1,36 @@
 import os
+import sys
 
 from dotenv import load_dotenv
 
 load_dotenv()
 
-VERSION: str = "0.5.0"
+VERSION: str = "0.6.0"
 
-BOT_TOKEN: str = os.environ["TELEGRAM_BOT_TOKEN"]
+# ── Bot token (required) ────────────────────────────────────
+BOT_TOKEN: str = os.getenv("TELEGRAM_BOT_TOKEN", "")
+if not BOT_TOKEN or BOT_TOKEN == "your-bot-token-here":
+    print(
+        "ERROR: TELEGRAM_BOT_TOKEN is not set.\n"
+        "\n"
+        "  Quick fix:  bash setup.sh\n"
+        "  Manual fix: edit the .env file and add your bot token.\n"
+        "  Get a token from @BotFather on Telegram: https://t.me/BotFather\n"
+    )
+    sys.exit(1)
 
+# ── Allowed users (required) ────────────────────────────────
 _raw_ids = os.getenv("ALLOWED_USER_IDS", "")
 ALLOWED_USER_IDS: set[int] = {
     int(uid.strip()) for uid in _raw_ids.split(",") if uid.strip()
 }
+if not ALLOWED_USER_IDS:
+    print(
+        "WARNING: ALLOWED_USER_IDS is empty — the bot will ignore ALL messages.\n"
+        "  Add your Telegram user ID to .env (find it via @userinfobot on Telegram).\n"
+    )
 
+# ── Model & optional settings ───────────────────────────────
 DEFAULT_MODEL: str = os.getenv("DEFAULT_MODEL", "sonnet")
 _raw_working_dir = os.getenv("CLAUDE_WORKING_DIR") or None
 CLAUDE_WORKING_DIR: str | None = (

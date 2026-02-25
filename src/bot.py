@@ -160,11 +160,12 @@ async def cmd_model(message: Message) -> None:
     lines = [f"<b>Current model:</b> {current}\n"]
     lines.append("<b>Select a model:</b>")
 
-    # Build inline keyboard
+    # Build inline keyboard with buttons
     keyboard = InlineKeyboardBuilder()
     for model in sorted(VALID_MODELS):
         button_text = f"{'✓ ' if model == current else ''}{model}"
         keyboard.button(text=button_text, callback_data=f"model:{model}")
+    keyboard.adjust(2)  # 2 buttons per row
 
     await message.answer("\n".join(lines), reply_markup=keyboard.as_markup(), parse_mode="HTML")
 
@@ -193,6 +194,7 @@ async def cb_model_switch(callback: CallbackQuery) -> None:
     for m in sorted(VALID_MODELS):
         button_text = f"{'✓ ' if m == model else ''}{m}"
         keyboard.button(text=button_text, callback_data=f"model:{m}")
+    keyboard.adjust(2)  # 2 buttons per row
 
     await callback.message.edit_text("\n".join(lines), reply_markup=keyboard.as_markup(), parse_mode="HTML")
     await callback.answer(f"Switched to {model}")
@@ -209,11 +211,12 @@ async def cmd_provider(message: Message) -> None:
     lines = [f"<b>Current provider:</b> {current.name}\n<i>{current.description}</i>\n"]
     lines.append("<b>Select a provider:</b>")
 
-    # Build inline keyboard
+    # Build inline keyboard with buttons
     keyboard = InlineKeyboardBuilder()
     for p in provider_manager.providers:
         button_text = f"{'✓ ' if p.name == current.name else ''}{p.name}"
         keyboard.button(text=button_text, callback_data=f"provider:{p.name}")
+    keyboard.adjust(2)  # 2 buttons per row
 
     await message.answer("\n".join(lines), reply_markup=keyboard.as_markup(), parse_mode="HTML")
 
@@ -244,6 +247,7 @@ async def cb_provider_switch(callback: CallbackQuery) -> None:
     for p in provider_manager.providers:
         button_text = f"{'✓ ' if p.name == provider.name else ''}{p.name}"
         keyboard.button(text=button_text, callback_data=f"provider:{p.name}")
+    keyboard.adjust(2)  # 2 buttons per row
 
     await callback.message.edit_text("\n".join(lines), reply_markup=keyboard.as_markup(), parse_mode="HTML")
     await callback.answer(f"Switched to {provider.name}")

@@ -8,8 +8,9 @@ import yaml
 from aiogram import Router, F
 from aiogram.types import Message
 from aiogram.enums import ChatAction
+from aiogram.exceptions import TelegramAPIError
 
-from . import bridge, config
+from . import bridge, config, metrics
 from .sessions import SessionManager
 from .formatter import markdown_to_html, split_message, strip_html
 from .memory import MemoryManager
@@ -428,7 +429,10 @@ async def _keep_typing(message: Message) -> None:
     """Send typing indicator every 5 seconds."""
     try:
         while True:
-            await message.bot.send_chat_action(chat_id=message.chat.id, action=ChatAction.TYPING)
+            try:
+                await message.bot.send_chat_action(chat_id=message.chat.id, action=ChatAction.TYPING)
+            except TelegramAPIError as e:
+                logger.debug("Typing indicator failed (transient): %s", e)
             await asyncio.sleep(5)
     except asyncio.CancelledError:
         return

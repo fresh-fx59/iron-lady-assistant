@@ -19,6 +19,7 @@ from .memory import MemoryManager
 from .progress import ProgressReporter
 from .providers import ProviderManager
 from .tools import ToolRegistry
+from .tasks import TaskManager, TaskStatus
 
 logger = logging.getLogger(__name__)
 router = Router()
@@ -27,6 +28,7 @@ session_manager = SessionManager()
 provider_manager = ProviderManager()
 memory_manager = MemoryManager(config.MEMORY_DIR)
 tool_registry = ToolRegistry(config.TOOLS_DIR)
+task_manager: TaskManager | None = None  # Set in main()
 
 # Restore persisted provider selections from sessions
 for _chat_id, _session in session_manager.sessions.items():
@@ -99,6 +101,8 @@ async def cmd_start(message: Message) -> None:
         "/status — Show current session info",
         "/memory — Show what I remember",
         "/tools — Show available tools",
+        "/bg <task> — Run task in background",
+        "/bg-cancel <id> — Cancel background task",
         "/cancel — Cancel current request",
     ])
 
@@ -311,6 +315,139 @@ async def cmd_cancel(message: Message) -> None:
     proc.kill()
     state.cancel_requested = True
     metrics.CLAUDE_REQUESTS_TOTAL.labels(model=session_manager.get(message.chat.id).model, status="cancelled").inc()
+
+
+@router.message(F.text.startswith("/bg "))
+async def cmd_bg(message: Message) -> None:
+    """Run a task in the background."""
+    if not _is_authorized(message.from_user and message.from_user.id):
+        return
+
+    if not task_manager:
+        await message.answer("Background tasks not available.")
+        return
+
+    # Extract prompt after /bg
+    prompt = message.text[3:].strip()
+    if not prompt:
+        await message.answer("Please provide a task to run in background.\n\nExample: /bg write a python script to backup my database")
+        return
+
+    session = session_manager.get(message.chat.id)
+
+    # Build memory and tool-augmented prompt
+    memory_context = memory_manager.build_context(prompt)
+    tool_context = tool_registry.build_context(prompt)
+    memory_instructions = memory_manager.build_instructions()
+
+    prompt_parts = []
+    if memory_context:
+        prompt_parts.append(memory_context)
+    if tool_context:
+        prompt_parts.append(tool_context)
+    prompt_parts.append(prompt + memory_instructions)
+
+    full_prompt = "\n\n".join(prompt_parts)
+
+    task_id = await task_manager.submit(
+        chat_id=message.chat.id,
+        user_id=message.from_user.id,
+        prompt=full_prompt,
+        model=session.model,
+        session_id=session.claude_session_id,
+    )
+
+    lines = [
+        f"✅ <b>Task queued</b>",
+        f"",
+        f"<b>Task ID:</b> <code>{task_id}</code>",
+        f"<b>Model:</b> {session.model}",
+        f"",
+        f"I'll notify you when it completes. You can continue chatting.",
+        f"",
+        f"<b>Commands:</b>",
+        f"/bg-list — List active tasks",
+        f"/bg-cancel {task_id} — Cancel this task",
+    ]
+    await message.answer("\n".join(lines), parse_mode="HTML")
+
+
+@router.message(F.text == "/bg-list")
+async def cmd_bg_list(message: Message) -> None:
+    """List active background tasks."""
+    if not _is_authorized(message.from_user and message.from_user.id):
+        return
+
+    if not task_manager:
+        await message.answer("Background tasks not available.")
+        return
+
+    tasks = task_manager.list_user_tasks(message.chat.id)
+
+    if not tasks:
+        await message.answer("No active background tasks.")
+        return
+
+    lines = ["<b>Active background tasks:</b>", ""]
+    for task in tasks:
+        status_emoji = {
+            TaskStatus.QUEUED: "⏳",
+            TaskStatus.RUNNING: "🔄",
+        }.get(task.status, "❓")
+
+        duration = ""
+        if task.started_at:
+            duration = f" ({(datetime.now() - task.started_at).total_seconds():.0f}s)"
+
+        lines.append(
+            f"{status_emoji} <code>{task.id[:8]}</code> — {task.status.value}{duration}"
+        )
+        lines.append(f"   {task.prompt[:100]}...")
+        lines.append("")
+
+    await message.answer("\n".join(lines), parse_mode="HTML")
+
+
+@router.message(F.text.startswith("/bg-cancel "))
+async def cmd_bg_cancel(message: Message) -> None:
+    """Cancel a background task."""
+    if not _is_authorized(message.from_user and message.from_user.id):
+        return
+
+    if not task_manager:
+        await message.answer("Background tasks not available.")
+        return
+
+    task_id = message.text[11:].strip()
+    if not task_id:
+        await message.answer("Please provide a task ID.\n\nExample: /bg-cancel abc123")
+        return
+
+    # Find full task ID from partial match
+    full_task_id = None
+    for tid in task_manager.tasks:
+        if tid.startswith(task_id):
+            full_task_id = tid
+            break
+
+    if not full_task_id:
+        await message.answer("Task not found.")
+        return
+
+    task = await task_manager.get_status(full_task_id)
+    if not task or task.chat_id != message.chat.id:
+        await message.answer("Task not found.")
+        return
+
+    if task.status not in (TaskStatus.QUEUED, TaskStatus.RUNNING):
+        await message.answer(f"Task is already {task.status.value}.")
+        return
+
+    cancelled = await task_manager.cancel(full_task_id)
+    if cancelled:
+        await message.answer(f"✅ Cancelled task <code>{full_task_id[:8]}</code>", parse_mode="HTML")
+    else:
+        await message.answer("Could not cancel task.")
 
 
 async def _run_claude(

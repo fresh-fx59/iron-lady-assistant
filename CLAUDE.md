@@ -1,6 +1,6 @@
 # Claude Code as Telegram Assistant
 
-**Current version: `0.12.1`** — defined in `src/config.py` as `VERSION`.
+**Current version: `0.13.0`** — defined in `src/config.py` as `VERSION`.
 
 Telegram bot that bridges messages to Claude Code's `--print` mode via subprocess, providing a conversational AI assistant through Telegram.
 
@@ -20,9 +20,10 @@ Telegram bot that bridges messages to Claude Code's `--print` mode via subproces
 src/
 ├── main.py       # Entry point, dispatcher setup, polling, metrics server
 ├── config.py     # Env vars: BOT_TOKEN, ALLOWED_USER_IDS, DEFAULT_MODEL, IDLE_TIMEOUT, MEMORY_DIR, TOOLS_DIR
-├── bot.py        # Telegram handlers: /start, /new, /model, /provider, /status, /memory, /forget, /tools, /cancel
+├── bot.py        # Telegram handlers: /start, /new, /model, /provider, /status, /memory, /forget, /tools, /bg, /cancel
 ├── memory.py     # Persistent memory: YAML profile + SQLite FTS5 episodic, context injection
 ├── tools.py      # Tool registry: lazy loads YAML tool definitions, injects context
+├── tasks.py      # Background task manager with queue and completion notifications
 ├── bridge.py     # Runs `claude -p` subprocess, yields stream events (TOOL_USE, RESULT)
 ├── providers.py  # Provider fallback chain: auto-switches LLM on rate limit
 ├── progress.py   # ProgressReporter: manages live progress message with debounced edits
@@ -52,7 +53,50 @@ src/
 - `/status` — Show current session info
 - `/memory` — Show what the bot remembers (profile + episodes)
 - `/tools` — Show available tools
+- `/bg <task>` — Run a task in background (non-blocking)
+- `/bg-list` — List active background tasks
+- `/bg-cancel <task_id>` — Cancel a background task
 - `/cancel` — Cancel the current request
+
+## Background Tasks
+
+Long-running tasks can be executed in the background without blocking your chat conversation.
+
+### Usage
+
+Start a background task:
+```
+/bg write a python script to backup my database
+```
+
+The bot will queue the task and immediately reply with a task ID, allowing you to continue chatting.
+
+List active tasks:
+```
+/bg-list
+```
+
+Cancel a task:
+```
+/bg-cancel abc123
+```
+
+### Features
+
+- **Queue system**: Up to 3 concurrent background tasks
+- **10-minute timeout**: Long tasks are automatically terminated
+- **Completion notifications**: You're notified when a background task finishes
+- **Status tracking**: Real-time status (queued, running, completed, failed, cancelled)
+- **Auto-cleanup**: Completed tasks are removed from memory after 1 hour
+- **Memory & tools preserved**: Background tasks have full access to memory and custom tools
+
+### Task lifecycle
+
+1. Submit with `/bg <prompt>` → Task queued
+2. Bot processes queue (max 3 concurrent)
+3. Claude executes the task (includes memory + tool context)
+4. Results delivered via Telegram notification
+5. Task cleaned up after 1 hour
 
 ## Deployment (systemd)
 
@@ -142,6 +186,10 @@ The bot exposes metrics on port `9101` (configurable via `METRICS_PORT`).
 | `telegrambot_claude_cost_usd_total` | Counter | `model` | Cumulative API cost in USD |
 | `telegrambot_claude_turns_total` | Counter | `model` | Cumulative agentic turns |
 | `telegrambot_active_sessions` | Gauge | — | Active chat sessions |
+| `telegrambot_bg_tasks_active` | Gauge | — | Total active background tasks (queued + running) |
+| `telegrambot_bg_tasks_queued` | Gauge | — | Queued background tasks |
+| `telegrambot_bg_tasks_running` | Gauge | — | Currently running background tasks |
+| `telegrambot_bg_tasks_total` | Counter | `status` | Total background tasks (completed/failed/cancelled/timeout) |
 | `process_*` | various | — | Python process metrics (auto-exported) |
 
 ### Add to Prometheus

@@ -6,7 +6,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-VERSION: str = "0.12.1"
+VERSION: str = "0.13.0"
 
 # ── Bot token (required) ────────────────────────────────────
 BOT_TOKEN: str = os.getenv("TELEGRAM_BOT_TOKEN", "")

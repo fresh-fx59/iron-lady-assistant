@@ -45,6 +45,28 @@ ACTIVE_SESSIONS = Gauge(
     "Number of active chat sessions",
 )
 
+# Background task metrics
+BG_TASKS_ACTIVE = Gauge(
+    "telegrambot_bg_tasks_active",
+    "Number of active background tasks (queued + running)",
+)
+
+BG_TASKS_QUEUED = Gauge(
+    "telegrambot_bg_tasks_queued",
+    "Number of queued background tasks",
+)
+
+BG_TASKS_RUNNING = Gauge(
+    "telegrambot_bg_tasks_running",
+    "Number of running background tasks",
+)
+
+BG_TASKS_TOTAL = Counter(
+    "telegrambot_bg_tasks_total",
+    "Total background tasks submitted",
+    ["status"],  # completed, failed, cancelled, timeout
+)
+
 # Current model gauge (set per chat, last used)
 CURRENT_MODEL = Gauge(
     "telegrambot_current_model",

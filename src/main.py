@@ -7,7 +7,7 @@ from aiogram import Bot, Dispatcher
 from aiogram.types import BotCommand
 
 from .config import BOT_TOKEN, METRICS_PORT
-from .bot import router, provider_manager
+from .bot import router, provider_manager, task_manager
 from .metrics import start_metrics_server
 
 
@@ -40,6 +40,12 @@ async def main() -> None:
     dp = Dispatcher()
     dp.include_router(router)
 
+    # Initialize task manager
+    global task_manager
+    from .tasks import TaskManager
+    task_manager = TaskManager(bot)
+    await task_manager.start()
+
     await bot.set_my_commands([
         BotCommand(command="start", description="Welcome message"),
         BotCommand(command="new", description="Start fresh conversation"),
@@ -48,6 +54,8 @@ async def main() -> None:
         BotCommand(command="status", description="Show current session info"),
         BotCommand(command="memory", description="Show what I remember"),
         BotCommand(command="tools", description="Show available tools"),
+        BotCommand(command="bg", description="Run task in background"),
+        BotCommand(command="bg-cancel", description="Cancel background task"),
         BotCommand(command="cancel", description="Cancel current request"),
     ])
 
@@ -57,6 +65,8 @@ async def main() -> None:
     try:
         await dp.start_polling(bot)
     finally:
+        if task_manager:
+            await task_manager.stop()
         provider_manager.shutdown()
         await bot.session.close()
 

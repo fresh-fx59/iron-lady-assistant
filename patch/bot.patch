@@ -1,0 +1,207 @@
+--- a/src/bot.py
++++ b/src/bot.py
+@@ -1,4 +1,5 @@
+-from aiogram.enums import ChatAction
++from aiogram.enums import ChatAction, CallbackQuery
+-from aiogram.types import Message
++from aiogram.types import Message, CallbackQuery
+-from . import bridge, config
++from . import bridge, config
+-from .sessions import SessionManager
++from .sessions import SessionManager
+-from .formatter import markdown_to_html, split_message, strip_html
++from .formatter import markdown_to_html, split_message, strip_html
+-from .memory import MemoryManager
++from .memory import MemoryManager
+-from .progress import ProgressReporter
++from .progress import ProgressReporter
+-from .providers import ProviderManager
++from .providers import ProviderManager
+-from .tools import ToolRegistry
++from .tools import ToolRegistry
+
+ logger = logging.getLogger(__name__)
+ router = Router()
+
+ session_manager = SessionManager()
+ provider_manager = ProviderManager()
+ memory_manager = MemoryManager(config.MEMORY_DIR)
++tool_registry = ToolRegistry(config.TOOLS_DIR)
+
+ VALID_MODELS = {"sonnet", "opus", "haiku"}
+
+@@ -144,7 +146,6 @@
+ @router.message(F.text.startswith("/model"))
+ async def cmd_model(message: Message) -> None:
+     """Switch Claude model."""
+     if not _is_authorized(message.from_user and message.from_user.id):
+         return
+
+     session = session_manager.get(message.chat.id)
+     current = session.model
++
++    # Build keyboard for quick model selection
++    keyboard = InlineKeyboardMarkup()
++    for model in VALID_MODELS:
++        is_active = model == current
++        keyboard.add(KeyboardButton(text=model.capitalize(), callback_data=f"model:{model}"))
++        if is_active:
++            keyboard.adjust(KeyboardButton(text="✓ " + model.capitalize(), callback_data=f"model:{model}"))
++
+     if len((message.text or "").split()) < 2:
+-        await message.answer(
+-            f"Current model: <b>{current}</b>\n"
+-            f"Usage: /model [sonnet|opus|haiku]",
+-            parse_mode="HTML",
+-        )
++        # No immediate answer needed when using keyboard
+         return
+
+     model = parts[1].lower()
+     if model not in VALID_MODELS:
+         await message.answer(f"Invalid model. Choose from: {', '.join(sorted(VALID_MODELS))}")
+         return
+
+     session_manager.set_model(message.chat.id, model)
+-    await message.answer(f"Model switched to <b>{model}</b>.", parse_mode="HTML")
++    # Only persist model, no answer needed
+
+@@ -167,6 +168,5 @@
+ @router.message(F.text.startsWith("/provider"))
+ async def cmd_provider(message: Message) -> None:
+     """View or switch to LLM provider."""
+     if not _is_authorized(message.from_user and message.from_user.id):
+         return
+
+     parts = (message.text or "").split()
+     if len(parts) < 2:
++        # Handle reload command
++        old_hash = provider_manager.get_config_hash()
++        new_hash = None
++        try:
++            import hashlib
++            with open(provider_manager._CONFIG_PATH, "rb") as f:
++                new_hash = hashlib.md5(f.read()).hexdigest()
++        except Exception:
++            logger.error("Failed to hash providers.json")
++            await message.answer("Failed to hash providers.json")
++            return
+
++        # Check for manual changes (force reload)
++        if len(parts) > 2 and parts[0].lower() == "reload":
++            new_hash = None
++            try:
++                import hashlib
++                with open(provider_manager._CONFIG_PATH, "rb") as f:
++                    new_hash = hashlib.md5(f.read()).hexdigest()
++            except Exception:
++                logger.error("Failed to hash providers.json")
++                await message.answer("Failed to hash providers.json")
++                return
+
++        if old_hash and old_hash != new_hash:
++            await message.answer("No changes detected in providers.json.")
++            return
+
++        # Reload providers and notify
++        provider_manager.reload()
++        await message.answer("Providers reloaded successfully.")
++        return
+
++    # Proceed with normal provider flow
+     current = provider_manager.get_provider(message.chat.id)
+
++    # Show current provider list
+     if len(parts) < 2:
++        status_text = f"<b>Current provider:</b> {current.name} — {current.description}"
++        lines = [status_text]
++        lines.append("<b>Available:</b>")
+         for p in provider_manager.providers:
+             marker = " (active)" if p.name == current.name else ""
+             lines.append(f"  <code>{p.name}</code> — {p.description}{marker}")
+-        lines.append(f"\nUsage: /provider [{'|'.join(p.name for p in provider_manager.providers)}]")
+-        await message.answer("\n".join(lines), parse_mode="HTML")
+-        return
++        lines.append(f"\nUsage: /provider [name|reload]")
+         await message.answer("\n".join(lines), parse_mode="HTML")
+         return
+
+     name = parts[1].lower()
+     logger.info("Chat %d: /provider %s requested", message.chat.id, name)
+     provider = provider_manager.set_provider(message.chat.id, name)
+
++    # Build keyboard for provider selection
++    keyboard = InlineKeyboardMarkup()
++    for p in provider_manager.providers:
++        marker = " (active)" if p.name == current.name else ""
++        keyboard.add(KeyboardButton(text=p.name, callback_data=f"provider:{p.name}"))
+
+     await message.answer(
+-        f"<b>Provider:</b> {provider.name}</b> — {provider.description}",
+-        parse_mode="HTML",
+-        )
++        f"<b>Provider:</b> {provider.name}</b> — {provider.description}",
++        reply_markup=keyboard,
++        )
+
+@@ -199,28 +210,44 @@
+ @router.message(F.text == "/status")
+ async def cmd_status(message: Message) -> None:
+     if not _is_authorized(message.from_user and message.from_user.id):
+         return
+
+     session = session_manager.get(message.chat.id)
+     sid = session.claude_session_id or "none (new conversation)"
+     provider = provider_manager.get_provider(message.chat.id)
++    providers_hash = provider_manager.get_config_hash()
+     await message.answer(
+         f"<b>Version:</b> {config.VERSION}\n"
+         f"<b>Session:</b> <code>{sid}</code>\n"
+         f"<b>Model:</b> {session.model}\n"
+         f"<b>Provider:</b> {provider.name} — {provider.description}\n"
++        f"<b>Providers hash:</b> <code>{providers_hash}</code>\n"
+         parse_mode="HTML",
+     )
+
+@@ -259 +282,52 @@
+ @router.callback_query(lambda c: c.data and c.data.startswith("model:"))
+ async def callback_model(query: CallbackQuery) -> None:
+     """Handle model selection via inline keyboard."""
+     if not _is_authorized(query.from_user and query.from_user.id):
+         return
+
+     session = session_manager.get(query.message.chat.id)
+     new_model = query.data.split(":", 1)[0].lower()
+
+     if new_model not in VALID_MODELS:
+         await query.answer(f"Invalid model: {new_model}")
+         return
+
+     if new_model == session.model:
+         await query.answer("Already using this model.")
+         return
+
+     session_manager.set_model(query.message.chat.id, new_model)
+     await query.answer(f"Model switched to {new_model}", parse_mode="HTML")
+
++    # Provider callback with hash check
++    elif query.data.startswith("provider:"):
++        session = session_manager.get(query.message.chat.id)
++        current_provider = provider_manager.get_provider(query.message.chat.id)
++        new_provider = query.data.split(":", 1)[1]
++
++        if new_provider == current_provider.name:
++            await query.answer("Already using this provider.")
++            return
++
++        provider = provider_manager.set_provider(query.message.chat.id, new_provider)
++        await query.answer(
++            query.message,
++            f"Provider switched to {provider.name}</b> — {provider.description}",
++            parse_mode="HTML",
++        )
++        else:
++            await query.answer("Already using this provider.")
++        return
+
+ @router.message(F.text)

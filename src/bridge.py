@@ -280,6 +280,16 @@ async def stream_message(
                     if is_error:
                         result_text = result_text or "Claude returned an error."
 
+                    # Log empty responses to diagnose root cause
+                    if not result_text or result_text.strip() == "":
+                        logger.warning(
+                            "Claude returned empty result text - data keys: %s, is_error=%s, cost=%.6f, turns=%d",
+                            list(data.keys()),
+                            is_error,
+                            cost_usd,
+                            num_turns,
+                        )
+
                     status = "error" if is_error else "success"
                     metrics.CLAUDE_REQUESTS_TOTAL.labels(model=model, status=status).inc()
                     elapsed = time.monotonic() - start
@@ -311,7 +321,9 @@ async def stream_message(
         elapsed = time.monotonic() - start
         stderr = (await proc.stderr.read()).decode()
         if stderr:
-            logger.warning("Claude stderr: %s", stderr.strip())
+            logger.warning("Claude stderr: %s", stderr.strip()[:500])  # Limit log size
+        else:
+            logger.warning("Claude process exited without result and no stderr (returncode=%d)", proc.returncode)
 
         if proc.returncode != 0:
             metrics.CLAUDE_REQUESTS_TOTAL.labels(model=model, status="error").inc()

@@ -405,6 +405,14 @@ async def handle_message(message: Message) -> None:
                 chunks = split_message(html)
 
                 if not chunks:
+                    logger.warning(
+                        "Chat %d: Got empty response object - text='%s', is_error=%s, session_id=%s, cost=%.6f",
+                        message.chat.id,
+                        repr(final_response.text[:200]) if final_response.text else "None",
+                        final_response.is_error,
+                        final_response.session_id,
+                        final_response.cost_usd,
+                    )
                     chunks = ["(empty response)"]
 
                 for chunk in chunks:

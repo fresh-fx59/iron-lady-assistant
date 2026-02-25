@@ -66,8 +66,12 @@ Open Telegram, find your bot by its username, and start chatting.
 |---------|-------------|
 | `/start` | Show welcome message |
 | `/new` | Clear conversation history and start fresh |
-| `/model sonnet` | Switch to a different model (sonnet/opus/haiku) |
+| `/model` | Switch model (sonnet/opus/haiku) via inline keyboard |
+| `/provider` | Switch LLM provider via inline keyboard |
 | `/status` | Show current session and model info |
+| `/memory` | Show what the bot remembers about you |
+| `/tools` | Show available tools |
+| `/cancel` | Cancel the current request |
 
 Just send any text message and the bot will respond using Claude.
 
@@ -95,6 +99,7 @@ Useful commands:
 sudo systemctl status telegram-bot.service    # check if running
 sudo systemctl restart telegram-bot.service   # restart the bot
 journalctl -u telegram-bot.service -f         # view live logs
+cat .deploy/deploy.log                        # persistent deploy/crash log
 ```
 
 ### Option B: Run in a terminal
@@ -118,6 +123,8 @@ All settings are in the `.env` file. Edit it anytime and restart the bot.
 | `IDLE_TIMEOUT` | No | `120` | Seconds without output before timeout |
 | `PROGRESS_DEBOUNCE_SECONDS` | No | `3.0` | Min seconds between progress updates |
 | `METRICS_PORT` | No | `9101` | Prometheus metrics port (0 to disable) |
+| `MEMORY_DIR` | No | `memory/` | Directory for persistent memory storage |
+| `TOOLS_DIR` | No | `tools/` | Directory for custom tool definitions |
 
 ## Monitoring (Optional)
 
@@ -139,8 +146,10 @@ Tracked metrics include: message counts, response times, API costs, and active s
 - Run `bash setup.sh` or edit `.env` with your token from @BotFather
 
 **Bot crashes or stops responding**
-- Check logs: `journalctl -u telegram-bot.service -f`
-- Restart: `sudo systemctl restart telegram-bot.service`
+- The bot has built-in crash loop protection: if it crashes 3+ times in 5 minutes, it auto-rolls back to the last working version and notifies you via Telegram
+- Check deploy log: `cat .deploy/deploy.log`
+- Check system logs: `journalctl -u telegram-bot.service -f`
+- Restart manually: `sudo systemctl restart telegram-bot.service`
 - If running manually, check the terminal output for errors
 
 **"Still processing your previous message"**
@@ -150,16 +159,25 @@ Tracked metrics include: message counts, response times, API costs, and active s
 
 ```
 ├── setup.sh              # Interactive setup wizard
-├── run.sh                # Start the bot (auto-installs deps)
+├── run.sh                # Start the bot (crash protection + auto-installs deps)
 ├── .env.example          # Configuration template
 ├── requirements.txt      # Python dependencies
 ├── telegram-bot.service  # systemd service file
+├── providers.json        # LLM provider fallback configuration
+├── .deploy/              # Runtime state (gitignored)
+│   ├── good_commit       # Last known-good git commit hash
+│   ├── start_times       # Recent start timestamps for crash detection
+│   └── deploy.log        # Persistent log of deploys, crashes, rollbacks
 └── src/
-    ├── main.py           # Entry point
+    ├── main.py           # Entry point, marks good commits on successful start
     ├── config.py         # Configuration loader
     ├── bot.py            # Telegram command handlers
     ├── bridge.py         # Claude Code subprocess bridge
     ├── sessions.py       # Conversation session management
+    ├── providers.py      # Provider fallback chain
+    ├── memory.py         # Persistent memory (YAML profile + SQLite episodes)
+    ├── tools.py          # Tool registry with lazy loading
+    ├── progress.py       # Live progress updates
     ├── formatter.py      # Markdown-to-HTML conversion
     └── metrics.py        # Prometheus metrics
 ```

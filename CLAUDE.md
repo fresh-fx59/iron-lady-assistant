@@ -1,6 +1,6 @@
 # Claude Code as Telegram Assistant
 
-**Current version: `0.11.8`** — defined in `src/config.py` as `VERSION`.
+**Current version: `0.12.1`** — defined in `src/config.py` as `VERSION`.
 
 Telegram bot that bridges messages to Claude Code's `--print` mode via subprocess, providing a conversational AI assistant through Telegram.
 
@@ -58,6 +58,7 @@ src/
 
 `run.sh` auto-creates the venv and installs dependencies if missing — fully hands-off on boot. The systemd service has:
 - `Restart=always` + `RestartSec=5` — auto-restarts on crash
+- `StartLimitBurst=5` + `StartLimitIntervalSec=600` — stops retrying after 5 crashes in 10 min
 - `WantedBy=multi-user.target` — starts on boot
 - `After=network-online.target` — waits for network
 
@@ -76,7 +77,56 @@ Useful commands:
 ```bash
 sudo systemctl status telegram-bot.service
 journalctl -u telegram-bot.service -f
+cat .deploy/deploy.log          # persistent deploy/crash log
+cat .deploy/good_commit         # last known-good git commit
 ```
+
+### Crash Loop Protection & Auto-Rollback
+
+Three-layer safety system prevents the bot from going silent after a bad deploy:
+
+**Layer 1 — `run.sh` crash loop detection:**
+- Tracks start attempts in `.deploy/start_times` (timestamp + commit hash)
+- If 3+ starts within 5 minutes → crash loop detected
+- Auto-rolls back to `.deploy/good_commit` via `git reset --hard`
+- Sends Telegram notification to the first admin in `ALLOWED_USER_IDS`
+- Runs a **smoke test** (`from src.config import VERSION`) before every start
+- All events logged to `.deploy/deploy.log` (auto-trimmed at 1MB)
+
+**Layer 2 — `src/main.py` good-commit marker:**
+- After `set_my_commands()` succeeds (proves code loaded + token valid + Telegram API reachable), writes current git hash to `.deploy/good_commit`
+- This is the commit that rollback will restore to
+
+**Layer 3 — systemd safety net:**
+- `StartLimitBurst=5` / `StartLimitIntervalSec=600` — if even rollback fails, systemd stops retrying after 5 attempts in 10 minutes
+
+**State files** (in `.deploy/`, gitignored):
+- `good_commit` — full git hash of last known-good version
+- `start_times` — recent start attempts for crash detection
+- `deploy.log` — persistent log of starts, crashes, rollbacks
+
+### Deploy Procedure
+
+**IMPORTANT: Follow this procedure for every deploy to ensure rollback safety.**
+
+After committing changes:
+```bash
+# 1. Copy updated service file (only if telegram-bot.service changed)
+sudo cp telegram-bot.service /etc/systemd/system/
+sudo systemctl daemon-reload
+
+# 2. Restart the service
+sudo systemctl restart telegram-bot.service
+
+# 3. Verify it's running
+sudo systemctl status telegram-bot.service
+cat .deploy/deploy.log | tail -5
+
+# 4. Confirm good_commit was updated (wait a few seconds for bot to connect)
+cat .deploy/good_commit
+```
+
+If something goes wrong, the bot will auto-rollback after 3 crash restarts. Check `.deploy/deploy.log` for details.
 
 ## Prometheus Monitoring
 
@@ -111,6 +161,14 @@ Then reload: `docker exec prometheus kill -HUP 1`
 ## Versioning & Commit Convention
 
 **IMPORTANT: Update the version on EVERY commit** — this is mandatory. Do not skip version bumps for any reason.
+
+**IMPORTANT: Commit after every meaningful action** — do not batch unrelated changes into one commit. Each commit should represent one logical unit of work. Examples of when to commit:
+- After implementing a feature or fixing a bug
+- After updating documentation
+- After refactoring code
+- After adding/updating tests
+
+If a task involves multiple steps (e.g. code change + docs update + config change), commit each step separately if they are independently meaningful.
 
 Every commit message **must** start with the version prefix:
 

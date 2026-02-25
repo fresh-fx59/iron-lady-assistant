@@ -397,11 +397,15 @@ async def handle_message(message: Message) -> None:
             await progress.finish()
         elif final_response:
             if final_response.is_error:
-                await message.answer(final_response.text)
+                error_text = final_response.text or "(No response)"
+                await message.answer(error_text)
                 await progress.finish()
             else:
                 html = markdown_to_html(final_response.text)
                 chunks = split_message(html)
+
+                if not chunks:
+                    chunks = ["(empty response)"]
 
                 for chunk in chunks:
                     try:

@@ -68,6 +68,9 @@ def markdown_to_html(text: str) -> str:
 
 def split_message(text: str) -> list[str]:
     """Split text into chunks that fit Telegram's message limit."""
+    if not text or not text.strip():
+        return []
+
     if len(text) <= MAX_MESSAGE_LENGTH:
         return [text]
 
@@ -89,7 +92,9 @@ def split_message(text: str) -> list[str]:
             # Hard split
             split_at = MAX_MESSAGE_LENGTH
 
-        chunks.append(text[:split_at])
+        chunk = text[:split_at]
+        if chunk.strip():
+            chunks.append(chunk)
         text = text[split_at:].lstrip("\n")
 
     return chunks

@@ -1,0 +1,36 @@
+name: bluebubbles
+description: Use when you need to send or manage iMessages via BlueBubbles (recommended
+  iMessage integration). Ca
+triggers:
+- bluebubbles
+- when
+- need
+instructions: "# BlueBubbles Actions\n\n## Overview\n\nBlueBubbles is OpenClaw\u2019\
+  s recommended iMessage integration. Use the `message` tool with `channel: \"bluebubbles\"\
+  ` to send messages and manage iMessage conversations: send texts and attachments,\
+  \ react (tapbacks), edit/unsend, reply in threads, and manage group participants/names/icons.\n\
+  \n## Inputs to collect\n\n- `target` (prefer `chat_guid:...`; also `+15551234567`\
+  \ in E.164 or `user@example.com`)\n- `message` text for send/edit/reply\n- `messageId`\
+  \ for react/edit/unsend/reply\n- Attachment `path` for local files, or `buffer`\
+  \ + `filename` for base64\n\nIf the user is vague (\"text my mom\"), ask for the\
+  \ recipient handle or chat guid and the exact message content.\n\n## Actions\n\n\
+  ### Send a message\n\n```json\n{\n  \"action\": \"send\",\n  \"channel\": \"bluebubbles\"\
+  ,\n  \"target\": \"+15551234567\",\n  \"message\": \"hello from OpenClaw\"\n}\n\
+  ```\n\n### React (tapback)\n\n```json\n{\n  \"action\": \"react\",\n  \"channel\"\
+  : \"bluebubbles\",\n  \"target\": \"+15551234567\",\n  \"messageId\": \"<message-guid>\"\
+  ,\n  \"emoji\": \"\u2764\uFE0F\"\n}\n```\n\n### Remove a reaction\n\n```json\n{\n\
+  \  \"action\": \"react\",\n  \"channel\": \"bluebubbles\",\n  \"target\": \"+15551234567\"\
+  ,\n  \"messageId\": \"<message-guid>\",\n  \"emoji\": \"\u2764\uFE0F\",\n  \"remove\"\
+  : true\n}\n```\n\n### Edit a previously sent message\n\n```json\n{\n  \"action\"\
+  : \"edit\",\n  \"channel\": \"bluebubbles\",\n  \"target\": \"+15551234567\",\n\
+  \  \"messageId\": \"<message-guid>\",\n  \"message\": \"updated text\"\n}\n```\n\
+  \n### Unsend a message\n\n```json\n{\n  \"action\": \"unsend\",\n  \"channel\":\
+  \ \"bluebubbles\",\n  \"target\": \"+15551234567\",\n  \"messageId\": \"<message-guid>\"\
+  \n}\n```\n\n### Reply to a specific message\n\n```json\n{\n  \"action\": \"reply\"\
+  ,\n  \"channel\": \"bluebubbles\",\n  \"target\": \"+15551234567\",\n  \"replyTo\"\
+  : \"<message-guid>\",\n  \"message\": \"replying to that\"\n}\n```\n\n### Send an\
+  \ attachment\n\n```json\n{\n  \"action\": \"sendAttachment\",\n  \"channel\": \"\
+  bluebubbles\",\n  \"target\": \"+15551234567\",\n  \"path\": \"/tmp/photo.jpg\"\
+  ,\n  \"caption\": \"here you go\"\n}\n```\n\n### Send with an iMessage effect\n\n\
+  ```json\n{\n  \"action\": \"sendWithEffect\",\n  \"channel"
+setup: null

@@ -1,0 +1,34 @@
+name: sonoscli
+description: Control Sonos speakers (discover/status/play/volume/group).
+triggers:
+- sonoscli
+- control
+- sonos
+- speakers
+- (discover/status/play/volume/group).
+instructions: "# Sonos CLI\n\nUse `sonos` to control Sonos speakers on the local network.\n\
+  \n## Quick start\n\n- `sonos discover`\n- `sonos status --name \"Kitchen\"`\n- `sonos\
+  \ play|pause|stop --name \"Kitchen\"`\n- `sonos volume set 15 --name \"Kitchen\"\
+  `\n\n## Common tasks\n\n- Grouping: `sonos group status|join|unjoin|party|solo`\n\
+  - Favorites: `sonos favorites list|open`\n- Queue: `sonos queue list|play|clear`\n\
+  - Spotify search (via SMAPI): `sonos smapi search --service \"Spotify\" --category\
+  \ tracks \"query\"`\n\n## Notes\n\n- If SSDP fails, specify `--ip <speaker-ip>`.\n\
+  - Spotify Web API search is optional and requires `SPOTIFY_CLIENT_ID/SECRET`.\n\
+  - If there is an error, check the troubleshooting section and offer advice if there\
+  \ is a decent match.\n\n## Troubleshooting\n\n### `sonos discover` - `no route to\
+  \ host`\n\n- On error `Error: write udp4 0.0.0.0:64326->239.255.255.250:1900: sendto:\
+  \ no route to host (Command exited with code 1)`\n  - Note that the port number\
+  \ after `0.0.0.0:` is ephemeral and will change and the netmask may not match exactly\
+  \ either\n  - The `sendto: no route to host` should stay consistent\n- Advise the\
+  \ user that in `direct` (no Docker sandbox) mode on Mac OS that Settings -> Privacy\
+  \ & Security -> Local Network will need to be enabled for the top-level host parent\
+  \ process of the Gateway\n  - `node` if running via `launchd`\n  - `Terminal` if\
+  \ running the gateway directly in the terminal\n  - `Visual Studio Code` if running\
+  \ via terminal in VS Code\n- An alternative option is to use `sandbox` (docker container)\
+  \ with network access allowed for that sandbox\n\n### `sonos discover` - `bind:\
+  \ operation not permitted`\n\n- On error `Error: listen udp4 0.0.0.0:0: bind: operation\
+  \ not permitted`\n- Advise the user that they may be running via a Codex or other\
+  \ sandbox that does not permit network access (this can be replicated by running\
+  \ `sonos discover` within a Codex CLI session with sandbox enabled and not approving\
+  \ the escalation request)"
+setup: 'Ensure binary installed: sonos'

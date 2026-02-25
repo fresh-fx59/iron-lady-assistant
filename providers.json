@@ -7,18 +7,18 @@
     },
     {
       "name": "glm4.7",
-      "description": "GLM-4.7 via Cloud.ru (LiteLLM :4001)",
+      "description": "GLM-4.7 via Cloud.ru (LiteLLM :4000)",
       "env": {
-        "ANTHROPIC_BASE_URL": "http://0.0.0.0:4001",
+        "ANTHROPIC_BASE_URL": "http://0.0.0.0:4000",
         "ANTHROPIC_AUTH_TOKEN": "any-placeholder-value",
         "ANTHROPIC_MODEL": "claude-3-5-sonnet-latest"
       }
     },
     {
       "name": "qwen3-coder",
-      "description": "Qwen3-Coder-480B via DeepInfra (LiteLLM :4000)",
+      "description": "Qwen3-Coder-480B via DeepInfra (LiteLLM :4001)",
       "env": {
-        "ANTHROPIC_BASE_URL": "http://0.0.0.0:4000",
+        "ANTHROPIC_BASE_URL": "http://0.0.0.0:4001",
         "ANTHROPIC_AUTH_TOKEN": "any-placeholder-value",
         "ANTHROPIC_MODEL": "claude-3-5-sonnet-latest"
       }

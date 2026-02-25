@@ -1,0 +1,34 @@
+name: discord
+description: Discord ops via the message tool (channel=discord).
+triggers:
+- discord
+- discord
+- message
+instructions: "# Discord (Via `message`)\n\nUse the `message` tool. No provider-specific\
+  \ `discord` tool exposed to the agent.\n\n## Musts\n\n- Always: `channel: \"discord\"\
+  `.\n- Respect gating: `channels.discord.actions.*` (some default off: `roles`, `moderation`,\
+  \ `presence`, `channels`).\n- Prefer explicit ids: `guildId`, `channelId`, `messageId`,\
+  \ `userId`.\n- Multi-account: optional `accountId`.\n\n## Guidelines\n\n- Avoid\
+  \ Markdown tables in outbound Discord messages.\n- Mention users as `<@USER_ID>`.\n\
+  - Prefer Discord components v2 (`components`) for rich UI; use legacy `embeds` only\
+  \ when you must.\n\n## Targets\n\n- Send-like actions: `to: \"channel:<id>\"` or\
+  \ `to: \"user:<id>\"`.\n- Message-specific actions: `channelId: \"<id>\"` (or `to`)\
+  \ + `messageId: \"<id>\"`.\n\n## Common Actions (Examples)\n\nSend message:\n\n\
+  ```json\n{\n  \"action\": \"send\",\n  \"channel\": \"discord\",\n  \"to\": \"channel:123\"\
+  ,\n  \"message\": \"hello\",\n  \"silent\": true\n}\n```\n\nSend with media:\n\n\
+  ```json\n{\n  \"action\": \"send\",\n  \"channel\": \"discord\",\n  \"to\": \"channel:123\"\
+  ,\n  \"message\": \"see attachment\",\n  \"media\": \"file:///tmp/example.png\"\n\
+  }\n```\n\n- Optional `silent: true` to suppress Discord notifications.\n\nSend with\
+  \ components v2 (recommended for rich UI):\n\n```json\n{\n  \"action\": \"send\"\
+  ,\n  \"channel\": \"discord\",\n  \"to\": \"channel:123\",\n  \"message\": \"Status\
+  \ update\",\n  \"components\": \"[Carbon v2 components]\"\n}\n```\n\n- `components`\
+  \ expects Carbon component instances (Container, TextDisplay, etc.) from JS/TS integrations.\n\
+  - Do not combine `components` with `embeds` (Discord rejects v2 + embeds).\n\nLegacy\
+  \ embeds (not recommended):\n\n```json\n{\n  \"action\": \"send\",\n  \"channel\"\
+  : \"discord\",\n  \"to\": \"channel:123\",\n  \"message\": \"Status update\",\n\
+  \  \"embeds\": [{ \"title\": \"Legacy\", \"description\": \"Embeds are legacy.\"\
+  \ }]\n}\n```\n\n- `embeds` are ignored when components v2 are present.\n\nReact:\n\
+  \n```json\n{\n  \"action\": \"react\",\n  \"channel\": \"discord\",\n  \"channelId\"\
+  : \"123\",\n  \"messageId\": \"456\",\n  \"emoji\": \"\u2705\"\n}\n```\n\nRead:\n\
+  \n```json\n{\n  \"action\": \"read\",\n  \"channel\": \"discord\",\n  \"to\": "
+setup: null

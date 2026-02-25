@@ -1,0 +1,33 @@
+name: xurl
+description: A CLI tool for making authenticated requests to the X (Twitter) API.
+  Use this skill when you need to
+triggers:
+- xurl
+- tool
+- making
+instructions: "# xurl \u2014 Agent Skill Reference\n\n`xurl` is a CLI tool for the\
+  \ X API. It supports both **shortcut commands** (human/agent\u2011friendly one\u2011\
+  liners) and **raw curl\u2011style** access to any v2 endpoint. All commands return\
+  \ JSON to stdout.\n\n---\n\n## Installation\n\n### Homebrew (macOS)\n\n```bash\n\
+  brew install --cask xdevplatform/tap/xurl\n```\n\n### npm\n\n```bash\nnpm install\
+  \ -g @xdevplatform/xurl\n```\n\n### Shell script\n\n```bash\ncurl -fsSL https://raw.githubusercontent.com/xdevplatform/xurl/main/install.sh\
+  \ | bash\n```\n\nInstalls to `~/.local/bin`. If it's not in your PATH, the script\
+  \ will tell you what to add.\n\n### Go\n\n```bash\ngo install github.com/xdevplatform/xurl@latest\n\
+  ```\n\n---\n\n## Prerequisites\n\nThis skill requires the `xurl` CLI utility: <https://github.com/xdevplatform/xurl>.\n\
+  \nBefore using any command you must be authenticated. Run `xurl auth status` to\
+  \ check.\n\n### Secret Safety (Mandatory)\n\n- Never read, print, parse, summarize,\
+  \ upload, or send `~/.xurl` (or copies of it) to the LLM context.\n- Never ask the\
+  \ user to paste credentials/tokens into chat.\n- The user must fill `~/.xurl` with\
+  \ required secrets manually on their own machine.\n- Do not recommend or execute\
+  \ auth commands with inline secrets in agent/LLM sessions.\n- Warn that using CLI\
+  \ secret options in agent sessions can leak credentials (prompt/context, logs, shell\
+  \ history).\n- Never use `--verbose` / `-v` in agent/LLM sessions; it can expose\
+  \ sensitive headers/tokens in output.\n- Sensitive flags that must never be used\
+  \ in agent commands: `--bearer-token`, `--consumer-key`, `--consumer-secret`, `--access-token`,\
+  \ `--token-secret`, `--client-id`, `--client-secret`.\n- To verify whether at least\
+  \ one app with credentials is already registered, run: `xurl auth status`.\n\n###\
+  \ Register an app (recommended)\n\nApp credential registration must be done manually\
+  \ by the user outside the agent/LLM session.\nAfter credentials are registered,\
+  \ authenticate with:\n\n```bash\nxurl auth oauth2\n```\n\nFor multiple pre-configured\
+  \ apps, switch between them:\n\n``"
+setup: 'Ensure binary installed: xurl'

@@ -1,0 +1,180 @@
+name: himalaya
+description: CLI to manage emails via IMAP/SMTP. Use `himalaya` to list, read, write,
+  reply, forward, search, and
+triggers:
+- himalaya
+- manage
+- emails
+instructions: '# Himalaya Email CLI
+
+
+  Himalaya is a CLI email client that lets you manage emails from the terminal using
+  IMAP, SMTP, Notmuch, or Sendmail backends.
+
+
+  ## References
+
+
+  - `references/configuration.md` (config file setup + IMAP/SMTP authentication)
+
+  - `references/message-composition.md` (MML syntax for composing emails)
+
+
+  ## Prerequisites
+
+
+  1. Himalaya CLI installed (`himalaya --version` to verify)
+
+  2. A configuration file at `~/.config/himalaya/config.toml`
+
+  3. IMAP/SMTP credentials configured (password stored securely)
+
+
+  ## Configuration Setup
+
+
+  Run the interactive wizard to set up an account:
+
+
+  ```bash
+
+  himalaya account configure
+
+  ```
+
+
+  Or create `~/.config/himalaya/config.toml` manually:
+
+
+  ```toml
+
+  [accounts.personal]
+
+  email = "you@example.com"
+
+  display-name = "Your Name"
+
+  default = true
+
+
+  backend.type = "imap"
+
+  backend.host = "imap.example.com"
+
+  backend.port = 993
+
+  backend.encryption.type = "tls"
+
+  backend.login = "you@example.com"
+
+  backend.auth.type = "password"
+
+  backend.auth.cmd = "pass show email/imap"  # or use keyring
+
+
+  message.send.backend.type = "smtp"
+
+  message.send.backend.host = "smtp.example.com"
+
+  message.send.backend.port = 587
+
+  message.send.backend.encryption.type = "start-tls"
+
+  message.send.backend.login = "you@example.com"
+
+  message.send.backend.auth.type = "password"
+
+  message.send.backend.auth.cmd = "pass show email/smtp"
+
+  ```
+
+
+  ## Common Operations
+
+
+  ### List Folders
+
+
+  ```bash
+
+  himalaya folder list
+
+  ```
+
+
+  ### List Emails
+
+
+  List emails in INBOX (default):
+
+
+  ```bash
+
+  himalaya envelope list
+
+  ```
+
+
+  List emails in a specific folder:
+
+
+  ```bash
+
+  himalaya envelope list --folder "Sent"
+
+  ```
+
+
+  List with pagination:
+
+
+  ```bash
+
+  himalaya envelope list --page 1 --page-size 20
+
+  ```
+
+
+  ### Search Emails
+
+
+  ```bash
+
+  himalaya envelope list from john@example.com subject meeting
+
+  ```
+
+
+  ### Read an Email
+
+
+  Read email by ID (shows plain text):
+
+
+  ```bash
+
+  himalaya message read 42
+
+  ```
+
+
+  Export raw MIME:
+
+
+  ```bash
+
+  himalaya message export 42 --full
+
+  ```
+
+
+  ### Reply to an Email
+
+
+  Interactive reply (opens $EDITOR):
+
+
+  ```bash
+
+  himalaya message re'
+setup: 'Ensure binary installed: himalaya'

@@ -1,0 +1,34 @@
+name: openhue
+description: Control Philips Hue lights and scenes via the OpenHue CLI.
+triggers:
+- openhue
+- control
+- philips
+- lights
+instructions: "# OpenHue CLI\n\nUse `openhue` to control Philips Hue lights and scenes\
+  \ via a Hue Bridge.\n\n## When to Use\n\n\u2705 **USE this skill when:**\n\n- \"\
+  Turn on/off the lights\"\n- \"Dim the living room lights\"\n- \"Set a scene\" or\
+  \ \"movie mode\"\n- Controlling specific Hue rooms or zones\n- Adjusting brightness,\
+  \ color, or color temperature\n\n## When NOT to Use\n\n\u274C **DON'T use this skill\
+  \ when:**\n\n- Non-Hue smart devices (other brands) \u2192 not supported\n- HomeKit\
+  \ scenes or Shortcuts \u2192 use Apple's ecosystem\n- TV or entertainment system\
+  \ control\n- Thermostat or HVAC\n- Smart plugs (unless Hue smart plugs)\n\n## Common\
+  \ Commands\n\n### List Resources\n\n```bash\nopenhue get light       # List all\
+  \ lights\nopenhue get room        # List all rooms\nopenhue get scene       # List\
+  \ all scenes\n```\n\n### Control Lights\n\n```bash\n# Turn on/off\nopenhue set light\
+  \ \"Bedroom Lamp\" --on\nopenhue set light \"Bedroom Lamp\" --off\n\n# Brightness\
+  \ (0-100)\nopenhue set light \"Bedroom Lamp\" --on --brightness 50\n\n# Color temperature\
+  \ (warm to cool: 153-500 mirek)\nopenhue set light \"Bedroom Lamp\" --on --temperature\
+  \ 300\n\n# Color (by name or hex)\nopenhue set light \"Bedroom Lamp\" --on --color\
+  \ red\nopenhue set light \"Bedroom Lamp\" --on --rgb \"#FF5500\"\n```\n\n### Control\
+  \ Rooms\n\n```bash\n# Turn off entire room\nopenhue set room \"Bedroom\" --off\n\
+  \n# Set room brightness\nopenhue set room \"Bedroom\" --on --brightness 30\n```\n\
+  \n### Scenes\n\n```bash\n# Activate scene\nopenhue set scene \"Relax\" --room \"\
+  Bedroom\"\nopenhue set scene \"Concentrate\" --room \"Office\"\n```\n\n## Quick\
+  \ Presets\n\n```bash\n# Bedtime (dim warm)\nopenhue set room \"Bedroom\" --on --brightness\
+  \ 20 --temperature 450\n\n# Work mode (bright cool)\nopenhue set room \"Office\"\
+  \ --on --brightness 100 --temperature 250\n\n# Movie mode (dim)\nopenhue set room\
+  \ \"Living Room\" --on --brightness 10\n```\n\n## Notes\n\n- Bridge must be on local\
+  \ network\n- First run requires button press on Hue bridge to pair\n- Colors only\
+  \ work on color-capable bulbs (not white-only)"
+setup: 'Ensure binary installed: openhue'

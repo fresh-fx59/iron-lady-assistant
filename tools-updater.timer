@@ -1,0 +1,11 @@
+[Unit]
+Description=Daily tool sync timer
+Requires=tools-updater.service
+
+[Timer]
+OnCalendar=daily
+Persistent=true
+RandomizedDelaySec=600  # Run somewhere within 10 minutes of scheduled time
+
+[Install]
+WantedBy=timers.target

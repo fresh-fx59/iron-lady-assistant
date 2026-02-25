@@ -1,0 +1,33 @@
+name: notion
+description: Notion API for creating and managing pages, databases, and blocks.
+triggers:
+- notion
+- notion
+- creating
+instructions: "# notion\n\nUse the Notion API to create/read/update pages, data sources\
+  \ (databases), and blocks.\n\n## Setup\n\n1. Create an integration at https://notion.so/my-integrations\n\
+  2. Copy the API key (starts with `ntn_` or `secret_`)\n3. Store it:\n\n```bash\n\
+  mkdir -p ~/.config/notion\necho \"ntn_your_key_here\" > ~/.config/notion/api_key\n\
+  ```\n\n4. Share target pages/databases with your integration (click \"...\" \u2192\
+  \ \"Connect to\" \u2192 your integration name)\n\n## API Basics\n\nAll requests\
+  \ need:\n\n```bash\nNOTION_KEY=$(cat ~/.config/notion/api_key)\ncurl -X GET \"https://api.notion.com/v1/...\"\
+  \ \\\n  -H \"Authorization: Bearer $NOTION_KEY\" \\\n  -H \"Notion-Version: 2025-09-03\"\
+  \ \\\n  -H \"Content-Type: application/json\"\n```\n\n> **Note:** The `Notion-Version`\
+  \ header is required. This skill uses `2025-09-03` (latest). In this version, databases\
+  \ are called \"data sources\" in the API.\n\n## Common Operations\n\n**Search for\
+  \ pages and data sources:**\n\n```bash\ncurl -X POST \"https://api.notion.com/v1/search\"\
+  \ \\\n  -H \"Authorization: Bearer $NOTION_KEY\" \\\n  -H \"Notion-Version: 2025-09-03\"\
+  \ \\\n  -H \"Content-Type: application/json\" \\\n  -d '{\"query\": \"page title\"\
+  }'\n```\n\n**Get page:**\n\n```bash\ncurl \"https://api.notion.com/v1/pages/{page_id}\"\
+  \ \\\n  -H \"Authorization: Bearer $NOTION_KEY\" \\\n  -H \"Notion-Version: 2025-09-03\"\
+  \n```\n\n**Get page content (blocks):**\n\n```bash\ncurl \"https://api.notion.com/v1/blocks/{page_id}/children\"\
+  \ \\\n  -H \"Authorization: Bearer $NOTION_KEY\" \\\n  -H \"Notion-Version: 2025-09-03\"\
+  \n```\n\n**Create page in a data source:**\n\n```bash\ncurl -X POST \"https://api.notion.com/v1/pages\"\
+  \ \\\n  -H \"Authorization: Bearer $NOTION_KEY\" \\\n  -H \"Notion-Version: 2025-09-03\"\
+  \ \\\n  -H \"Content-Type: application/json\" \\\n  -d '{\n    \"parent\": {\"database_id\"\
+  : \"xxx\"},\n    \"properties\": {\n      \"Name\": {\"title\": [{\"text\": {\"\
+  content\": \"New Item\"}}]},\n      \"Status\": {\"select\": {\"name\": \"Todo\"\
+  }}\n    }\n  }'\n```\n\n**Query a data source (database):**\n\n```bash\ncurl -X\
+  \ POST \"https://api.notion.com/v1/data_sources/{data_source_id}/query\" \\\n  -H\
+  \ \"Authoriz"
+setup: null

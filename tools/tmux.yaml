@@ -1,0 +1,37 @@
+name: tmux
+description: Remote-control tmux sessions for interactive CLIs by sending keystrokes
+  and scraping pane output.
+triggers:
+- tmux
+- remote-control
+- tmux
+- sessions
+- interactive
+instructions: "# tmux Session Control\n\nControl tmux sessions by sending keystrokes\
+  \ and reading output. Essential for managing Claude Code sessions.\n\n## When to\
+  \ Use\n\n\u2705 **USE this skill when:**\n\n- Monitoring Claude/Codex sessions in\
+  \ tmux\n- Sending input to interactive terminal applications\n- Scraping output\
+  \ from long-running processes in tmux\n- Navigating tmux panes/windows programmatically\n\
+  - Checking on background work in existing sessions\n\n## When NOT to Use\n\n\u274C\
+  \ **DON'T use this skill when:**\n\n- Running one-off shell commands \u2192 use\
+  \ `exec` tool directly\n- Starting new background processes \u2192 use `exec` with\
+  \ `background:true`\n- Non-interactive scripts \u2192 use `exec` tool\n- The process\
+  \ isn't in tmux\n- You need to create a new tmux session \u2192 use `exec` with\
+  \ `tmux new-session`\n\n## Example Sessions\n\n| Session                 | Purpose\
+  \                     |\n| ----------------------- | ---------------------------\
+  \ |\n| `shared`                | Primary interactive session |\n| `worker-2` - `worker-8`\
+  \ | Parallel worker sessions    |\n\n## Common Commands\n\n### List Sessions\n\n\
+  ```bash\ntmux list-sessions\ntmux ls\n```\n\n### Capture Output\n\n```bash\n# Last\
+  \ 20 lines of pane\ntmux capture-pane -t shared -p | tail -20\n\n# Entire scrollback\n\
+  tmux capture-pane -t shared -p -S -\n\n# Specific pane in window\ntmux capture-pane\
+  \ -t shared:0.0 -p\n```\n\n### Send Keys\n\n```bash\n# Send text (doesn't press\
+  \ Enter)\ntmux send-keys -t shared \"hello\"\n\n# Send text + Enter\ntmux send-keys\
+  \ -t shared \"y\" Enter\n\n# Send special keys\ntmux send-keys -t shared Enter\n\
+  tmux send-keys -t shared Escape\ntmux send-keys -t shared C-c          # Ctrl+C\n\
+  tmux send-keys -t shared C-d          # Ctrl+D (EOF)\ntmux send-keys -t shared C-z\
+  \          # Ctrl+Z (suspend)\n```\n\n### Window/Pane Navigation\n\n```bash\n# Select\
+  \ window\ntmux select-window -t shared:0\n\n# Select pane\ntmux select-pane -t shared:0.1\n\
+  \n# List windows\ntmux list-windows -t shared\n```\n\n### Session Management\n\n\
+  ```bash\n# Create new session\ntmux new-session -d -s newsession\n\n# Kill session\n\
+  tmux kill-s"
+setup: 'Ensure binary installed: tmux'

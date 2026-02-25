@@ -1,0 +1,36 @@
+name: imsg
+description: iMessage/SMS CLI for listing chats, history, and sending messages via
+  Messages.app.
+triggers:
+- imsg
+- imessage/sms
+- listing
+- chats,
+instructions: "# imsg\n\nUse `imsg` to read and send iMessage/SMS via macOS Messages.app.\n\
+  \n## When to Use\n\n\u2705 **USE this skill when:**\n\n- User explicitly asks to\
+  \ send iMessage or SMS\n- Reading iMessage conversation history\n- Checking recent\
+  \ Messages.app chats\n- Sending to phone numbers or Apple IDs\n\n## When NOT to\
+  \ Use\n\n\u274C **DON'T use this skill when:**\n\n- Telegram messages \u2192 use\
+  \ `message` tool with `channel:telegram`\n- Signal messages \u2192 use Signal channel\
+  \ if configured\n- WhatsApp messages \u2192 use WhatsApp channel if configured\n\
+  - Discord messages \u2192 use `message` tool with `channel:discord`\n- Slack messages\
+  \ \u2192 use `slack` skill\n- Group chat management (adding/removing members) \u2192\
+  \ not supported\n- Bulk/mass messaging \u2192 always confirm with user first\n-\
+  \ Replying in current conversation \u2192 just reply normally (Clawdbot routes automatically)\n\
+  \n## Requirements\n\n- macOS with Messages.app signed in\n- Full Disk Access for\
+  \ terminal\n- Automation permission for Messages.app (for sending)\n\n## Common\
+  \ Commands\n\n### List Chats\n\n```bash\nimsg chats --limit 10 --json\n```\n\n###\
+  \ View History\n\n```bash\n# By chat ID\nimsg history --chat-id 1 --limit 20 --json\n\
+  \n# With attachments info\nimsg history --chat-id 1 --limit 20 --attachments --json\n\
+  ```\n\n### Watch for New Messages\n\n```bash\nimsg watch --chat-id 1 --attachments\n\
+  ```\n\n### Send Messages\n\n```bash\n# Text only\nimsg send --to \"+14155551212\"\
+  \ --text \"Hello!\"\n\n# With attachment\nimsg send --to \"+14155551212\" --text\
+  \ \"Check this out\" --file /path/to/image.jpg\n\n# Specify service\nimsg send --to\
+  \ \"+14155551212\" --text \"Hi\" --service imessage\nimsg send --to \"+14155551212\"\
+  \ --text \"Hi\" --service sms\n```\n\n## Service Options\n\n- `--service imessage`\
+  \ \u2014 Force iMessage (requires recipient has iMessage)\n- `--service sms` \u2014\
+  \ Force SMS (green bubble)\n- `--service auto` \u2014 Let Messages.app decide (default)\n\
+  \n## Safety Rules\n\n1. **Always confirm recipient and message content** before\
+  \ sending\n2. **Never send to unknown numbers** without explicit user approval\n\
+  3. **Be careful with attachments** \u2014 co"
+setup: 'Ensure binary installed: imsg'

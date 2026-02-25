@@ -1,0 +1,34 @@
+name: weather
+description: 'Get current weather and forecasts via wttr.in or Open-Meteo. Use when:
+  user asks about weather, temp'
+triggers:
+- weather
+- current
+- weather
+- forecasts
+instructions: "# Weather Skill\n\nGet current weather conditions and forecasts.\n\n\
+  ## When to Use\n\n\u2705 **USE this skill when:**\n\n- \"What's the weather?\"\n\
+  - \"Will it rain today/tomorrow?\"\n- \"Temperature in [city]\"\n- \"Weather forecast\
+  \ for the week\"\n- Travel planning weather checks\n\n## When NOT to Use\n\n\u274C\
+  \ **DON'T use this skill when:**\n\n- Historical weather data \u2192 use weather\
+  \ archives/APIs\n- Climate analysis or trends \u2192 use specialized data sources\n\
+  - Hyper-local microclimate data \u2192 use local sensors\n- Severe weather alerts\
+  \ \u2192 check official NWS sources\n- Aviation/marine weather \u2192 use specialized\
+  \ services (METAR, etc.)\n\n## Location\n\nAlways include a city, region, or airport\
+  \ code in weather queries.\n\n## Commands\n\n### Current Weather\n\n```bash\n# One-line\
+  \ summary\ncurl \"wttr.in/London?format=3\"\n\n# Detailed current conditions\ncurl\
+  \ \"wttr.in/London?0\"\n\n# Specific city\ncurl \"wttr.in/New+York?format=3\"\n\
+  ```\n\n### Forecasts\n\n```bash\n# 3-day forecast\ncurl \"wttr.in/London\"\n\n#\
+  \ Week forecast\ncurl \"wttr.in/London?format=v2\"\n\n# Specific day (0=today, 1=tomorrow,\
+  \ 2=day after)\ncurl \"wttr.in/London?1\"\n```\n\n### Format Options\n\n```bash\n\
+  # One-liner\ncurl \"wttr.in/London?format=%l:+%c+%t+%w\"\n\n# JSON output\ncurl\
+  \ \"wttr.in/London?format=j1\"\n\n# PNG image\ncurl \"wttr.in/London.png\"\n```\n\
+  \n### Format Codes\n\n- `%c` \u2014 Weather condition emoji\n- `%t` \u2014 Temperature\n\
+  - `%f` \u2014 \"Feels like\"\n- `%w` \u2014 Wind\n- `%h` \u2014 Humidity\n- `%p`\
+  \ \u2014 Precipitation\n- `%l` \u2014 Location\n\n## Quick Responses\n\n**\"What's\
+  \ the weather?\"**\n\n```bash\ncurl -s \"wttr.in/London?format=%l:+%c+%t+(feels+like+%f),+%w+wind,+%h+humidity\"\
+  \n```\n\n**\"Will it rain?\"**\n\n```bash\ncurl -s \"wttr.in/London?format=%l:+%c+%p\"\
+  \n```\n\n**\"Weekend forecast\"**\n\n```bash\ncurl \"wttr.in/London?format=v2\"\n\
+  ```\n\n## Notes\n\n- No API key needed (uses wttr.in)\n- Rate limited; don't spam\
+  \ requests\n- Works for most global cities\n- Supports airport codes: `curl wttr.in/ORD`"
+setup: 'Ensure binary installed: curl'

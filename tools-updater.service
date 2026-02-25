@@ -1,0 +1,12 @@
+[Unit]
+Description=Tool Updater - Daily tool sync from popular repositories
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=claude-developer
+WorkingDirectory=/home/claude-developer/claude-code-as-assistant
+ExecStart=/home/claude-developer/claude-code-as-assistant/venv/bin/python tools_updater.py
+Environment="PATH=/home/claude-developer/claude-code-as-assistant/venv/bin:/usr/local/bin:/usr/bin"
+StandardOutput=journal
+StandardError=journal

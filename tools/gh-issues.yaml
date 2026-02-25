@@ -1,0 +1,37 @@
+name: gh-issues
+description: Fetch GitHub issues, spawn sub-agents to implement fixes and open PRs,
+  then monitor and address PR r
+triggers:
+- gh-issues
+- fetch
+- github
+- issues,
+- spawn
+- sub-agents
+instructions: "# gh-issues \u2014 Auto-fix GitHub Issues with Parallel Sub-agents\n\
+  \nYou are an orchestrator. Follow these 6 phases exactly. Do not skip phases.\n\n\
+  IMPORTANT \u2014 No `gh` CLI dependency. This skill uses curl + the GitHub REST\
+  \ API exclusively. The GH_TOKEN env var is already injected by OpenClaw. Pass it\
+  \ as a Bearer token in all API calls:\n\n```\ncurl -s -H \"Authorization: Bearer\
+  \ $GH_TOKEN\" -H \"Accept: application/vnd.github+json\" ...\n```\n\n---\n\n## Phase\
+  \ 1 \u2014 Parse Arguments\n\nParse the arguments string provided after /gh-issues.\n\
+  \nPositional:\n\n- owner/repo \u2014 optional. This is the source repo to fetch\
+  \ issues from. If omitted, detect from the current git remote:\n  `git remote get-url\
+  \ origin`\n  Extract owner/repo from the URL (handles both HTTPS and SSH formats).\n\
+  \  - HTTPS: https://github.com/owner/repo.git \u2192 owner/repo\n  - SSH: git@github.com:owner/repo.git\
+  \ \u2192 owner/repo\n    If not in a git repo or no remote found, stop with an error\
+  \ asking the user to specify owner/repo.\n\nFlags (all optional):\n| Flag | Default\
+  \ | Description |\n|------|---------|-------------|\n| --label | _(none)_ | Filter\
+  \ by label (e.g. bug, `enhancement`) |\n| --limit | 10 | Max issues to fetch per\
+  \ poll |\n| --milestone | _(none)_ | Filter by milestone title |\n| --assignee |\
+  \ _(none)_ | Filter by assignee (`@me` for self) |\n| --state | open | Issue state:\
+  \ open, closed, all |\n| --fork | _(none)_ | Your fork (`user/repo`) to push branches\
+  \ and open PRs from. Issues are fetched from the source repo; code is pushed to\
+  \ the fork; PRs are opened from the fork to the source repo. |\n| --watch | false\
+  \ | Keep polling for new issues and PR reviews after each batch |\n| --interval\
+  \ | 5 | Minutes between polls (only with `--watch`) |\n| --dry-run | false | Fetch\
+  \ and display only \u2014 no sub-agents |\n| --yes | false | Skip confirmation and\
+  \ auto-process all filtered issues |\n| --reviews-only | false | Skip issue processing\
+  \ (Phases 2-5). Only run Phase 6 \u2014 check open PRs for review comments and address\
+  \ them. |\n| --cron | false | Cron-safe mode:"
+setup: 'Ensure binary installed: curl git gh'

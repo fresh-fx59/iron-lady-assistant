@@ -1,0 +1,37 @@
+name: github
+description: 'GitHub operations via `gh` CLI: issues, PRs, CI runs, code review, API
+  queries. Use when: (1) checki'
+triggers:
+- github
+- github
+- operations
+- '`gh`'
+- 'cli:'
+instructions: "# GitHub Skill\n\nUse the `gh` CLI to interact with GitHub repositories,\
+  \ issues, PRs, and CI.\n\n## When to Use\n\n\u2705 **USE this skill when:**\n\n\
+  - Checking PR status, reviews, or merge readiness\n- Viewing CI/workflow run status\
+  \ and logs\n- Creating, closing, or commenting on issues\n- Creating or merging\
+  \ pull requests\n- Querying GitHub API for repository data\n- Listing repos, releases,\
+  \ or collaborators\n\n## When NOT to Use\n\n\u274C **DON'T use this skill when:**\n\
+  \n- Local git operations (commit, push, pull, branch) \u2192 use `git` directly\n\
+  - Non-GitHub repos (GitLab, Bitbucket, self-hosted) \u2192 different CLIs\n- Cloning\
+  \ repositories \u2192 use `git clone`\n- Reviewing actual code changes \u2192 use\
+  \ `coding-agent` skill\n- Complex multi-file diffs \u2192 use `coding-agent` or\
+  \ read files directly\n\n## Setup\n\n```bash\n# Authenticate (one-time)\ngh auth\
+  \ login\n\n# Verify\ngh auth status\n```\n\n## Common Commands\n\n### Pull Requests\n\
+  \n```bash\n# List PRs\ngh pr list --repo owner/repo\n\n# Check CI status\ngh pr\
+  \ checks 55 --repo owner/repo\n\n# View PR details\ngh pr view 55 --repo owner/repo\n\
+  \n# Create PR\ngh pr create --title \"feat: add feature\" --body \"Description\"\
+  \n\n# Merge PR\ngh pr merge 55 --squash --repo owner/repo\n```\n\n### Issues\n\n\
+  ```bash\n# List issues\ngh issue list --repo owner/repo --state open\n\n# Create\
+  \ issue\ngh issue create --title \"Bug: something broken\" --body \"Details...\"\
+  \n\n# Close issue\ngh issue close 42 --repo owner/repo\n```\n\n### CI/Workflow Runs\n\
+  \n```bash\n# List recent runs\ngh run list --repo owner/repo --limit 10\n\n# View\
+  \ specific run\ngh run view <run-id> --repo owner/repo\n\n# View failed step logs\
+  \ only\ngh run view <run-id> --repo owner/repo --log-failed\n\n# Re-run failed jobs\n\
+  gh run rerun <run-id> --failed --repo owner/repo\n```\n\n### API Queries\n\n```bash\n\
+  # Get PR with specific fields\ngh api repos/owner/repo/pulls/55 --jq '.title, .state,\
+  \ .user.login'\n\n# List all labels\ngh api repos/owner/repo/labels --jq '.[].name'\n\
+  \n# Get repo stats\ngh api repos/owner/repo --jq '{stars: .stargazers_count, forks:\
+  \ .forks_count}'\n```\n\n## J"
+setup: 'Ensure binary installed: gh'

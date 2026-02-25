@@ -1,0 +1,35 @@
+name: coding-agent
+description: 'Delegate coding tasks to Codex, Claude Code, or Pi agents via background
+  process. Use when: (1) buil'
+triggers:
+- coding-agent
+- delegate
+- coding
+- tasks
+- codex,
+instructions: "# Coding Agent (bash-first)\n\nUse **bash** (with optional background\
+  \ mode) for all coding agent work. Simple and effective.\n\n## \u26A0\uFE0F PTY\
+  \ Mode Required!\n\nCoding agents (Codex, Claude Code, Pi) are **interactive terminal\
+  \ applications** that need a pseudo-terminal (PTY) to work correctly. Without PTY,\
+  \ you'll get broken output, missing colors, or the agent may hang.\n\n**Always use\
+  \ `pty:true`** when running coding agents:\n\n```bash\n# \u2705 Correct - with PTY\n\
+  bash pty:true command:\"codex exec 'Your prompt'\"\n\n# \u274C Wrong - no PTY, agent\
+  \ may break\nbash command:\"codex exec 'Your prompt'\"\n```\n\n### Bash Tool Parameters\n\
+  \n| Parameter    | Type    | Description                                       \
+  \                          |\n| ------------ | ------- | ---------------------------------------------------------------------------\
+  \ |\n| `command`    | string  | The shell command to run                       \
+  \                             |\n| `pty`        | boolean | **Use for coding agents!**\
+  \ Allocates a pseudo-terminal for interactive CLIs |\n| `workdir`    | string  |\
+  \ Working directory (agent sees only this folder's context)                   |\n\
+  | `background` | boolean | Run in background, returns sessionId for monitoring \
+  \                        |\n| `timeout`    | number  | Timeout in seconds (kills\
+  \ process on expiry)                                |\n| `elevated`   | boolean\
+  \ | Run on host instead of sandbox (if allowed)                                \
+  \ |\n\n### Process Tool Actions (for background sessions)\n\n| Action      | Description\
+  \                                          |\n| ----------- | ----------------------------------------------------\
+  \ |\n| `list`      | List all running/recent sessions                     |\n| `poll`\
+  \      | Check if session is still running                    |\n| `log`       |\
+  \ Get session output (with optional offset/limit)      |\n| `write`     | Send raw\
+  \ data to stdin                               |\n| `submit`    | Send data + newline\
+  \ (like typing and pressing Enter) |\n| `s"
+setup: null

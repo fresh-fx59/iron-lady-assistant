@@ -1,0 +1,35 @@
+name: session-logs
+description: Search and analyze your own session logs (older/parent conversations)
+  using jq.
+triggers:
+- session-logs
+- search
+- analyze
+- your
+instructions: "# session-logs\n\nSearch your complete conversation history stored\
+  \ in session JSONL files. Use this when a user references older/parent conversations\
+  \ or asks what was said before.\n\n## Trigger\n\nUse this skill when the user asks\
+  \ about prior chats, parent conversations, or historical context that isn't in memory\
+  \ files.\n\n## Location\n\nSession logs live at: `~/.openclaw/agents/<agentId>/sessions/`\
+  \ (use the `agent=<id>` value from the system prompt Runtime line).\n\n- **`sessions.json`**\
+  \ - Index mapping session keys to session IDs\n- **`<session-id>.jsonl`** - Full\
+  \ conversation transcript per session\n\n## Structure\n\nEach `.jsonl` file contains\
+  \ messages with:\n\n- `type`: \"session\" (metadata) or \"message\"\n- `timestamp`:\
+  \ ISO timestamp\n- `message.role`: \"user\", \"assistant\", or \"toolResult\"\n\
+  - `message.content[]`: Text, thinking, or tool calls (filter `type==\"text\"` for\
+  \ human-readable content)\n- `message.usage.cost.total`: Cost per response\n\n##\
+  \ Common Queries\n\n### List all sessions by date and size\n\n```bash\nfor f in\
+  \ ~/.openclaw/agents/<agentId>/sessions/*.jsonl; do\n  date=$(head -1 \"$f\" | jq\
+  \ -r '.timestamp' | cut -dT -f1)\n  size=$(ls -lh \"$f\" | awk '{print $5}')\n \
+  \ echo \"$date $size $(basename $f)\"\ndone | sort -r\n```\n\n### Find sessions\
+  \ from a specific day\n\n```bash\nfor f in ~/.openclaw/agents/<agentId>/sessions/*.jsonl;\
+  \ do\n  head -1 \"$f\" | jq -r '.timestamp' | grep -q \"2026-01-06\" && echo \"\
+  $f\"\ndone\n```\n\n### Extract user messages from a session\n\n```bash\njq -r 'select(.message.role\
+  \ == \"user\") | .message.content[]? | select(.type == \"text\") | .text' <session>.jsonl\n\
+  ```\n\n### Search for keyword in assistant responses\n\n```bash\njq -r 'select(.message.role\
+  \ == \"assistant\") | .message.content[]? | select(.type == \"text\") | .text' <session>.jsonl\
+  \ | rg -i \"keyword\"\n```\n\n### Get total cost for a session\n\n```bash\njq -s\
+  \ '[.[] | .message.usage.cost.total // 0] | add' <session>.jsonl\n```\n\n### Daily\
+  \ cost summary\n\n```bash\nfor f in ~/.openclaw/agents/<agentId>/sessions/*.jsonl;\
+  \ do\n  date=$(head -1 \"$f\" | jq"
+setup: 'Ensure binary installed: jq rg'

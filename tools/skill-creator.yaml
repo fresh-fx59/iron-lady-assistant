@@ -1,0 +1,34 @@
+name: skill-creator
+description: Create or update AgentSkills. Use when designing, structuring, or packaging
+  skills with scripts, ref
+triggers:
+- skill-creator
+- create
+- update
+- agentskills.
+instructions: "# Skill Creator\n\nThis skill provides guidance for creating effective\
+  \ skills.\n\n## About Skills\n\nSkills are modular, self-contained packages that\
+  \ extend Codex's capabilities by providing\nspecialized knowledge, workflows, and\
+  \ tools. Think of them as \"onboarding guides\" for specific\ndomains or tasks\u2014\
+  they transform Codex from a general-purpose agent into a specialized agent\nequipped\
+  \ with procedural knowledge that no model can fully possess.\n\n### What Skills\
+  \ Provide\n\n1. Specialized workflows - Multi-step procedures for specific domains\n\
+  2. Tool integrations - Instructions for working with specific file formats or APIs\n\
+  3. Domain expertise - Company-specific knowledge, schemas, business logic\n4. Bundled\
+  \ resources - Scripts, references, and assets for complex and repetitive tasks\n\
+  \n## Core Principles\n\n### Concise is Key\n\nThe context window is a public good.\
+  \ Skills share the context window with everything else Codex needs: system prompt,\
+  \ conversation history, other Skills' metadata, and the actual user request.\n\n\
+  **Default assumption: Codex is already very smart.** Only add context Codex doesn't\
+  \ already have. Challenge each piece of information: \"Does Codex really need this\
+  \ explanation?\" and \"Does this paragraph justify its token cost?\"\n\nPrefer concise\
+  \ examples over verbose explanations.\n\n### Set Appropriate Degrees of Freedom\n\
+  \nMatch the level of specificity to the task's fragility and variability:\n\n**High\
+  \ freedom (text-based instructions)**: Use when multiple approaches are valid, decisions\
+  \ depend on context, or heuristics guide the approach.\n\n**Medium freedom (pseudocode\
+  \ or scripts with parameters)**: Use when a preferred pattern exists, some variation\
+  \ is acceptable, or configuration affects behavior.\n\n**Low freedom (specific scripts,\
+  \ few parameters)**: Use when operations are fragile and error-prone, consistency\
+  \ is critical, or a specific sequence must be followed.\n\nThink of Codex as exploring\
+  \ a path: a narrow bridge with cliffs needs specific guardrails (low freedom), while "
+setup: null

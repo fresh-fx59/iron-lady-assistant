@@ -1,0 +1,37 @@
+name: apple-reminders
+description: Manage Apple Reminders via remindctl CLI (list, add, edit, complete,
+  delete). Supports lists, date f
+triggers:
+- apple-reminders
+- manage
+- apple
+- reminders
+- remindctl
+instructions: "# Apple Reminders CLI (remindctl)\n\nUse `remindctl` to manage Apple\
+  \ Reminders directly from the terminal.\n\n## When to Use\n\n\u2705 **USE this skill\
+  \ when:**\n\n- User explicitly mentions \"reminder\" or \"Reminders app\"\n- Creating\
+  \ personal to-dos with due dates that sync to iOS\n- Managing Apple Reminders lists\n\
+  - User wants tasks to appear in their iPhone/iPad Reminders app\n\n## When NOT to\
+  \ Use\n\n\u274C **DON'T use this skill when:**\n\n- Scheduling Clawdbot tasks or\
+  \ alerts \u2192 use `cron` tool with systemEvent instead\n- Calendar events or appointments\
+  \ \u2192 use Apple Calendar\n- Project/work task management \u2192 use Notion, GitHub\
+  \ Issues, or task queue\n- One-time notifications \u2192 use `cron` tool for timed\
+  \ alerts\n- User says \"remind me\" but means a Clawdbot alert \u2192 clarify first\n\
+  \n## Setup\n\n- Install: `brew install steipete/tap/remindctl`\n- macOS-only; grant\
+  \ Reminders permission when prompted\n- Check status: `remindctl status`\n- Request\
+  \ access: `remindctl authorize`\n\n## Common Commands\n\n### View Reminders\n\n\
+  ```bash\nremindctl                    # Today's reminders\nremindctl today     \
+  \         # Today\nremindctl tomorrow           # Tomorrow\nremindctl week     \
+  \          # This week\nremindctl overdue            # Past due\nremindctl all \
+  \               # Everything\nremindctl 2026-01-04         # Specific date\n```\n\
+  \n### Manage Lists\n\n```bash\nremindctl list               # List all lists\nremindctl\
+  \ list Work          # Show specific list\nremindctl list Projects --create    #\
+  \ Create list\nremindctl list Work --delete        # Delete list\n```\n\n### Create\
+  \ Reminders\n\n```bash\nremindctl add \"Buy milk\"\nremindctl add --title \"Call\
+  \ mom\" --list Personal --due tomorrow\nremindctl add --title \"Meeting prep\" --due\
+  \ \"2026-02-15 09:00\"\n```\n\n### Complete/Delete\n\n```bash\nremindctl complete\
+  \ 1 2 3     # Complete by ID\nremindctl delete 4A83 --force  # Delete by ID\n```\n\
+  \n### Output Formats\n\n```bash\nremindctl today --json       # JSON for scripting\n\
+  remindctl today --plain      # TSV format\nremindctl today --quiet      # Counts\
+  \ only\n```\n\n"
+setup: 'Ensure binary installed: remindctl'

@@ -39,8 +39,20 @@ def markdown_to_html(text: str) -> str:
             code_lines.append(line)
             continue
 
-        # Normal line: escape HTML first, then apply formatting
-        line = _escape_html(line)
+        # Headings: #, ##, ### (convert to bold with emoji prefix)
+        heading_match = re.match(r"^(#{1,3})\s+(.+)$", line)
+        if heading_match:
+            level = len(heading_match.group(1))
+            heading_text = heading_match.group(2).strip()
+            line = _escape_html(heading_text)
+            # Add emoji prefixes based on heading level
+            if level == 1:
+                result.append(f"\n<b>📍 {line}</b>\n")
+            elif level == 2:
+                result.append(f"\n<b>▫️ {line}</b>")
+            else:  # level == 3
+                result.append(f"\n<b>• {line}</b>")
+            continue
 
         # Bold: **text** or __text__
         line = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", line)

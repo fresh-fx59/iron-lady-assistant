@@ -48,13 +48,14 @@ if grep -q "^TELEGRAM_BOT_TOKEN=your-bot-token-here" .env 2>/dev/null; then
     exit 1
 fi
 
-# ── Create venv and install deps if missing ──────────────────
+# ── Create venv if missing ───────────────────────────────────
 if [ ! -d "venv" ]; then
     info "First run — setting up Python environment..."
     python3 -m venv venv
-    venv/bin/pip install --quiet -r requirements.txt
-    info "Dependencies installed."
 fi
+
+# ── Sync dependencies (installs new/updated packages) ───────
+venv/bin/pip install --quiet -r requirements.txt
 
 # ── Start the bot ────────────────────────────────────────────
 source venv/bin/activate

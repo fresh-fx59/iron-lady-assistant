@@ -1,6 +1,6 @@
 # Claude Code as Telegram Assistant
 
-**Current version: `0.15.0`** — defined in `src/config.py` as `VERSION`.
+**Current version: `0.15.1`** — defined in `src/config.py` as `VERSION`.
 
 Telegram bot that bridges messages to Claude Code's `--print` mode via subprocess, providing a conversational AI assistant through Telegram.
 
@@ -169,10 +169,24 @@ Push to `main` branch triggers `deploy.sh` via GitHub Actions SSH. The script:
 This gives full rollback protection for both import-time errors (caught by smoke test) and runtime startup errors (caught by health check).
 
 Required secrets in GitHub repo:
-- `SERVER_HOST` - Your server hostname or IP
-- `SERVER_USER` - SSH username
-- `SSH_PRIVATE_KEY` - Private SSH key for connection
-- `SSH_PORT` - SSH port (optional, defaults to 22)
+- `SERVER_HOST` - Your server hostname or IP (e.g., `your-server.com` or `1.2.3.4`)
+- `SERVER_USER` - SSH username on the server (e.g., `claude-developer`)
+- `SSH_PRIVATE_KEY` - Private SSH key content (full key with `-----BEGIN ...-----` headers)
+- `SSH_PORT` - SSH port (optional, defaults to 22; only needed if you use a non-standard port)
+
+**Setup SSH key for passwordless deploy:**
+```bash
+# Generate a new key pair
+ssh-keygen -t ed25519 -f ~/.ssh/deploy_key -N ""
+
+# Copy PUBLIC key to your server
+ssh-copy-id -i ~/.ssh/deploy_key.pub user@your-server-host
+
+# Test passwordless SSH
+ssh -i ~/.ssh/deploy_key user@your-server-host hostname
+```
+
+Then paste the **private key** (`~/.ssh/deploy_key`) into GitHub as `SSH_PRIVATE_KEY`.
 
 #### Manual Deployment
 
@@ -197,7 +211,7 @@ When the bot starts, it sends a Telegram notification to the first admin:
 ```
 🚀 Bot restarted
 
-📦 Version: v0.15.0
+📦 Version: v0.15.1
 📦 Commit: abc1234
 
 ✅ Ready to assist!

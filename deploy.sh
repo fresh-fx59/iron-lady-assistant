@@ -62,15 +62,15 @@ git fetch origin main
 NEW_COMMIT=$(git rev-parse origin/main)
 NEW_SHORT=$(echo "$NEW_COMMIT" | cut -c1-7)
 
+ALREADY_CURRENT=false
 if [ "$ROLLBACK_COMMIT" = "$NEW_COMMIT" ]; then
-    deploy_log "Already on latest commit $NEW_SHORT. Nothing to deploy."
-    exit 0
+    deploy_log "Already on latest commit $NEW_SHORT. Will restart service."
+    ALREADY_CURRENT=true
+else
+    deploy_log "Deploying $ROLLBACK_SHORT -> $NEW_SHORT"
+    # ── 3. Switch to new code ────────────────────────────────────
+    git reset --hard origin/main
 fi
-
-deploy_log "Deploying $ROLLBACK_SHORT -> $NEW_SHORT"
-
-# ── 3. Switch to new code ────────────────────────────────────
-git reset --hard origin/main
 
 # ── 4. Install deps + smoke test ─────────────────────────────
 # Create venv if missing
@@ -82,13 +82,21 @@ fi
 venv/bin/pip install --quiet -r requirements.txt
 
 if ! venv/bin/python3 -c "from src.config import VERSION; print(f'Smoke test OK: v{VERSION}')" 2>>"$DEPLOY_LOG"; then
-    deploy_log "SMOKE TEST FAILED for $NEW_SHORT. Rolling back to $ROLLBACK_SHORT."
-    git reset --hard "$ROLLBACK_COMMIT"
-    notify_admin "❌ *Deploy failed* (smoke test)
+    deploy_log "SMOKE TEST FAILED for $NEW_SHORT."
+    if [ "$ALREADY_CURRENT" = false ]; then
+        deploy_log "Rolling back to $ROLLBACK_SHORT."
+        git reset --hard "$ROLLBACK_COMMIT"
+        notify_admin "❌ *Deploy failed* (smoke test)
 
 Commit \`$NEW_SHORT\` failed smoke test.
 Rolled back to \`$ROLLBACK_SHORT\`.
 Service was not restarted — old code still running."
+    else
+        notify_admin "❌ *Deploy failed* (smoke test)
+
+Commit \`$NEW_SHORT\` failed smoke test.
+Service was not restarted."
+    fi
     exit 1
 fi
 
@@ -126,19 +134,27 @@ for i in $(seq 1 "$HEALTH_TIMEOUT"); do
 done
 
 # ── 8. Health check failed — rollback ────────────────────────
-deploy_log "HEALTH CHECK FAILED for $NEW_SHORT after ${HEALTH_TIMEOUT}s. Rolling back to $ROLLBACK_SHORT."
+deploy_log "HEALTH CHECK FAILED for $NEW_SHORT after ${HEALTH_TIMEOUT}s."
 
-git reset --hard "$ROLLBACK_COMMIT"
+if [ "$ALREADY_CURRENT" = false ]; then
+    deploy_log "Rolling back to $ROLLBACK_SHORT."
+    git reset --hard "$ROLLBACK_COMMIT"
 
-# Clear crash counter again for clean rollback start
-: > "$START_TIMES"
+    # Clear crash counter again for clean rollback start
+    : > "$START_TIMES"
 
-sudo systemctl restart telegram-bot.service
+    sudo systemctl restart telegram-bot.service
 
-notify_admin "❌ *Deploy failed* (health check)
+    notify_admin "❌ *Deploy failed* (health check)
 
 Commit \`$NEW_SHORT\` did not become healthy within ${HEALTH_TIMEOUT}s.
 Rolled back to \`$ROLLBACK_SHORT\` and restarted.
 Check \`.deploy/deploy.log\` for details."
+else
+    notify_admin "❌ *Deploy failed* (health check)
+
+Commit \`$NEW_SHORT\` did not become healthy within ${HEALTH_TIMEOUT}s.
+Check \`.deploy/deploy.log\` for details."
+fi
 
 exit 1

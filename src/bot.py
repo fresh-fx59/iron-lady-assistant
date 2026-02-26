@@ -96,6 +96,9 @@ def _model_options(provider) -> list[str]:
 
 def _codex_model_arg(session: object, provider) -> str | None:
     model = session.codex_model or provider.model
+    allowed = set(provider.models or ["default"])
+    if model and model not in allowed:
+        return None
     if model == "default":
         return None
     return model

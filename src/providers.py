@@ -163,20 +163,11 @@ class ProviderManager:
         return self._cfg.providers
 
     def get_provider(self, chat_id: int) -> Provider:
-        """Return the current provider for a chat, auto-recovering if cooldown passed."""
+        """Return the current provider for a chat (NO auto-recovery to prevent unexpected switches)."""
         idx = self._chat_provider_idx.get(chat_id, 0)
 
-        # Auto-recover to primary after cooldown
-        if idx > 0 and chat_id in self._fallback_since:
-            elapsed = time.monotonic() - self._fallback_since[chat_id]
-            if elapsed >= self._cfg.cooldown_minutes * 60:
-                logger.info(
-                    "Chat %d: cooldown expired (%.0f min), restoring primary provider",
-                    chat_id, elapsed / 60,
-                )
-                self._chat_provider_idx[chat_id] = 0
-                self._fallback_since.pop(chat_id, None)
-                idx = 0
+        # No auto-recovery - provider only changes on explicit user interaction
+        # via /provider command or provider manager reset method
 
         return self._cfg.providers[idx]
 

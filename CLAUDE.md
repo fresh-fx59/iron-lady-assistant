@@ -1,6 +1,6 @@
 # Claude Code as Telegram Assistant
 
-**Current version: `0.14.0`** — defined in `src/config.py` as `VERSION`.
+**Current version: `0.15.0`** — defined in `src/config.py` as `VERSION`.
 
 Telegram bot that bridges messages to Claude Code's `--print` mode via subprocess, providing a conversational AI assistant through Telegram.
 
@@ -153,18 +153,20 @@ Three-layer safety system prevents the bot from going silent after a bad deploy:
 
 **IMPORTANT: Follow this procedure for every deploy to ensure rollback safety.**
 
-#### Automatic Deployment (GitHub Actions)
+#### Automatic Deployment (GitHub Actions) — with rollback protection
 
-Push to `main` branch triggers automatic deployment via GitHub Actions:
-- Pulls latest code
-- Restarts `telegram-bot.service`
-- Bot sends you a startup notification via Telegram
+Push to `main` branch triggers `deploy.sh` via GitHub Actions SSH. The script:
 
-⚠️ **Important: Rollback Safety**
-The GitHub Actions restart is simplified and doesn't update the `good_commit` marker. This means:
-- Auto-rollback detection in `run.sh` won't recognize repeated restarts as crash loops
-- If the new code crashes repeatedly, you'll need to manually intervene
-- For full rollback safety after bad deploys via GitHub Actions, run restarts manually using **Manual Deployment** steps below
+1. Saves current commit as rollback target
+2. Pulls new code (`git fetch origin main && git reset --hard origin/main`)
+3. Installs deps and runs **smoke test** (`from src.config import VERSION`)
+4. If smoke test fails → **rollback immediately**, service not restarted, admin notified
+5. Clears crash counter, restarts `telegram-bot.service`
+6. **Health check**: polls for up to 30s, waiting for `good_commit` to match the new commit
+7. If health check fails → **rollback + restart**, admin notified via Telegram
+8. If healthy → deploy success, exit 0
+
+This gives full rollback protection for both import-time errors (caught by smoke test) and runtime startup errors (caught by health check).
 
 Required secrets in GitHub repo:
 - `SERVER_HOST` - Your server hostname or IP
@@ -174,42 +176,32 @@ Required secrets in GitHub repo:
 
 #### Manual Deployment
 
-After committing changes:
+You can also run `deploy.sh` directly on the server:
 ```bash
-# 1. Copy updated service file (only if telegram-bot.service changed)
-sudo cp telegram-bot.service /etc/systemd/system/
+# Protected deploy (same as GitHub Actions)
+./deploy.sh
+
+# Or manual steps:
+sudo cp telegram-bot.service /etc/systemd/system/  # only if service file changed
 sudo systemctl daemon-reload
-
-# 2. Restart the service
 sudo systemctl restart telegram-bot.service
-
-# 3. Verify it's running
 sudo systemctl status telegram-bot.service
 cat .deploy/deploy.log | tail -5
-
-# 4. Confirm good_commit was updated (wait a few seconds for bot to connect)
 cat .deploy/good_commit
 ```
 
 ### Startup Notification
 
-When the bot starts (or restarts), it sends a Telegram notification to the first admin user:
+When the bot starts, it sends a Telegram notification to the first admin:
 
 ```
 🚀 Bot restarted
 
-📦 Version: v0.14.0
-📦 Commit: 7aa872a
-Uptime: 2h 35m
+📦 Version: v0.15.0
+📦 Commit: abc1234
 
 ✅ Ready to assist!
 ```
-
-This confirms:
-- Which version is running (`VERSION` in config.py)
-- Which git commit was deployed
-- Bot uptime (from systemd service)
-- Bot is ready to accept messages
 
 If something goes wrong, the bot will auto-rollback after 3 crash restarts. Check `.deploy/deploy.log` for details.
 

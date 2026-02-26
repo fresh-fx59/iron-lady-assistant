@@ -11,37 +11,20 @@ jobs:
     timeout-minutes: 5
 
     steps:
-      - name: Deploy and Restart Bot
+      - name: Protected Deploy with Rollback
         uses: appleboy/ssh-action@v1.0.0
         with:
           host: ${{ secrets.SERVER_HOST }}
           username: ${{ secrets.SERVER_USER }}
           key: ${{ secrets.SSH_PRIVATE_KEY }}
           port: ${{ secrets.SSH_PORT || 22 }}
-          script_stop: false
+          script_stop: true
           script: |
             cd /home/claude-developer/claude-code-as-assistant
 
-            # Pull latest changes
+            # Fetch latest and extract deploy script from new commit
             git fetch origin main
-            git reset --hard origin/main
+            git show origin/main:deploy.sh > /tmp/_deploy.sh
 
-            # Check if bot is running
-            if systemctl is-active --quiet telegram-bot.service; then
-              echo "Bot is running. Restarting..."
-              sudo systemctl restart telegram-bot.service
-            else
-              echo "Bot is not running. Starting..."
-              sudo systemctl start telegram-bot.service
-            fi
-
-            # Wait for bot to start
-            sleep 5
-
-            # Show status
-            sudo systemctl status telegram-bot.service --no-pager || true
-
-            # Show latest commit
-            echo ""
-            echo "Current commit:"
-            git log -1 --oneline
+            # Run protected deploy (smoke test + health check + rollback)
+            bash /tmp/_deploy.sh

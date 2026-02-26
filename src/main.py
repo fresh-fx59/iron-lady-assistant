@@ -32,62 +32,22 @@ def mark_good_commit() -> None:
 
 
 async def send_startup_notification(bot: Bot, commit: str | None = None) -> None:
-    """Send startup notification to all admins.
-
-    Note: GitHub Actions deployments don't mark good_commit, so repeated
-    restarts won't trigger crash loop protection. Always test new code
-    manually after GitHub Actions deploys using /bg commands.
-    """
+    """Send startup notification to first admin."""
     if not ALLOWED_USER_IDS:
         return
 
     try:
-        # Get first admin user for nicer formatting
         first_admin = min(ALLOWED_USER_IDS)
 
-        commit_line = f"📦 Commit: <code>{commit}</code>" if commit else ""
+        lines = ["🚀 <b>Bot restarted</b>\n"]
+        lines.append(f"📦 Version: <code>{VERSION}</code>")
+        if commit:
+            lines.append(f"📦 Commit: <code>{commit}</code>")
 
-        # Check if running via GitHub Actions or manual restart
-        # If good_commit missing, it's a GitHub Actions deploy
-        from_path = Path(__file__).parent.parent / ".deploy" / "good_commit"
-        is_github_actions_deploy = not from_path.exists()
+        lines.append("\n✅ Ready to assist!")
 
-        # Add uptime info
-        try:
-            uptime_result = subprocess.run(
-                ["systemctl", "show", "telegram-bot.service", "--property=UptimeMSec"],
-                capture_output=True, text=True, timeout=5,
-            )
-            if uptime_result.returncode == 0:
-                uptime_sec = float(uptime_result.stdout.strip()) / 1000
-                uptime_str = f"Uptime: {uptime_sec:.0f}s"
-                if uptime_sec > 3600:
-                    hours = int(uptime_sec // 3600)
-                    mins = int((uptime_sec % 3600) / 60)
-                    uptime_str = f"Uptime: {hours}h {mins}m"
-        except Exception:
-            uptime_str = ""
+        message = "\n".join(lines)
 
-        message = (
-            f"🚀 <b>Bot restarted</b>\n\n"
-            f"📦 Version: <code>{VERSION}</code>\n"
-            f"{commit_line}\n" if commit else f"📦 Version: <code>{VERSION}</code>\n"
-            f"{uptime_str}\n" if uptime_str else ""
-        )
-
-        # Add note about GitHub Actions limitation
-        if is_github_actions_deploy and commit:
-            message += (
-                "\n\n⚠️ <b>GitHub Actions deployment detected</b>\n\n"
-                "Crash loop protection disabled for this restart.\n"
-                "Please test new code manually with /bg commands.\n"
-                "If new code has issues, use manual rollback:\n"
-                f"  <code>git reset --hard {commit}~1</code>"
-            )
-
-        message += "\n\n✅ Ready to assist!"
-
-        # Send to first admin (others can type /start)
         try:
             await bot.send_message(chat_id=first_admin, text=message, parse_mode="HTML")
             logging.info("Sent startup notification to admin %s", first_admin)

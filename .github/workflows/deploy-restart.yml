@@ -20,7 +20,7 @@ jobs:
           port: ${{ secrets.SSH_PORT || 22 }}
           script_stop: true
           script: |
-            cd /home/claude-developer/claude-code-as-assistant
+            cd /home/claude-developer/claude-code-as-assistant/work-dir
 
             # Fetch latest and extract deploy script from new commit
             git fetch origin main

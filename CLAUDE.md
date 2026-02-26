@@ -1,6 +1,6 @@
 # Claude Code as Telegram Assistant
 
-**Current version: `0.15.1`** — defined in `src/config.py` as `VERSION`.
+**Current version: `0.15.2`** — defined in `src/config.py` as `VERSION`.
 
 Telegram bot that bridges messages to Claude Code's `--print` mode via subprocess, providing a conversational AI assistant through Telegram.
 
@@ -211,7 +211,7 @@ When the bot starts, it sends a Telegram notification to the first admin:
 ```
 🚀 Bot restarted
 
-📦 Version: v0.15.1
+📦 Version: v0.15.2
 📦 Commit: abc1234
 
 ✅ Ready to assist!

@@ -376,6 +376,7 @@ class TestCommandLineArgs:
             assert "--verbose" in args
             assert "--include-partial-messages" in args
             assert "--model" in args
+            assert "--dangerously-skip-permissions" in args
 
     async def test_resume_flag_with_session_id(self, mock_subprocess_lines, mock_successful_response):
         """Should include --resume when session_id is provided."""

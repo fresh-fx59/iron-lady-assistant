@@ -196,6 +196,7 @@ async def stream_message(
         "--verbose",
         "--include-partial-messages",
         "--model", model,
+        "--dangerously-skip-permissions",
     ]
     if session_id:
         cmd.extend(["--resume", session_id])

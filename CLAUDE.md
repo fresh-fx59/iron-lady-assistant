@@ -7,7 +7,7 @@ Telegram bot that bridges messages to Claude Code's `--print` mode via subproces
 ## Architecture
 
 - **aiogram 3.x** async Telegram bot with long-polling
-- **asyncio subprocess** runs `claude -p` per message with `--output-format stream-json --verbose --include-partial-messages`
+- **asyncio subprocess** runs `claude -p` per message with `--output-format stream-json --verbose --include-partial-messages` and `--dangerously-skip-permissions`
 - **`--resume <session_id>`** for conversation continuity
 - **Streaming output** with idle timeout (default 120s) — checks if subprocess is still alive on timeout; only fails if process actually dies
 - **Live progress updates** show current Claude activity (Reading, Editing, Running commands, etc.) with heartbeat animation for long-running tasks

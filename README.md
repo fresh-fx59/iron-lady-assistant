@@ -169,6 +169,10 @@ Tracked metrics include: message counts, response times, API costs, and active s
 │   ├── start_times       # Recent start timestamps for crash detection
 │   └── deploy.log        # Persistent log of deploys, crashes, rollbacks
 └── src/
+    ├── core/             # Stable orchestration primitives
+    │   └── context_plugins.py
+    ├── plugins/          # Extensible context/tool modules
+    │   └── tools_plugin.py
     ├── main.py           # Entry point, marks good commits on successful start
     ├── config.py         # Configuration loader
     ├── bot.py            # Telegram command handlers
@@ -176,7 +180,7 @@ Tracked metrics include: message counts, response times, API costs, and active s
     ├── sessions.py       # Conversation session management
     ├── providers.py      # Provider fallback chain
     ├── memory.py         # Persistent memory (YAML profile + SQLite episodes)
-    ├── tools.py          # Tool registry with lazy loading
+    ├── tools.py          # Backward-compatible shim to tools plugin
     ├── progress.py       # Live progress updates
     ├── formatter.py      # Markdown-to-HTML conversion
     └── metrics.py        # Prometheus metrics

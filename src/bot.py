@@ -17,12 +17,13 @@ from aiogram.enums import ChatAction
 from aiogram.exceptions import TelegramAPIError
 
 from . import bridge, config, metrics
+from .core.context_plugins import ContextPluginRegistry
 from .sessions import SessionManager
 from .formatter import markdown_to_html, split_message, strip_html
 from .memory import MemoryManager
 from .progress import ProgressReporter
 from .providers import ProviderManager
-from .tools import ToolRegistry
+from .plugins.tools_plugin import ToolRegistry
 from .tasks import TaskManager, TaskStatus
 
 logger = logging.getLogger(__name__)
@@ -32,6 +33,7 @@ session_manager = SessionManager()
 provider_manager = ProviderManager()
 memory_manager = MemoryManager(config.MEMORY_DIR)
 tool_registry = ToolRegistry(config.TOOLS_DIR)
+context_plugins = ContextPluginRegistry([tool_registry])
 task_manager: TaskManager | None = None  # Set in main()
 
 # Restore persisted provider selections from sessions
@@ -637,7 +639,7 @@ async def cmd_bg(message: Message) -> None:
 
     # Build memory and tool-augmented prompt
     memory_context = memory_manager.build_context(prompt)
-    tool_context = tool_registry.build_context(prompt)
+    tool_context = context_plugins.build_context(prompt)
     memory_instructions = memory_manager.build_instructions()
 
     prompt_parts = []
@@ -763,7 +765,7 @@ async def _run_claude(
     # Build memory and tool-augmented prompt
     raw_prompt = message.text or ""
     memory_context = memory_manager.build_context(raw_prompt)
-    tool_context = tool_registry.build_context(raw_prompt)
+    tool_context = context_plugins.build_context(raw_prompt)
     memory_instructions = memory_manager.build_instructions()
 
     # Assemble prompt with all context layers
@@ -835,7 +837,7 @@ async def _run_codex(
     # Build memory and tool-augmented prompt
     raw_prompt = message.text or ""
     memory_context = memory_manager.build_context(raw_prompt)
-    tool_context = tool_registry.build_context(raw_prompt)
+    tool_context = context_plugins.build_context(raw_prompt)
     memory_instructions = memory_manager.build_instructions()
 
     prompt_parts = []

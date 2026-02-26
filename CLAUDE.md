@@ -1,6 +1,6 @@
 # Claude Code as Telegram Assistant
 
-**Current version: `0.16.8`** — defined in `src/config.py` as `VERSION`.
+**Current version: `0.16.9`** — defined in `src/config.py` as `VERSION`.
 
 Telegram bot that bridges messages to Claude Code's `--print` mode via subprocess, providing a conversational AI assistant through Telegram.
 
@@ -18,18 +18,22 @@ Telegram bot that bridges messages to Claude Code's `--print` mode via subproces
 
 ```
 src/
-├── main.py       # Entry point, dispatcher setup, polling, metrics server
-├── config.py     # Env vars: BOT_TOKEN, ALLOWED_USER_IDS, DEFAULT_MODEL, IDLE_TIMEOUT, MEMORY_DIR, TOOLS_DIR
-├── bot.py        # Telegram handlers: /start, /new, /model, /provider, /status, /memory, /tools, /rollback, /bg, /cancel
-├── memory.py     # Persistent memory: YAML profile + SQLite FTS5 episodic, context injection
-├── tools.py      # Tool registry: lazy loads YAML tool definitions, injects context
-├── tasks.py      # Background task manager with queue and completion notifications
-├── bridge.py     # Runs `claude -p` subprocess, yields stream events (TOOL_USE, RESULT)
-├── providers.py  # Provider fallback chain: auto-switches LLM on rate limit
-├── progress.py   # ProgressReporter: manages live progress message with debounced edits
-├── sessions.py   # Maps chat_id → claude session_id, persists to sessions.json
-├── formatter.py  # Markdown→HTML conversion, message splitting
-└── metrics.py    # Prometheus metrics: counters, histograms, gauges
+├── core/
+│   └── context_plugins.py  # Stable registry for context-producing plugins
+├── plugins/
+│   └── tools_plugin.py     # Lazy YAML tool plugin used by prompt context pipeline
+├── main.py                 # Entry point, dispatcher setup, polling, metrics server
+├── config.py               # Env vars: BOT_TOKEN, ALLOWED_USER_IDS, DEFAULT_MODEL, IDLE_TIMEOUT, MEMORY_DIR, TOOLS_DIR
+├── bot.py                  # Telegram handlers: /start, /new, /model, /provider, /status, /memory, /tools, /rollback, /bg, /cancel
+├── memory.py               # Persistent memory: YAML profile + SQLite FTS5 episodic, context injection
+├── tools.py                # Backward-compatible shim to plugins/tools_plugin.py
+├── tasks.py                # Background task manager with queue and completion notifications
+├── bridge.py               # Runs `claude -p` subprocess, yields stream events (TOOL_USE, RESULT)
+├── providers.py            # Provider fallback chain: auto-switches LLM on rate limit
+├── progress.py             # ProgressReporter: manages live progress message with debounced edits
+├── sessions.py             # Maps chat_id → claude session_id, persists to sessions.json
+├── formatter.py            # Markdown→HTML conversion, message splitting
+└── metrics.py              # Prometheus metrics: counters, histograms, gauges
 ```
 
 ## Setup

@@ -249,6 +249,61 @@ Docker containers running:
 - **OpenClaw** — agent platform (gateway container)
 - **Crossposter** — Telegram-to-MAX crossposting (backend + frontend + postgres)
 
+## 6. Cloudflare Free Geo Steering (Implemented 2026-02-27)
+
+Target zone: `aiengineerhelper.com`
+
+Goal:
+- Keep Cloudflare in front
+- Route `RU` traffic to monitoring origin (`45.151.30.146`)
+- Route non-`RU` traffic to primary origin (`31.220.78.216`)
+
+### Implementation
+
+- Product: Cloudflare Workers on Free plan (instead of paid Load Balancer geo steering)
+- Worker script: `geo-origin-steering`
+- Script source in repo: `tools/cloudflare/geo-origin-steering.js`
+- Worker routes:
+  - `aiengineerhelper.com/*`
+  - `crossposter.aiengineerhelper.com/*`
+- Internal DNS records used by `resolveOverride`:
+  - `cf-origin-main.aiengineerhelper.com -> 31.220.78.216` (proxied)
+  - `cf-origin-ru.aiengineerhelper.com -> 45.151.30.146` (proxied)
+- Response debug headers from Worker:
+  - `X-Origin-Selected: main|ru|main-fallback|ru-fallback`
+  - `X-CF-Country: <country code>`
+
+### Monitoring server path
+
+`45.151.30.146` currently handles:
+- `:80` HTTP reverse proxy to `31.220.78.216:80` for:
+  - `aiengineerhelper.com`
+  - `crossposter.aiengineerhelper.com`
+- `:443` TLS passthrough (`nginx stream`) to `31.220.78.216:443` based on SNI for the same hostnames
+
+### TLS notes
+
+- Both origins present Cloudflare Origin CA cert with SAN:
+  - `aiengineerhelper.com`
+  - `*.aiengineerhelper.com`
+- Cloudflare SSL mode should be `Full (strict)`.
+- API token used on 2026-02-27 did not have zone SSL settings permission (`error 9109`), so SSL mode must be verified/set in dashboard or with a broader token.
+
+### Verification commands
+
+```bash
+# Edge result should include worker headers
+curl -sSI https://aiengineerhelper.com | grep -iE 'x-origin-selected|x-cf-country|^HTTP'
+curl -sSI https://crossposter.aiengineerhelper.com | grep -iE 'x-origin-selected|x-cf-country|^HTTP'
+
+# Confirm monitoring origin ports are open
+nc -zv 45.151.30.146 80 443
+
+# Direct origin checks (Origin CA is not publicly trusted; use -k for local probe)
+curl -k -sSI --resolve aiengineerhelper.com:443:31.220.78.216 https://aiengineerhelper.com | head
+curl -k -sSI --resolve aiengineerhelper.com:443:45.151.30.146 https://aiengineerhelper.com | head
+```
+
 ## Ports Summary
 
 | Port | Service | Exposure |

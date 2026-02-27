@@ -43,19 +43,29 @@ async def send_startup_notification(bot: Bot, commit: str | None = None) -> None
         lines.append(f"📦 Version: <code>{VERSION}</code>")
         if commit:
             lines.append(f"📦 Commit: <code>{commit}</code>")
-
-        lines.append("\n✅ Ready to assist!")
+        lines.append("\n⏳ Starting up...")
         startup_message = "\n".join(lines)
 
         try:
             await bot.send_message(chat_id=first_admin, text=startup_message, parse_mode="HTML")
-            await bot.send_message(chat_id=first_admin, text="💬 Ready to accept messages.")
             logging.info("Sent startup notification to admin %s", first_admin)
         except Exception as e:
             logging.warning("Failed to send startup notification: %s", e)
 
     except Exception as e:
         logging.warning("Could not send startup notification: %s", e)
+
+
+async def send_ready_notification(bot: Bot) -> None:
+    """Send ready notification when polling loop is started."""
+    if not ALLOWED_USER_IDS:
+        return
+    try:
+        first_admin = min(ALLOWED_USER_IDS)
+        await bot.send_message(chat_id=first_admin, text="💬 Ready to accept messages.")
+        logging.info("Sent ready notification to admin %s", first_admin)
+    except Exception as e:
+        logging.warning("Could not send ready notification: %s", e)
 
 
 async def main() -> None:
@@ -69,6 +79,7 @@ async def main() -> None:
     bot = Bot(token=BOT_TOKEN)
     dp = Dispatcher()
     dp.include_router(router)
+    dp.startup.register(send_ready_notification)
 
     # Initialize task manager
     global task_manager, schedule_manager

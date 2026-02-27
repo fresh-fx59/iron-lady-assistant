@@ -1,6 +1,6 @@
 # Claude Code as Telegram Assistant
 
-**Current version: `0.16.15`** — defined in `src/config.py` as `VERSION`.
+**Current version: `0.16.16`** — defined in `src/config.py` as `VERSION`.
 
 Telegram bot that bridges messages to Claude Code's `--print` mode via subprocess, providing a conversational AI assistant through Telegram.
 
@@ -64,6 +64,7 @@ src/
 - `/selfmod_apply <path.py> [test_target]` — Validate+promote sandbox plugin candidate (admin-only)
 - `/schedule_every <minutes> <task>` — Create recurring background task
 - `/schedule_daily <HH:MM> <task>` — Create daily recurring background task
+- `/schedule_weekly <day> <HH:MM> <task>` — Create weekly recurring background task
 - `/schedule_list` — List recurring schedules
 - `/schedule_cancel <schedule_id>` — Cancel recurring schedule
 - `/bg <task>` — Run a task in background (non-blocking)
@@ -456,5 +457,6 @@ Returns JSON with title, url, snippet fields.
 - `/selfmod_apply <path.py> [test_target]` — Validate+promote sandbox plugin candidate (admin-only)
 - `/schedule_every <minutes> <task>` — Create recurring background task
 - `/schedule_daily <HH:MM> <task>` — Create daily recurring background task
+- `/schedule_weekly <day> <HH:MM> <task>` — Create weekly recurring background task
 - `/schedule_list` — List recurring schedules
 - `/schedule_cancel <schedule_id>` — Cancel recurring schedule

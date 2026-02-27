@@ -153,6 +153,29 @@ def _strip_markdown_code_fence(text: str) -> str:
     return stripped
 
 
+def _weekday_to_int(name: str) -> int | None:
+    mapping = {
+        "mon": 0,
+        "monday": 0,
+        "tue": 1,
+        "tues": 1,
+        "tuesday": 1,
+        "wed": 2,
+        "wednesday": 2,
+        "thu": 3,
+        "thur": 3,
+        "thurs": 3,
+        "thursday": 3,
+        "fri": 4,
+        "friday": 4,
+        "sat": 5,
+        "saturday": 5,
+        "sun": 6,
+        "sunday": 6,
+    }
+    return mapping.get(name.strip().lower())
+
+
 def _get_recent_commits(limit: int = 10) -> list[tuple[str, str, str]]:
     result = subprocess.run(
         [
@@ -325,6 +348,7 @@ async def cmd_start(message: Message) -> None:
         "/selfmod_apply — Validate+promote sandbox plugin (admin)",
         "/schedule_every <min> <task> — Schedule recurring task",
         "/schedule_daily <HH:MM> <task> — Schedule daily recurring task",
+        "/schedule_weekly <day> <HH:MM> <task> — Schedule weekly task",
         "/schedule_list — List recurring schedules",
         "/schedule_cancel <id> — Cancel recurring schedule",
         "/bg <task> — Run task in background",
@@ -969,7 +993,11 @@ async def cmd_schedule_list(message: Message) -> None:
     lines = ["<b>Recurring schedules:</b>", ""]
     for item in schedules:
         next_run_local = item.next_run_at.astimezone().strftime("%Y-%m-%d %H:%M")
-        if item.schedule_type == "daily" and item.daily_time:
+        if item.schedule_type == "weekly" and item.daily_time and item.weekly_day is not None:
+            tz_name = item.timezone_name or "UTC"
+            weekday = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"][item.weekly_day]
+            schedule_label = f"weekly {weekday} {item.daily_time} ({tz_name})"
+        elif item.schedule_type == "daily" and item.daily_time:
             tz_name = item.timezone_name or "UTC"
             schedule_label = f"daily at {item.daily_time} ({tz_name})"
         else:
@@ -979,6 +1007,76 @@ async def cmd_schedule_list(message: Message) -> None:
         lines.append(f"   {item.prompt[:80]}...")
         lines.append("")
     await message.answer("\n".join(lines), parse_mode="HTML")
+
+
+@router.message(F.text.startswith("/schedule_weekly"))
+async def cmd_schedule_weekly(message: Message) -> None:
+    """Create weekly recurring background task schedule."""
+    if not _is_authorized(message.from_user and message.from_user.id):
+        return
+    if not schedule_manager:
+        await message.answer("Scheduler not available.")
+        return
+
+    parts = (message.text or "").split(maxsplit=3)
+    if len(parts) < 4:
+        await message.answer(
+            "Usage: /schedule_weekly <day> <HH:MM> <task>\n"
+            "Example: /schedule_weekly mon 09:00 check sprint board"
+        )
+        return
+
+    weekday = _weekday_to_int(parts[1])
+    if weekday is None:
+        await message.answer("Day must be one of: mon,tue,wed,thu,fri,sat,sun.")
+        return
+
+    daily_time = parts[2].strip()
+    if not re.fullmatch(r"([01]\d|2[0-3]):([0-5]\d)", daily_time):
+        await message.answer("Time must be in HH:MM 24-hour format.")
+        return
+
+    task_text = parts[3].strip()
+    if not task_text:
+        await message.answer("Task text cannot be empty.")
+        return
+
+    timezone_name = _default_timezone_name()
+    session = session_manager.get(message.chat.id)
+    memory_context = _as_text(memory_manager.build_context(task_text))
+    tool_context = _as_text(context_plugins.build_context(task_text))
+    memory_instructions = _as_text(memory_manager.build_instructions())
+    prompt_parts = []
+    if memory_context:
+        prompt_parts.append(memory_context)
+    if tool_context:
+        prompt_parts.append(tool_context)
+    prompt_parts.append(task_text + memory_instructions)
+    full_prompt = "\n\n".join(prompt_parts)
+
+    try:
+        schedule_id = await schedule_manager.create_weekly(
+            chat_id=message.chat.id,
+            user_id=message.from_user.id,
+            prompt=full_prompt,
+            weekly_day=weekday,
+            daily_time=daily_time,
+            timezone_name=timezone_name,
+            model=session.model,
+            session_id=session.claude_session_id,
+        )
+    except Exception as exc:
+        await message.answer(f"Could not create weekly schedule: {exc}")
+        return
+
+    day_label = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"][weekday]
+    await message.answer(
+        "✅ Weekly schedule created\n"
+        f"<b>ID:</b> <code>{schedule_id[:8]}</code>\n"
+        f"<b>Time:</b> {day_label} {daily_time} ({timezone_name})\n"
+        f"Use /schedule_list to view schedules.",
+        parse_mode="HTML",
+    )
 
 
 @router.message(F.text.startswith("/schedule_daily"))

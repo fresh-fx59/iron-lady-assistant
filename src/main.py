@@ -92,6 +92,7 @@ async def main() -> None:
         BotCommand(command="selfmod_apply", description="Apply sandbox plugin candidate (admin)"),
         BotCommand(command="schedule_every", description="Create recurring schedule"),
         BotCommand(command="schedule_daily", description="Create daily schedule"),
+        BotCommand(command="schedule_weekly", description="Create weekly schedule"),
         BotCommand(command="schedule_list", description="List recurring schedules"),
         BotCommand(command="schedule_cancel", description="Cancel recurring schedule"),
         BotCommand(command="bg", description="Run task in background"),

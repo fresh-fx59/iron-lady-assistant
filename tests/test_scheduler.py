@@ -118,3 +118,25 @@ async def test_due_daily_schedule_submits_and_rolls_next_run(tmp_path) -> None:
     assert len(stub.submissions) == 1
     assert stub.submissions[0]["model"] == "haiku"
     assert after > before
+
+
+@pytest.mark.asyncio
+async def test_create_weekly_schedule(tmp_path) -> None:
+    manager = ScheduleManager(_StubTaskManager(), tmp_path / "schedules.db")
+
+    sid = await manager.create_weekly(
+        chat_id=1,
+        user_id=2,
+        prompt="weekly report",
+        weekly_day=0,
+        daily_time="09:30",
+        timezone_name="UTC",
+        model="sonnet",
+    )
+
+    items = await manager.list_for_chat(1)
+    assert len(items) == 1
+    assert items[0].id == sid
+    assert items[0].schedule_type == "weekly"
+    assert items[0].weekly_day == 0
+    assert items[0].daily_time == "09:30"

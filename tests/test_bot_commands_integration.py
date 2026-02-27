@@ -19,6 +19,7 @@ from src.bot import (
     cmd_selfmod_apply,
     cmd_schedule_every,
     cmd_schedule_daily,
+    cmd_schedule_weekly,
     cmd_schedule_list,
     cmd_schedule_cancel,
     handle_message,
@@ -402,6 +403,23 @@ class TestScheduleCommands:
         assert mock_message.answer.call_count == 1
         assert "daily schedule created" in mock_message.answer.call_args[0][0].lower()
         sched_mock.create_daily.assert_called_once()
+
+    async def test_schedule_weekly_invalid_day(self, mock_message):
+        mock_message.text = "/schedule_weekly foo 09:00 check backlog"
+        with patch("src.bot.schedule_manager") as sched_mock:
+            await cmd_schedule_weekly(mock_message)
+            sched_mock.create_weekly.assert_not_called()
+        assert "day must be one of" in mock_message.answer.call_args[0][0].lower()
+
+    async def test_schedule_weekly_creates_schedule(self, mock_message):
+        mock_message.text = "/schedule_weekly mon 09:00 check backlog"
+        with patch("src.bot.schedule_manager") as sched_mock:
+            sched_mock.create_weekly = AsyncMock(return_value="abcd1234-1234")
+            await cmd_schedule_weekly(mock_message)
+
+        assert mock_message.answer.call_count == 1
+        assert "weekly schedule created" in mock_message.answer.call_args[0][0].lower()
+        sched_mock.create_weekly.assert_called_once()
 
     async def test_schedule_cancel_not_found(self, mock_message):
         mock_message.text = "/schedule_cancel deadbeef"

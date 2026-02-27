@@ -45,12 +45,11 @@ async def send_startup_notification(bot: Bot, commit: str | None = None) -> None
             lines.append(f"📦 Commit: <code>{commit}</code>")
 
         lines.append("\n✅ Ready to assist!")
-        lines.append("💬 Ready to accept messages.")
-
-        message = "\n".join(lines)
+        startup_message = "\n".join(lines)
 
         try:
-            await bot.send_message(chat_id=first_admin, text=message, parse_mode="HTML")
+            await bot.send_message(chat_id=first_admin, text=startup_message, parse_mode="HTML")
+            await bot.send_message(chat_id=first_admin, text="💬 Ready to accept messages.")
             logging.info("Sent startup notification to admin %s", first_admin)
         except Exception as e:
             logging.warning("Failed to send startup notification: %s", e)

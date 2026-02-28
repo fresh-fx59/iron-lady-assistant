@@ -70,7 +70,9 @@ _CODEX_TRANSIENT_ERROR_PATTERNS = (
     re.compile(r"\b(etimedout|econnreset|connection reset)\b", re.IGNORECASE),
 )
 _AUDIO_AS_VOICE_TAG_RE = re.compile(r"\[\[\s*audio_as_voice\s*\]\]", re.IGNORECASE)
-_MEDIA_LINE_RE = re.compile(r"^\s*MEDIA:\s*(.+?)\s*$", re.IGNORECASE)
+# Accept optional visual prefixes like "📍 MEDIA:/tmp/file.mp3" while still
+# requiring the directive to start the line.
+_MEDIA_LINE_RE = re.compile(r"^\s*(?:[^\w\s]+\s*)?MEDIA:\s*(.+?)\s*$", re.IGNORECASE)
 _VOICE_COMPATIBLE_EXTENSIONS = {".ogg", ".opus", ".mp3", ".m4a"}
 _AUDIO_EXTENSIONS = _VOICE_COMPATIBLE_EXTENSIONS | {".wav", ".aac", ".flac"}
 
@@ -1636,7 +1638,9 @@ async def _handle_message_inner(message: Message, override_text: str | None = No
                 for media_ref in media_refs:
                     media_input = _resolve_media_input(media_ref)
                     try:
-                        if audio_as_voice and _is_voice_compatible_media(media_ref):
+                        if _is_voice_compatible_media(media_ref):
+                            await message.answer_voice(media_input)
+                        elif audio_as_voice and _is_audio_media(media_ref):
                             await message.answer_voice(media_input)
                         elif _is_audio_media(media_ref):
                             await message.answer_audio(media_input)

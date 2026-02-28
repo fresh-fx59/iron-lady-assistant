@@ -10,10 +10,11 @@ import shutil
 import subprocess
 from datetime import datetime, timezone as tz
 from pathlib import Path
+from urllib.parse import urlparse
 
 import yaml
 from aiogram import Router, F
-from aiogram.types import Message, CallbackQuery, ErrorEvent
+from aiogram.types import Message, CallbackQuery, ErrorEvent, FSInputFile
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from aiogram.enums import ChatAction
 from aiogram.exceptions import TelegramAPIError
@@ -68,6 +69,10 @@ _CODEX_TRANSIENT_ERROR_PATTERNS = (
     re.compile(r"\breconnecting\.\.\.\s*\d+/\d+", re.IGNORECASE),
     re.compile(r"\b(etimedout|econnreset|connection reset)\b", re.IGNORECASE),
 )
+_AUDIO_AS_VOICE_TAG_RE = re.compile(r"\[\[\s*audio_as_voice\s*\]\]", re.IGNORECASE)
+_MEDIA_LINE_RE = re.compile(r"^\s*MEDIA:\s*(.+?)\s*$", re.IGNORECASE)
+_VOICE_COMPATIBLE_EXTENSIONS = {".ogg", ".opus", ".mp3", ".m4a"}
+_AUDIO_EXTENSIONS = _VOICE_COMPATIBLE_EXTENSIONS | {".wav", ".aac", ".flac"}
 
 
 def _get_state(chat_id: int) -> _ChatState:
@@ -159,6 +164,57 @@ def _is_transient_codex_error(text: str | None) -> bool:
     if not text:
         return False
     return any(pattern.search(text) for pattern in _CODEX_TRANSIENT_ERROR_PATTERNS)
+
+
+def _media_extension(media_ref: str) -> str:
+    raw = media_ref.strip().strip("`").strip("\"'")
+    if not raw:
+        return ""
+    parsed = urlparse(raw)
+    if parsed.scheme in {"http", "https"}:
+        return Path(parsed.path).suffix.lower()
+    return Path(raw).suffix.lower()
+
+
+def _is_voice_compatible_media(media_ref: str) -> bool:
+    return _media_extension(media_ref) in _VOICE_COMPATIBLE_EXTENSIONS
+
+
+def _is_audio_media(media_ref: str) -> bool:
+    return _media_extension(media_ref) in _AUDIO_EXTENSIONS
+
+
+def _resolve_media_input(media_ref: str):
+    raw = media_ref.strip().strip("`").strip("\"'")
+    parsed = urlparse(raw)
+    if parsed.scheme in {"http", "https"}:
+        return raw
+    path = Path(raw).expanduser()
+    if path.exists() and path.is_file():
+        return FSInputFile(path)
+    return raw
+
+
+def _extract_media_directives(text: str) -> tuple[str, list[str], bool]:
+    if not text:
+        return "", [], False
+
+    audio_as_voice = bool(_AUDIO_AS_VOICE_TAG_RE.search(text))
+    without_tag = _AUDIO_AS_VOICE_TAG_RE.sub("", text)
+
+    media_refs: list[str] = []
+    text_lines: list[str] = []
+    for line in without_tag.splitlines():
+        match = _MEDIA_LINE_RE.match(line)
+        if match:
+            media = match.group(1).strip().strip("`").strip("\"'")
+            if media:
+                media_refs.append(media)
+            continue
+        text_lines.append(line)
+
+    cleaned_text = "\n".join(text_lines).strip()
+    return cleaned_text, media_refs, audio_as_voice
 
 
 def _default_timezone_name() -> str:
@@ -1575,19 +1631,38 @@ async def _handle_message_inner(message: Message, override_text: str | None = No
                 await message.answer(error_text, reply_markup=reply_markup)
                 await progress.finish()
             else:
-                html = markdown_to_html(final_response.text)
+                clean_text, media_refs, audio_as_voice = _extract_media_directives(final_response.text or "")
+
+                for media_ref in media_refs:
+                    media_input = _resolve_media_input(media_ref)
+                    try:
+                        if audio_as_voice and _is_voice_compatible_media(media_ref):
+                            await message.answer_voice(media_input)
+                        elif _is_audio_media(media_ref):
+                            await message.answer_audio(media_input)
+                        else:
+                            await message.answer_document(media_input)
+                    except Exception:
+                        logger.exception(
+                            "Chat %d: failed to send media '%s'",
+                            message.chat.id,
+                            media_ref,
+                        )
+
+                html = markdown_to_html(clean_text)
                 chunks = split_message(html)
 
                 if not chunks:
-                    logger.warning(
-                        "Chat %d: Got empty response object - text='%s', is_error=%s, session_id=%s, cost=%.6f",
-                        message.chat.id,
-                        repr(final_response.text[:200]) if final_response.text else "None",
-                        final_response.is_error,
-                        final_response.session_id,
-                        final_response.cost_usd,
-                    )
-                    chunks = ["(empty response)"]
+                    if not media_refs:
+                        logger.warning(
+                            "Chat %d: Got empty response object - text='%s', is_error=%s, session_id=%s, cost=%.6f",
+                            message.chat.id,
+                            repr(final_response.text[:200]) if final_response.text else "None",
+                            final_response.is_error,
+                            final_response.session_id,
+                            final_response.cost_usd,
+                        )
+                        chunks = ["(empty response)"]
 
                 for chunk in chunks:
                     try:

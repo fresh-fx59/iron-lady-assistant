@@ -1649,8 +1649,10 @@ async def _handle_message_inner(message: Message, override_text: str | None = No
                             media_ref,
                         )
 
-                html = markdown_to_html(clean_text)
-                chunks = split_message(html)
+                chunks: list[str] = []
+                if clean_text.strip():
+                    html = markdown_to_html(clean_text)
+                    chunks = split_message(html)
 
                 if not chunks:
                     if not media_refs:
@@ -1665,11 +1667,15 @@ async def _handle_message_inner(message: Message, override_text: str | None = No
                         chunks = ["(empty response)"]
 
                 for chunk in chunks:
+                    if not chunk.strip():
+                        continue
                     try:
                         await message.answer(chunk, parse_mode="HTML")
                     except Exception:
                         plain = strip_html(chunk)
                         for plain_chunk in split_message(plain):
+                            if not plain_chunk.strip():
+                                continue
                             await message.answer(plain_chunk)
 
                 await progress.finish()

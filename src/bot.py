@@ -18,7 +18,7 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 from aiogram.enums import ChatAction
 from aiogram.exceptions import TelegramAPIError
 
-from . import bridge, config, metrics
+from . import bridge, config, metrics, transcribe
 from .core.context_plugins import ContextPluginRegistry
 from .sessions import SessionManager
 from .formatter import markdown_to_html, split_message, strip_html
@@ -1206,12 +1206,13 @@ async def _run_claude(
     session: object,
     progress: ProgressReporter,
     subprocess_env: dict[str, str] | None = None,
+    override_text: str | None = None,
 ) -> bridge.ClaudeResponse | None:
     """Run a single Claude subprocess attempt. Returns the response or None."""
     state.process_handle = {}
 
     # Build memory and tool-augmented prompt
-    raw_prompt = message.text or ""
+    raw_prompt = override_text or message.text or ""
     memory_context = memory_manager.build_context(raw_prompt)
     tool_context = context_plugins.build_context(raw_prompt)
     memory_instructions = memory_manager.build_instructions()
@@ -1278,12 +1279,13 @@ async def _run_codex(
     session_id: str | None = None,
     resume_arg: str | None = None,
     subprocess_env: dict[str, str] | None = None,
+    override_text: str | None = None,
 ) -> bridge.ClaudeResponse | None:
     """Run a single Codex CLI subprocess attempt. Returns the response or None."""
     state.process_handle = {}
 
     # Build memory and tool-augmented prompt
-    raw_prompt = message.text or ""
+    raw_prompt = override_text or message.text or ""
     memory_context = memory_manager.build_context(raw_prompt)
     tool_context = context_plugins.build_context(raw_prompt)
     memory_instructions = memory_manager.build_instructions()
@@ -1350,6 +1352,7 @@ async def _run_codex_with_retries(
     session_id: str | None = None,
     resume_arg: str | None = None,
     subprocess_env: dict[str, str] | None = None,
+    override_text: str | None = None,
 ) -> bridge.ClaudeResponse | None:
     retries_left = max(0, config.CODEX_TRANSIENT_MAX_RETRIES)
     attempt = 0
@@ -1366,6 +1369,7 @@ async def _run_codex_with_retries(
             next_session_id,
             resume_arg,
             subprocess_env,
+            override_text=override_text,
         )
         if not response:
             return None
@@ -1386,6 +1390,46 @@ async def _run_codex_with_retries(
             # First retry starts a fresh Codex conversation to bypass stale stream state.
             next_session_id = None
         await asyncio.sleep(max(0.0, config.CODEX_TRANSIENT_RETRY_BACKOFF_SECONDS))
+
+
+@router.message(F.voice)
+async def handle_voice(message: Message) -> None:
+    """Transcribe voice message via whisper.cpp and process as text."""
+    if not _is_authorized(message.from_user and message.from_user.id, message.chat.id):
+        return
+
+    if not transcribe.is_available():
+        await message.answer(
+            "Voice messages are not supported — whisper.cpp is not installed.\n"
+            "Run <code>bash setup_whisper.sh</code> on the server to enable.",
+            parse_mode="HTML",
+        )
+        return
+
+    import tempfile
+
+    file = await message.bot.get_file(message.voice.file_id)
+    tmp = tempfile.NamedTemporaryFile(suffix=".oga", delete=False)
+    try:
+        await message.bot.download_file(file.file_path, tmp.name)
+        text = await transcribe.transcribe(tmp.name)
+        logger.info("Chat %d: transcribed voice (%ds) → %d chars",
+                     message.chat.id, message.voice.duration, len(text))
+    except Exception:
+        logger.exception("Voice transcription failed")
+        await message.answer("Failed to transcribe voice message.")
+        return
+    finally:
+        os.unlink(tmp.name)
+
+    override = f"[Voice message] {text}"
+    try:
+        await _handle_message_inner(message, override_text=override)
+    except Exception:
+        logger.exception("Unhandled exception in handle_voice")
+        metrics.MESSAGES_TOTAL.labels(status="error").inc()
+        _record_error(message.chat.id)
+        await message.answer("An internal error occurred while processing your voice message.")
 
 
 @router.message(F.text)
@@ -1411,7 +1455,7 @@ async def handle_channel_post(message: Message) -> None:
     await handle_message(message)
 
 
-async def _handle_message_inner(message: Message) -> None:
+async def _handle_message_inner(message: Message, override_text: str | None = None) -> None:
     if not _is_authorized(message.from_user and message.from_user.id, message.chat.id):
         metrics.MESSAGES_TOTAL.labels(status="unauthorized").inc()
         return
@@ -1464,9 +1508,13 @@ async def _handle_message_inner(message: Message) -> None:
                     session.codex_session_id,
                     provider.resume_arg,
                     env,
+                    override_text=override_text,
                 )
             else:
-                final_response = await _run_claude(message, state, session, progress, env)
+                final_response = await _run_claude(
+                    message, state, session, progress, env,
+                    override_text=override_text,
+                )
 
             # ── Fallback on rate-limit ────────────────────────────
             if (
@@ -1498,10 +1546,12 @@ async def _handle_message_inner(message: Message) -> None:
                             session.codex_session_id,
                             next_provider.resume_arg,
                             env,
+                            override_text=override_text,
                         )
                     else:
                         final_response = await _run_claude(
                             message, state, session, progress, env,
+                            override_text=override_text,
                         )
         finally:
             typing_task.cancel()

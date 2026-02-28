@@ -1,6 +1,6 @@
 # Claude Code as Telegram Assistant
 
-**Current version: `0.16.19`** — defined in `src/config.py` as `VERSION`.
+**Current version: `0.16.23`** — defined in `src/config.py` as `VERSION`.
 
 Telegram bot that bridges messages to Claude Code's `--print` mode via subprocess, providing a conversational AI assistant through Telegram.
 
@@ -30,6 +30,7 @@ src/
 ├── tasks.py                # Background task manager with queue and completion notifications
 ├── scheduler.py            # Persistent recurring schedules, submits jobs to background task manager
 ├── self_modify.py          # Sandboxed self-modification workflow: stage -> validate -> promote -> rollback helper
+├── transcribe.py           # Async voice transcription via whisper.cpp subprocess
 ├── bridge.py               # Runs `claude -p` subprocess, yields stream events (TOOL_USE, RESULT)
 ├── providers.py            # Provider fallback chain: auto-switches LLM on rate limit
 ├── progress.py             # ProgressReporter: manages live progress message with debounced edits
@@ -49,6 +50,31 @@ src/
    pip install -r requirements.txt
    ```
 4. `python -m src.main` (or use `./run.sh` which activates the venv automatically)
+
+## Voice Messages (whisper.cpp)
+
+Voice messages are transcribed locally using [whisper.cpp](https://github.com/ggerganov/whisper.cpp) — no API key needed.
+
+### One-time setup
+
+```bash
+bash setup_whisper.sh
+```
+
+This installs build deps (`cmake`, `g++`, `ffmpeg`), clones and builds whisper.cpp, and downloads the `small` model (~500 MB RAM, ~4s for 30s audio on CPU).
+
+### How it works
+
+1. User sends a voice message in Telegram
+2. Bot downloads the `.oga` file, converts to WAV via `ffmpeg`
+3. `whisper-cli` transcribes locally (auto-detects Russian/English)
+4. Transcribed text is prefixed with `[Voice message]` and passed to Claude/Codex
+5. If whisper.cpp is not installed, bot replies with setup instructions
+
+### Configuration
+
+- `WHISPER_BIN` env var — path to whisper-cli binary (default: `whisper.cpp/build/bin/whisper-cli` in repo root)
+- `WHISPER_MODEL` env var — path to GGML model file (default: `whisper.cpp/models/ggml-small.bin`)
 
 ## Bot Commands
 

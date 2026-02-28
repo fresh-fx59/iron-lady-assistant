@@ -15,3 +15,4 @@ work-dir/
 resume-work.md
 .deploy/
 node_modules/
+whisper.cpp/

@@ -1,91 +1,134 @@
 # Telegram Claude Bot
 
-Chat with Claude AI directly from Telegram. Send a message, get a response — it's that simple.
+Telegram bot that runs Claude Code as an assistant. You send messages in Telegram, the bot runs the coding agent, and returns replies/media back to chat.
 
-The bot runs [Claude Code](https://docs.anthropic.com/en/docs/claude-code) under the hood, so you get the full power of Claude as a conversational assistant right in your Telegram chat.
+## What This Repo Provides
 
-## What You Need
+- Telegram bot integration with Claude Code
+- Per-chat sessions and context persistence
+- Provider/model switching via commands
+- Memory subsystem (profile + episodes)
+- Optional recurring scheduler
+- Crash-loop protection with rollback to last known-good commit
+- Prometheus metrics endpoint
 
-Before starting, make sure you have:
+## Full Install From Scratch (Ubuntu 22.04/24.04)
 
-1. **A Linux server** (or any machine that stays online) — a $5/month VPS works fine
-2. **Python 3.10+** — pre-installed on most Linux systems
-3. **Node.js 18+** — needed to install Claude Code CLI
-4. **An Anthropic API key** — sign up at [console.anthropic.com](https://console.anthropic.com/)
+This section is the complete zero-to-working setup.
 
-## Setup (5 minutes)
+### 1. Prepare server
 
-### 1. Install Claude Code CLI
+```bash
+sudo apt update && sudo apt upgrade -y
+sudo apt install -y git curl ca-certificates ffmpeg python3 python3-venv python3-pip
+```
+
+Install Node.js 18+ (recommended: NodeSource 20.x):
+
+```bash
+curl -fsSL https://deb.nodesource.com/setup_20.x | sudo -E bash -
+sudo apt install -y nodejs
+node -v
+npm -v
+```
+
+### 2. Install Claude Code CLI
 
 ```bash
 npm install -g @anthropic-ai/claude-code
+claude
 ```
 
-Then authenticate it with your Anthropic API key:
+Finish login flow in terminal/browser and verify:
 
 ```bash
-claude  # follow the prompts to log in
+claude --version
 ```
 
-### 2. Clone this repo
+### 3. Create Telegram bot and get token
+
+In Telegram open `@BotFather`:
+
+1. Send `/newbot`
+2. Set bot name and username
+3. Copy token (`123456:ABC...`)
+
+Optional (recommended):
+
+1. `/setprivacy` -> Disable (if you want bot to read all group messages)
+2. `/setcommands` -> add commands from this README
+
+### 4. Find your Telegram IDs
+
+- Personal user ID: message `@userinfobot`
+- Group/channel chat ID: add bot and inspect updates or use known `-100...` ID
+
+### 5. Clone repository
 
 ```bash
 git clone https://github.com/YOUR_USERNAME/claude-code-as-assistant.git
 cd claude-code-as-assistant
 ```
 
-### 3. Run the setup wizard
+### 6. Configure environment
+
+```bash
+cp .env.example .env
+nano .env
+```
+
+Minimum required variables:
+
+```env
+TELEGRAM_BOT_TOKEN=123456:ABCDEF...
+ALLOWED_USER_IDS=123456789
+DEFAULT_PROVIDER=claude
+DEFAULT_MODEL=sonnet
+```
+
+Common optional variables:
+
+```env
+ALLOWED_CHAT_IDS=-1001234567890
+CLAUDE_WORKING_DIR=/home/claude-developer
+IDLE_TIMEOUT=120
+PROGRESS_DEBOUNCE_SECONDS=3.0
+METRICS_PORT=9101
+MEMORY_DIR=memory
+TOOLS_DIR=tools
+```
+
+### 7. Install Python dependencies
+
+```bash
+python3 -m venv venv
+source venv/bin/activate
+pip install --upgrade pip
+pip install -r requirements.txt
+```
+
+### 8. Run setup wizard (recommended)
 
 ```bash
 bash setup.sh
 ```
 
-The wizard walks you through everything step by step:
-- Creating a Telegram bot (via @BotFather)
-- Finding your Telegram user ID
-- Choosing a Claude model
-- Optionally setting up auto-start on boot
+Wizard can:
 
-That's it. Your bot is running.
+- validate environment
+- guide Telegram setup
+- configure defaults
+- optionally install systemd service
 
-### Alternative: Manual Setup
-
-If you prefer to configure things yourself:
+### 9. First run (manual)
 
 ```bash
-cp .env.example .env    # copy the template
-nano .env               # edit with your values
-./run.sh                # start the bot
+./run.sh
 ```
 
-## Using the Bot
+Open Telegram -> send `/start` -> send a test text message.
 
-Open Telegram, find your bot by its username, and start chatting.
-
-| Command | What it does |
-|---------|-------------|
-| `/start` | Show welcome message |
-| `/new` | Clear conversation history and start fresh |
-| `/model` | Switch model (sonnet/opus/haiku) via inline keyboard |
-| `/provider` | Switch LLM provider via inline keyboard |
-| `/status` | Show current session and model info |
-| `/memory` | Show what the bot remembers about you |
-| `/tools` | Show available tools |
-| `/cancel` | Cancel the current request |
-
-Just send any text message and the bot will respond using Claude.
-
-## Running in the Background
-
-### Option A: Auto-start on boot (recommended for servers)
-
-If you chose "yes" during setup, this is already done. Otherwise:
-
-```bash
-bash setup.sh   # choose "yes" for auto-start
-```
-
-Or manually:
+### 10. Enable auto-start with systemd
 
 ```bash
 sudo cp telegram-bot.service /etc/systemd/system/
@@ -93,103 +136,156 @@ sudo systemctl daemon-reload
 sudo systemctl enable --now telegram-bot.service
 ```
 
-Useful commands:
+Check status/logs:
 
 ```bash
-sudo systemctl status telegram-bot.service    # check if running
-sudo systemctl restart telegram-bot.service   # restart the bot
-journalctl -u telegram-bot.service -f         # view live logs
-cat .deploy/deploy.log                        # persistent deploy/crash log
+sudo systemctl status telegram-bot.service
+journalctl -u telegram-bot.service -f
+cat .deploy/deploy.log
 ```
 
-### Option B: Run in a terminal
+## Quick Start (if server is already prepared)
 
 ```bash
+git clone https://github.com/YOUR_USERNAME/claude-code-as-assistant.git
+cd claude-code-as-assistant
+bash setup.sh
 ./run.sh
 ```
 
-Use `screen` or `tmux` to keep it running after you disconnect.
+## Bot Commands
 
-## Configuration
+- `/start` - welcome/help
+- `/new` - reset current chat session
+- `/model` - switch model (inline keyboard)
+- `/provider` - switch provider (inline keyboard)
+- `/status` - show session/model/provider status
+- `/memory` - inspect remembered profile/episodes
+- `/tools` - show available tools
+- `/cancel` - cancel current in-flight request
+- `/rollback` - rollback to previous good version (admin)
 
-All settings are in the `.env` file. Edit it anytime and restart the bot.
+## Configuration Reference
 
-| Setting | Required | Default | Description |
-|---------|----------|---------|-------------|
-| `TELEGRAM_BOT_TOKEN` | Yes | — | Your bot token from @BotFather |
-| `ALLOWED_USER_IDS` | Yes | — | Comma-separated Telegram user IDs |
-| `ALLOWED_CHAT_IDS` | No | — | Comma-separated allowed chat/channel IDs |
-| `DEFAULT_MODEL` | No | `sonnet` | Default Claude model |
-| `CLAUDE_WORKING_DIR` | No | — | Working directory for Claude |
-| `IDLE_TIMEOUT` | No | `120` | Seconds without output before timeout |
-| `PROGRESS_DEBOUNCE_SECONDS` | No | `3.0` | Min seconds between progress updates |
-| `METRICS_PORT` | No | `9101` | Prometheus metrics port (0 to disable) |
-| `MEMORY_DIR` | No | `memory/` | Directory for persistent memory storage |
-| `TOOLS_DIR` | No | `tools/` | Directory for custom tool definitions |
+All settings are read from `.env`.
 
-## Monitoring (Optional)
+- `TELEGRAM_BOT_TOKEN` (required): token from BotFather
+- `ALLOWED_USER_IDS` (required): comma-separated allowed Telegram user IDs
+- `ALLOWED_CHAT_IDS` (optional): comma-separated allowed group/channel IDs
+- `DEFAULT_PROVIDER` (optional): default provider key from `providers.json`
+- `DEFAULT_MODEL` (optional): default model alias
+- `CLAUDE_WORKING_DIR` (optional): working directory for Claude CLI tasks
+- `IDLE_TIMEOUT` (optional, default `120`): seconds before idle timeout
+- `PROGRESS_DEBOUNCE_SECONDS` (optional, default `3.0`): progress update pacing
+- `METRICS_PORT` (optional, default `9101`): Prometheus endpoint port (`0` disables)
+- `MEMORY_DIR` (optional, default `memory/`): persistent memory path
+- `TOOLS_DIR` (optional, default `tools/`): custom tool definitions path
 
-The bot exposes Prometheus metrics at `http://localhost:9101/metrics` — useful if you run Grafana or similar.
+## Upgrade and Rollback
 
-Tracked metrics include: message counts, response times, API costs, and active sessions.
+Update to latest:
+
+```bash
+cd /path/to/claude-code-as-assistant
+git pull --ff-only
+source venv/bin/activate
+pip install -r requirements.txt
+sudo systemctl restart telegram-bot.service
+```
+
+If broken, rollback:
+
+```bash
+git log --oneline -n 10
+git checkout <last_good_commit>
+sudo systemctl restart telegram-bot.service
+```
+
+Runtime crash protection also auto-rolls back if there are repeated startup failures.
+
+## Monitoring
+
+Metrics endpoint:
+
+```text
+http://localhost:9101/metrics
+```
+
+Example check:
+
+```bash
+curl -fsS http://localhost:9101/metrics | head
+```
 
 ## Troubleshooting
 
-**Bot doesn't respond to messages**
-- Check that your Telegram user ID is in `ALLOWED_USER_IDS` in `.env`
-- Find your ID by messaging @userinfobot on Telegram
-- For channels/groups, add their numeric chat IDs to `ALLOWED_CHAT_IDS` (e.g. `-100...`)
+### Bot does not respond
 
-**"Claude Code CLI is not installed"**
-- Run `npm install -g @anthropic-ai/claude-code`
-- Make sure Node.js 18+ is installed
+- Verify `.env` values are correct
+- Ensure your user/chat IDs are in allowlists
+- Confirm service is running: `sudo systemctl status telegram-bot.service`
 
-**"TELEGRAM_BOT_TOKEN is not set"**
-- Run `bash setup.sh` or edit `.env` with your token from @BotFather
+### `Claude Code CLI is not installed`
 
-**Bot crashes or stops responding**
-- The bot has built-in crash loop protection: if it crashes 3+ times in 5 minutes, it auto-rolls back to the last working version and notifies you via Telegram
-- Check deploy log: `cat .deploy/deploy.log`
-- Check system logs: `journalctl -u telegram-bot.service -f`
-- Restart manually: `sudo systemctl restart telegram-bot.service`
-- If running manually, check the terminal output for errors
+```bash
+npm install -g @anthropic-ai/claude-code
+claude --version
+```
 
-**"Still processing your previous message"**
-- The bot handles one message at a time per chat. Wait for the current response to finish.
+### `TELEGRAM_BOT_TOKEN is not set`
+
+- Re-check `.env`
+- Ensure service uses the correct repo directory and env file
+
+### Bot keeps restarting
+
+```bash
+journalctl -u telegram-bot.service -n 200 --no-pager
+cat .deploy/deploy.log
+```
+
+### Voice transcription issues
+
+- Ensure `ffmpeg` is installed
+- Verify whisper setup if enabled (`setup_whisper.sh`)
 
 ## Project Structure
 
-```
-├── setup.sh              # Interactive setup wizard
-├── run.sh                # Start the bot (crash protection + auto-installs deps)
-├── .env.example          # Configuration template
-├── requirements.txt      # Python dependencies
-├── telegram-bot.service  # systemd service file
-├── providers.json        # LLM provider fallback configuration
-├── .deploy/              # Runtime state (gitignored)
-│   ├── good_commit       # Last known-good git commit hash
-│   ├── start_times       # Recent start timestamps for crash detection
-│   └── deploy.log        # Persistent log of deploys, crashes, rollbacks
-├── sandbox/              # Candidate self-modification workspace before promotion
+```text
+├── setup.sh
+├── run.sh
+├── .env.example
+├── requirements.txt
+├── telegram-bot.service
+├── providers.json
+├── .deploy/
+│   ├── good_commit
+│   ├── start_times
+│   └── deploy.log
+├── sandbox/
 └── src/
-    ├── core/             # Stable orchestration primitives
-    │   └── context_plugins.py
-    ├── plugins/          # Extensible context/tool modules
-    │   └── tools_plugin.py
-    ├── main.py           # Entry point, marks good commits on successful start
-    ├── config.py         # Configuration loader
-    ├── bot.py            # Telegram command handlers
-    ├── bridge.py         # Claude Code subprocess bridge
-    ├── sessions.py       # Conversation session management
-    ├── providers.py      # Provider fallback chain
-    ├── memory.py         # Persistent memory (YAML profile + SQLite episodes)
-    ├── tools.py          # Backward-compatible shim to tools plugin
-    ├── scheduler.py      # Persistent recurring schedule runner
-    ├── self_modify.py    # Stage/validate/promote/rollback helpers for sandboxed self-modification
-    ├── progress.py       # Live progress updates
-    ├── formatter.py      # Markdown-to-HTML conversion
-    └── metrics.py        # Prometheus metrics
+    ├── core/
+    ├── plugins/
+    ├── main.py
+    ├── config.py
+    ├── bot.py
+    ├── bridge.py
+    ├── sessions.py
+    ├── providers.py
+    ├── memory.py
+    ├── scheduler.py
+    ├── self_modify.py
+    ├── progress.py
+    ├── formatter.py
+    └── metrics.py
 ```
+
+## Security Notes
+
+- Never commit `.env`
+- Restrict `ALLOWED_USER_IDS` and `ALLOWED_CHAT_IDS`
+- Run bot under non-root user
+- Rotate Telegram/LLM credentials if leaked
 
 ## License
 

@@ -1,6 +1,6 @@
 # Claude Code as Telegram Assistant
 
-**Current version: `0.16.26`** — defined in `src/config.py` as `VERSION`.
+**Current version: `0.17.0`** — defined in `src/config.py` as `VERSION`.
 
 Telegram bot that bridges messages to Claude Code's `--print` mode via subprocess, providing a conversational AI assistant through Telegram.
 
@@ -312,10 +312,13 @@ v0.7.0: Short description of the change
 ```
 
 Rules:
-1. **Bump the version** in `src/config.py` (`VERSION`) with every commit
-2. **Update the version** in this file's header to match
-3. Use **semver**: bump patch for fixes, minor for features, major for breaking changes
-4. The commit message format is: `v<version>: <description>`
+1. **Bump the version** in `src/config.py` (`VERSION`) with every commit.
+2. **Update the version** in this file's header to match.
+3. Use **semver** with explicit mapping:
+   - `0.0.+1` (patch): fixes, refactors, internal improvements, docs/tests that do not change public behavior.
+   - `0.+1.0` (minor): new backward-compatible features/capabilities.
+   - `+1.0.0` (major): breaking changes (API/command/behavior contracts, required config migrations).
+4. The commit message format is: `v<version>: <description>`.
 
 ## Streaming Format (stream-json)
 

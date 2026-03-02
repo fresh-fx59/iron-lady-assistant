@@ -4,7 +4,7 @@ import uuid
 from dataclasses import dataclass
 from datetime import datetime
 from enum import Enum
-from typing import Final
+from typing import Final, Protocol, Sequence
 
 from aiogram import Bot
 
@@ -41,14 +41,20 @@ class BackgroundTask:
     task: asyncio.Task | None = None
 
 
+class TaskObserver(Protocol):
+    async def on_task_finished(self, task: BackgroundTask) -> None:
+        """Called when a task reaches terminal status."""
+
+
 class TaskManager:
     """Manages background task execution and notifications."""
 
     _MAX_CONCURRENT: Final[int] = 3  # Max background tasks running at once
     _TASK_TIMEOUT: Final[int] = 600  # 10 minutes max per task
 
-    def __init__(self, bot: Bot):
+    def __init__(self, bot: Bot, observers: Sequence[TaskObserver] | None = None):
         self.bot = bot
+        self._observers = list(observers or [])
         self.tasks: dict[str, BackgroundTask] = {}
         self._queue: list[BackgroundTask] = []
         self._running_tasks: set[str] = set()
@@ -265,6 +271,14 @@ class TaskManager:
             self._running_tasks.discard(task.id)
             metrics.BG_TASKS_RUNNING.set(len(self._running_tasks))
             metrics.BG_TASKS_ACTIVE.set(len(self.tasks))
+            await self._notify_observers(task)
+
+    async def _notify_observers(self, task: BackgroundTask) -> None:
+        for observer in self._observers:
+            try:
+                await observer.on_task_finished(task)
+            except Exception:
+                logger.exception("Task observer failed for task %s", task.id)
 
     async def _notify_completion(self, task: BackgroundTask) -> None:
         """Send notification when a task completes."""

@@ -6,7 +6,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-VERSION: str = "0.16.31"
+VERSION: str = "0.17.0"
 
 # ── Bot token (required) ────────────────────────────────────
 BOT_TOKEN: str = os.getenv("TELEGRAM_BOT_TOKEN", "")
@@ -64,6 +64,10 @@ CODEX_TRANSIENT_RETRY_BACKOFF_SECONDS: float = float(
 )
 PROGRESS_DEBOUNCE_SECONDS: float = float(os.getenv("PROGRESS_DEBOUNCE_SECONDS", "3.0"))
 METRICS_PORT: int = int(os.getenv("METRICS_PORT", "9101"))
+AUTONOMY_ENABLED: bool = os.getenv("AUTONOMY_ENABLED", "1").strip().lower() not in {"0", "false", "no"}
+AUTONOMY_FAILURE_THRESHOLD: int = int(os.getenv("AUTONOMY_FAILURE_THRESHOLD", "3"))
+AUTONOMY_FAILURE_WINDOW_MINUTES: int = int(os.getenv("AUTONOMY_FAILURE_WINDOW_MINUTES", "60"))
+AUTONOMY_ALERT_COOLDOWN_MINUTES: int = int(os.getenv("AUTONOMY_ALERT_COOLDOWN_MINUTES", "30"))
 
 # ── Memory system ─────────────────────────────────────────
 _raw_memory_dir = os.getenv("MEMORY_DIR") or None

@@ -21,6 +21,7 @@ from aiogram.exceptions import TelegramAPIError
 
 from . import bridge, config, metrics, transcribe
 from .core.context_plugins import ContextPluginRegistry
+from .identity import IdentityManager
 from .sessions import SessionManager
 from .formatter import markdown_to_html, split_message, strip_html
 from .memory import MemoryManager
@@ -37,6 +38,7 @@ router = Router()
 session_manager = SessionManager()
 provider_manager = ProviderManager()
 memory_manager = MemoryManager(config.MEMORY_DIR)
+identity_manager = IdentityManager(config.MEMORY_DIR)
 tool_registry = ToolRegistry(config.TOOLS_DIR)
 context_plugins = ContextPluginRegistry([tool_registry])
 self_mod_manager = SelfModificationManager(Path(__file__).resolve().parent.parent)
@@ -160,6 +162,24 @@ def _truncate_output(text: str, max_len: int = 2000) -> str:
 
 def _as_text(value: object) -> str:
     return value if isinstance(value, str) else ""
+
+
+def _build_augmented_prompt(raw_prompt: str) -> str:
+    """Compose prompt with memory, identity, tools, and memory instructions."""
+    memory_context = _as_text(memory_manager.build_context(raw_prompt))
+    identity_context = _as_text(identity_manager.build_context())
+    tool_context = _as_text(context_plugins.build_context(raw_prompt))
+    memory_instructions = _as_text(memory_manager.build_instructions())
+
+    prompt_parts: list[str] = []
+    if memory_context:
+        prompt_parts.append(memory_context)
+    if identity_context:
+        prompt_parts.append(identity_context)
+    if tool_context:
+        prompt_parts.append(tool_context)
+    prompt_parts.append(raw_prompt + memory_instructions)
+    return "\n\n".join(prompt_parts)
 
 
 def _is_transient_codex_error(text: str | None) -> bool:
@@ -888,19 +908,7 @@ async def cmd_bg(message: Message) -> None:
 
     session = session_manager.get(message.chat.id)
 
-    # Build memory and tool-augmented prompt
-    memory_context = memory_manager.build_context(prompt)
-    tool_context = context_plugins.build_context(prompt)
-    memory_instructions = memory_manager.build_instructions()
-
-    prompt_parts = []
-    if memory_context:
-        prompt_parts.append(memory_context)
-    if tool_context:
-        prompt_parts.append(tool_context)
-    prompt_parts.append(prompt + memory_instructions)
-
-    full_prompt = "\n\n".join(prompt_parts)
+    full_prompt = _build_augmented_prompt(prompt)
 
     task_id = await task_manager.submit(
         chat_id=message.chat.id,
@@ -1036,16 +1044,7 @@ async def cmd_schedule_every(message: Message) -> None:
         return
 
     session = session_manager.get(message.chat.id)
-    memory_context = _as_text(memory_manager.build_context(task_text))
-    tool_context = _as_text(context_plugins.build_context(task_text))
-    memory_instructions = _as_text(memory_manager.build_instructions())
-    prompt_parts = []
-    if memory_context:
-        prompt_parts.append(memory_context)
-    if tool_context:
-        prompt_parts.append(tool_context)
-    prompt_parts.append(task_text + memory_instructions)
-    full_prompt = "\n\n".join(prompt_parts)
+    full_prompt = _build_augmented_prompt(task_text)
 
     schedule_id = await schedule_manager.create_every(
         chat_id=message.chat.id,
@@ -1131,16 +1130,7 @@ async def cmd_schedule_weekly(message: Message) -> None:
 
     timezone_name = _default_timezone_name()
     session = session_manager.get(message.chat.id)
-    memory_context = _as_text(memory_manager.build_context(task_text))
-    tool_context = _as_text(context_plugins.build_context(task_text))
-    memory_instructions = _as_text(memory_manager.build_instructions())
-    prompt_parts = []
-    if memory_context:
-        prompt_parts.append(memory_context)
-    if tool_context:
-        prompt_parts.append(tool_context)
-    prompt_parts.append(task_text + memory_instructions)
-    full_prompt = "\n\n".join(prompt_parts)
+    full_prompt = _build_augmented_prompt(task_text)
 
     try:
         schedule_id = await schedule_manager.create_weekly(
@@ -1197,16 +1187,7 @@ async def cmd_schedule_daily(message: Message) -> None:
     timezone_name = _default_timezone_name()
 
     session = session_manager.get(message.chat.id)
-    memory_context = _as_text(memory_manager.build_context(task_text))
-    tool_context = _as_text(context_plugins.build_context(task_text))
-    memory_instructions = _as_text(memory_manager.build_instructions())
-    prompt_parts = []
-    if memory_context:
-        prompt_parts.append(memory_context)
-    if tool_context:
-        prompt_parts.append(tool_context)
-    prompt_parts.append(task_text + memory_instructions)
-    full_prompt = "\n\n".join(prompt_parts)
+    full_prompt = _build_augmented_prompt(task_text)
 
     try:
         schedule_id = await schedule_manager.create_daily(
@@ -1269,21 +1250,8 @@ async def _run_claude(
     """Run a single Claude subprocess attempt. Returns the response or None."""
     state.process_handle = {}
 
-    # Build memory and tool-augmented prompt
     raw_prompt = override_text or message.text or ""
-    memory_context = memory_manager.build_context(raw_prompt)
-    tool_context = context_plugins.build_context(raw_prompt)
-    memory_instructions = memory_manager.build_instructions()
-
-    # Assemble prompt with all context layers
-    prompt_parts = []
-    if memory_context:
-        prompt_parts.append(memory_context)
-    if tool_context:
-        prompt_parts.append(tool_context)
-    prompt_parts.append(raw_prompt + memory_instructions)
-
-    prompt = "\n\n".join(prompt_parts)
+    prompt = _build_augmented_prompt(raw_prompt)
 
     stream = bridge.stream_message(
         prompt=prompt,
@@ -1342,20 +1310,8 @@ async def _run_codex(
     """Run a single Codex CLI subprocess attempt. Returns the response or None."""
     state.process_handle = {}
 
-    # Build memory and tool-augmented prompt
     raw_prompt = override_text or message.text or ""
-    memory_context = memory_manager.build_context(raw_prompt)
-    tool_context = context_plugins.build_context(raw_prompt)
-    memory_instructions = memory_manager.build_instructions()
-
-    prompt_parts = []
-    if memory_context:
-        prompt_parts.append(memory_context)
-    if tool_context:
-        prompt_parts.append(tool_context)
-    prompt_parts.append(raw_prompt + memory_instructions)
-
-    prompt = "\n\n".join(prompt_parts)
+    prompt = _build_augmented_prompt(raw_prompt)
 
     stream = bridge.stream_codex_message(
         prompt=prompt,

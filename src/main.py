@@ -14,6 +14,10 @@ from .config import (
     ALLOWED_USER_IDS,
     VERSION,
     MEMORY_DIR,
+    AUTONOMY_ENABLED,
+    AUTONOMY_FAILURE_THRESHOLD,
+    AUTONOMY_FAILURE_WINDOW_MINUTES,
+    AUTONOMY_ALERT_COOLDOWN_MINUTES,
     TELEGRAM_REQUEST_TIMEOUT_SECONDS,
     TELEGRAM_POLLING_TIMEOUT_SECONDS,
     TELEGRAM_BACKOFF_MIN_SECONDS,
@@ -21,8 +25,9 @@ from .config import (
     TELEGRAM_BACKOFF_FACTOR,
     TELEGRAM_BACKOFF_JITTER,
 )
-from .bot import router, provider_manager, task_manager, schedule_manager
+from .bot import router, provider_manager, task_manager, schedule_manager, memory_manager
 from .metrics import start_metrics_server
+from .autonomy import AutonomyEngine, LearningJournal
 
 
 def mark_good_commit() -> None:
@@ -102,7 +107,16 @@ async def main() -> None:
     global task_manager, schedule_manager
     from .tasks import TaskManager
     from .scheduler import ScheduleManager
-    task_manager = TaskManager(bot)
+    autonomy_engine = AutonomyEngine(
+        bot=bot,
+        memory_manager=memory_manager,
+        journal=LearningJournal(MEMORY_DIR / "learning.db"),
+        proactive_enabled=AUTONOMY_ENABLED,
+        failure_threshold=AUTONOMY_FAILURE_THRESHOLD,
+        failure_window_minutes=AUTONOMY_FAILURE_WINDOW_MINUTES,
+        alert_cooldown_minutes=AUTONOMY_ALERT_COOLDOWN_MINUTES,
+    )
+    task_manager = TaskManager(bot, observers=[autonomy_engine])
     await task_manager.start()
     schedule_manager = ScheduleManager(task_manager, MEMORY_DIR / "schedules.db")
     await schedule_manager.start()

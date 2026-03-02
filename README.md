@@ -9,6 +9,8 @@ Telegram bot that runs Claude Code as an assistant. You send messages in Telegra
 - Provider/model switching via commands
 - Memory subsystem (profile + episodes)
 - Optional recurring scheduler
+- Identity policy layer (`memory/identity.yaml`)
+- Background self-learning journal + proactive failure alerts
 - Crash-loop protection with rollback to last known-good commit
 - Prometheus metrics endpoint
 
@@ -192,6 +194,10 @@ All settings are read from `.env`.
 - `METRICS_PORT` (optional, default `9101`): Prometheus endpoint port (`0` disables)
 - `MEMORY_DIR` (optional, default `memory/`): persistent memory path
 - `TOOLS_DIR` (optional, default `tools/`): custom tool definitions path
+- `AUTONOMY_ENABLED` (optional, default `1`): enable background self-learning and proactive alerts
+- `AUTONOMY_FAILURE_THRESHOLD` (optional, default `3`): failures required before proactive alert
+- `AUTONOMY_FAILURE_WINDOW_MINUTES` (optional, default `60`): rolling window for failure detection
+- `AUTONOMY_ALERT_COOLDOWN_MINUTES` (optional, default `30`): per-chat minimum gap between alerts
 
 ## Upgrade and Rollback
 

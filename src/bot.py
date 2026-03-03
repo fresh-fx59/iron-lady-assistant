@@ -1603,23 +1603,34 @@ async def _handle_message_inner(message: Message, override_text: str | None = No
                     override_text=override_text,
                 )
 
-            # ── Fallback on rate-limit ────────────────────────────
-            if (
+            # ── Fallback on provider errors ───────────────────────
+            error_text_l = (final_response.text or "").strip().lower() if final_response else ""
+            should_fallback = bool(
                 final_response
                 and final_response.is_error
                 and not state.cancel_requested
-                and provider_manager.is_rate_limit_error(final_response.text)
-            ):
+                and (
+                    provider_manager.is_rate_limit_error(final_response.text)
+                    # Claude CLI sometimes returns a generic empty-body failure.
+                    or (provider.cli == "claude" and error_text_l == "claude returned an error.")
+                )
+            )
+            if should_fallback:
                 next_provider = provider_manager.advance(message.chat.id)
                 if next_provider:
+                    reason = (
+                        "Rate limited"
+                        if provider_manager.is_rate_limit_error(final_response.text)
+                        else "Provider error"
+                    )
                     await message.answer(
-                        f"Rate limited on <b>{provider.name}</b>. "
+                        f"{reason} on <b>{provider.name}</b>. "
                         f"Switching to <b>{next_provider.name}</b>...",
                         parse_mode="HTML",
                     )
                     logger.info(
-                        "Chat %d: rate limit on '%s', retrying with '%s'",
-                        message.chat.id, provider.name, next_provider.name,
+                        "Chat %d: fallback from '%s' to '%s' (error=%r)",
+                        message.chat.id, provider.name, next_provider.name, final_response.text,
                     )
                     env = provider_manager.subprocess_env(next_provider)
                     if next_provider.cli == "codex":
@@ -1654,6 +1665,12 @@ async def _handle_message_inner(message: Message, override_text: str | None = No
         elif final_response:
             if final_response.is_error:
                 error_text = final_response.text or "(No response)"
+                logger.warning(
+                    "Chat %d: provider '%s' returned error response: %r",
+                    message.chat.id,
+                    provider.name,
+                    error_text[:500],
+                )
                 _record_error(message.chat.id)
                 reply_markup = _build_rollback_suggestion_markup(
                     message.chat.id,

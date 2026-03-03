@@ -3,6 +3,15 @@
 Telegram bot that runs coding agents in chat: `Claude Code CLI` and `Codex CLI`.
 You send messages in Telegram, the bot runs the selected agent, and returns replies/media back to chat.
 
+## Core Capabilities
+
+- Executes real coding tasks from Telegram: code edits, refactors, debugging, and test runs
+- Supports multiple agent providers (`Claude Code CLI` and `Codex CLI`) with in-chat provider/model switching
+- Preserves per-chat context and memory (profile + recent episodes) for long-running workflows
+- Handles media end-to-end: voice transcription, images/files passthrough, and formatted replies
+- Offers operational safety: allowlists, cancellation, rollback command, crash-loop protection, and metrics
+- Enables cost-aware operation via Codex CLI subscription-based agent usage instead of API-only metering
+
 ## What This Repo Provides
 
 - Telegram bot integration with Claude Code

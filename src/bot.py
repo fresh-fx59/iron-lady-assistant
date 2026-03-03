@@ -660,7 +660,9 @@ async def cmd_model(message: Message) -> None:
 @router.callback_query(F.data.startswith("model:"))
 async def cb_model_switch(callback: CallbackQuery) -> None:
     """Handle model button click."""
-    if not _is_authorized(callback.from_user and callback.from_user.id):
+    if not callback.message:
+        return
+    if not _is_authorized(callback.from_user and callback.from_user.id, callback.message.chat.id):
         return
 
     chat_id = callback.message.chat.id
@@ -696,13 +698,28 @@ async def cb_model_switch(callback: CallbackQuery) -> None:
     await callback.answer(f"Switched to {current}")
 
 
-@router.message(F.text == "/provider")
+@router.message(F.text.startswith("/provider"))
 async def cmd_provider(message: Message) -> None:
-    """Show provider selection keyboard."""
+    """Show provider selection keyboard or switch provider by argument."""
     if not _is_authorized(message.from_user and message.from_user.id, message.chat.id):
         return
 
+    chat_id = message.chat.id
+    thread_id = _thread_id(message)
     scope_key = _scope_key_from_message(message)
+    raw_text = message.text or ""
+    parts = raw_text.split(maxsplit=1)
+    if len(parts) > 1:
+        requested = parts[1].strip()
+        provider = provider_manager.set_provider(scope_key, requested)
+        if not provider:
+            available = ", ".join(p.name for p in provider_manager.providers)
+            await message.answer(f"Provider not found: {requested}\nAvailable: {available}")
+            return
+        session_manager.set_provider(chat_id, provider.name, thread_id)
+        await message.answer(f"Switched to provider: <b>{provider.name}</b>", parse_mode="HTML")
+        return
+
     current = provider_manager.get_provider(scope_key)
 
     lines = [f"<b>Current provider:</b> {current.name}\n<i>{current.description}</i>\n"]
@@ -721,7 +738,9 @@ async def cmd_provider(message: Message) -> None:
 @router.callback_query(F.data.startswith("provider:"))
 async def cb_provider_switch(callback: CallbackQuery) -> None:
     """Handle provider button click."""
-    if not _is_authorized(callback.from_user and callback.from_user.id):
+    if not callback.message:
+        return
+    if not _is_authorized(callback.from_user and callback.from_user.id, callback.message.chat.id):
         return
 
     chat_id = callback.message.chat.id

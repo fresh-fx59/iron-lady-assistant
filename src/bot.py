@@ -1702,6 +1702,7 @@ async def _handle_message_inner(message: Message, override_text: str | None = No
         session = session_manager.get(chat_id, thread_id)
         progress = ProgressReporter(message)
         typing_task = asyncio.create_task(_keep_typing(message))
+        await progress.show_working()
 
         final_response: bridge.ClaudeResponse | None = None
 

@@ -659,6 +659,22 @@ async def stream_codex_message(
             )
             return
 
+        if proc.returncode in {-15, 143}:
+            metrics.CLAUDE_REQUESTS_TOTAL.labels(model=model or "codex", status="error").inc()
+            metrics.CLAUDE_RESPONSE_DURATION.labels(model=model or "codex").observe(elapsed)
+            yield StreamEvent(
+                event_type=StreamEventType.RESULT,
+                response=ClaudeResponse(
+                    text="Codex process was interrupted by service restart. Please resend your message.",
+                    session_id=codex_session_id,
+                    is_error=True,
+                    cost_usd=0,
+                    duration_ms=elapsed * 1000,
+                    num_turns=0,
+                )
+            )
+            return
+
         metrics.CLAUDE_REQUESTS_TOTAL.labels(model=model or "codex", status="error").inc()
         metrics.CLAUDE_RESPONSE_DURATION.labels(model=model or "codex").observe(elapsed)
         yield StreamEvent(

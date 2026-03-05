@@ -1,4 +1,5 @@
 import asyncio
+import html
 import logging
 from collections import deque
 from typing import Optional
@@ -73,6 +74,24 @@ class ProgressReporter:
             self._task.cancel()
         self._task = asyncio.create_task(self._debounced_update())
 
+    async def show_working(self) -> None:
+        """Show initial working indicator immediately."""
+        if self._progress_message_id is not None:
+            return
+        text = "🔄 <b>Working...</b>"
+        try:
+            msg = await self._bot.send_message(
+                chat_id=self._chat_id,
+                message_thread_id=self._message_thread_id,
+                text=text,
+                parse_mode="HTML",
+            )
+            self._progress_message_id = msg.message_id
+            self._last_update_text = text
+            self._start_heartbeat()
+        except TelegramAPIError as e:
+            logger.warning("Failed to send initial progress message: %s", e)
+
     def _format_tool_action(self, tool_name: str, tool_input: str | None) -> str:
         """Format a tool action into a human-readable line."""
         tool_name = tool_name.lower()
@@ -100,8 +119,10 @@ class ProgressReporter:
             case _:
                 prefix = f"Using {tool_name}"
 
+        prefix = html.escape(prefix)
         if tool_input:
-            return f"{prefix}: {tool_input}"
+            safe_input = html.escape(tool_input, quote=False).replace("\n", " ")
+            return f"{prefix}: {safe_input}"
         return f"{prefix}..."
 
     async def _debounced_update(self) -> None:

@@ -57,12 +57,15 @@ def reset_session_manager():
             provider_manager,
             _chat_states,
             _error_counts,
+            _STEP_PLAN_STATE_PATH,
         )
         session_manager.sessions.clear()
         provider_manager._chat_provider_idx.clear()
         provider_manager._fallback_since.clear()
         _chat_states.clear()
         _error_counts.clear()
+        if _STEP_PLAN_STATE_PATH.exists():
+            _STEP_PLAN_STATE_PATH.unlink()
     except Exception:
         pass
 

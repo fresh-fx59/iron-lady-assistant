@@ -25,8 +25,13 @@ from src.bot import (
     cmd_schedule_weekly,
     cmd_schedule_list,
     cmd_schedule_cancel,
+    cmd_stepplan_start,
+    cmd_stepplan_status,
+    cmd_stepplan_stop,
     handle_message,
     _ChatState,
+    _save_step_plan_state,
+    _load_step_plan_state,
     _get_state,
     _is_authorized,
     _is_transient_codex_error,
@@ -623,6 +628,68 @@ class TestMessageHandling:
 
         session = session_manager.get(123456789)
         assert session.claude_session_id is None
+
+
+@pytest.mark.asyncio
+class TestStepPlanCommands:
+    async def test_stepplan_start_queues_first_step(self, mock_message, tmppath, monkeypatch):
+        plan_dir = tmppath / "plan"
+        plan_dir.mkdir(parents=True, exist_ok=True)
+        (plan_dir / "01 - First.md").write_text("first step", encoding="utf-8")
+        (plan_dir / "02 - Second.md").write_text("second step", encoding="utf-8")
+        mock_message.text = f"/stepplan_start {plan_dir}"
+
+        manager = AsyncMock()
+        manager.submit = AsyncMock(return_value="task-123")
+        monkeypatch.setattr("src.bot.task_manager", manager)
+
+        await cmd_stepplan_start(mock_message)
+
+        manager.submit.assert_awaited_once()
+        state = _load_step_plan_state()
+        assert state["active"] is True
+        assert state["current_index"] == 0
+        assert state["current_task_id"] == "task-123"
+        assert len(state["steps"]) == 2
+
+    async def test_stepplan_status_shows_state(self, mock_message):
+        mock_message.text = "/stepplan_status"
+        _save_step_plan_state(
+            {
+                "active": True,
+                "name": "Test Plan",
+                "steps": ["/tmp/01 - X.md"],
+                "current_index": 0,
+                "current_task_id": "abc",
+            }
+        )
+
+        await cmd_stepplan_status(mock_message)
+
+        mock_message.answer.assert_called_once()
+        text = mock_message.answer.call_args[0][0]
+        assert "Step Plan Status" in text
+        assert "Test Plan" in text
+
+    async def test_stepplan_stop_deactivates_and_cancels_running_task(self, mock_message, monkeypatch):
+        mock_message.text = "/stepplan_stop"
+        manager = AsyncMock()
+        manager.cancel = AsyncMock(return_value=True)
+        monkeypatch.setattr("src.bot.task_manager", manager)
+        _save_step_plan_state(
+            {
+                "active": True,
+                "chat_id": 123456789,
+                "current_task_id": "task-running",
+            }
+        )
+
+        await cmd_stepplan_stop(mock_message)
+
+        state = _load_step_plan_state()
+        assert state["active"] is False
+        assert not state["current_task_id"]
+        manager.cancel.assert_awaited_once_with("task-running")
 
 
 # ── Contract 8: Chat state management ───────────────────────────

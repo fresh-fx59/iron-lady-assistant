@@ -6,10 +6,12 @@ import json
 import logging
 import os
 import re
+import shlex
 import shutil
 import subprocess
 from datetime import datetime, timezone as tz
 from pathlib import Path
+from typing import Awaitable, Callable
 from urllib.parse import urlparse
 
 import yaml
@@ -44,6 +46,7 @@ context_plugins = ContextPluginRegistry([tool_registry])
 self_mod_manager = SelfModificationManager(Path(__file__).resolve().parent.parent)
 task_manager: TaskManager | None = None  # Set in main()
 schedule_manager: ScheduleManager | None = None  # Set in main()
+_step_plan_restart_callback: Callable[[str], Awaitable[None]] | None = None
 
 # Restore persisted provider selections from sessions
 for _scope_id, _session in session_manager.sessions.items():
@@ -80,6 +83,8 @@ _MEDIA_LINE_RE = re.compile(r"^\s*(?:[^\w\s]+\s*)?MEDIA:\s*(.+?)\s*$", re.IGNORE
 _VOICE_COMPATIBLE_EXTENSIONS = {".ogg", ".opus", ".mp3", ".m4a"}
 _AUDIO_EXTENSIONS = _VOICE_COMPATIBLE_EXTENSIONS | {".wav", ".aac", ".flac"}
 _IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png"}
+_STEP_PLAN_STATE_PATH = config.MEMORY_DIR / "step_plan_state.json"
+_STEP_PLAN_FILE_PATTERN = re.compile(r"^(\d+)\s*-\s*.+\.md$", re.IGNORECASE)
 
 
 def _thread_id(message: Message) -> int | None:
@@ -147,6 +152,270 @@ def _build_midflight_followup_prompt(items: list[str]) -> str:
         "Use it as updated context and continue from the latest conversation state.\n\n"
         f"{lines}"
     )
+
+
+def set_step_plan_restart_callback(
+    callback: Callable[[str], Awaitable[None]] | None,
+) -> None:
+    """Inject restart callback from main runtime."""
+    global _step_plan_restart_callback
+    _step_plan_restart_callback = callback
+
+
+def _step_plan_default_state() -> dict:
+    return {
+        "active": False,
+        "name": "",
+        "folder_path": "",
+        "chat_id": 0,
+        "message_thread_id": None,
+        "user_id": 0,
+        "steps": [],
+        "current_index": 0,
+        "current_task_id": None,
+        "restart_between_steps": True,
+        "last_error": "",
+        "updated_at": datetime.now(tz.utc).isoformat(),
+    }
+
+
+def _load_step_plan_state() -> dict:
+    if not _STEP_PLAN_STATE_PATH.exists():
+        return _step_plan_default_state()
+    try:
+        data = json.loads(_STEP_PLAN_STATE_PATH.read_text(encoding="utf-8"))
+    except Exception:
+        logger.warning("Failed to read step plan state, resetting", exc_info=True)
+        return _step_plan_default_state()
+    if not isinstance(data, dict):
+        return _step_plan_default_state()
+    state = _step_plan_default_state()
+    state.update(data)
+    return state
+
+
+def _save_step_plan_state(state: dict) -> None:
+    payload = _step_plan_default_state()
+    payload.update(state)
+    payload["updated_at"] = datetime.now(tz.utc).isoformat()
+    _STEP_PLAN_STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    _STEP_PLAN_STATE_PATH.write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+
+
+def _load_plan_steps_from_folder(folder_path: str) -> list[str]:
+    folder = Path(folder_path).expanduser().resolve()
+    if not folder.exists() or not folder.is_dir():
+        raise FileNotFoundError(f"Folder not found: {folder}")
+
+    ordered_files: list[tuple[int, Path]] = []
+    for child in folder.iterdir():
+        if not child.is_file():
+            continue
+        match = _STEP_PLAN_FILE_PATTERN.match(child.name)
+        if not match:
+            continue
+        ordered_files.append((int(match.group(1)), child))
+
+    ordered_files.sort(key=lambda row: row[0])
+    return [str(path) for _, path in ordered_files]
+
+
+def _build_step_plan_prompt(step_file: str, step_index: int, total_steps: int) -> str:
+    return (
+        f"Execute implementation step {step_index}/{total_steps} from this plan file:\n"
+        f"{step_file}\n\n"
+        "Requirements:\n"
+        "1. Follow the step plan in the file.\n"
+        "2. Implement code changes fully and verify with tests.\n"
+        "3. Mark the plan file as applied when done.\n"
+        "4. Bump project version and include version in commit message.\n"
+        "5. Commit and push to trigger deployment/restart.\n"
+        "6. If blocked, report concrete blocker and stop safely."
+    )
+
+
+async def _submit_current_step_plan_task(state: dict) -> str:
+    if not task_manager:
+        raise RuntimeError("Background tasks not available.")
+    steps = state.get("steps") or []
+    if not steps:
+        raise RuntimeError("Step plan has no steps.")
+    current_index = int(state.get("current_index") or 0)
+    if current_index >= len(steps):
+        raise RuntimeError("All steps already completed.")
+
+    step_file = str(steps[current_index])
+    prompt = _build_step_plan_prompt(step_file, current_index + 1, len(steps))
+    full_prompt = _build_augmented_prompt(prompt)
+
+    chat_id = int(state.get("chat_id") or 0)
+    message_thread_id = state.get("message_thread_id")
+    user_id = int(state.get("user_id") or 0)
+    session = session_manager.get(chat_id, message_thread_id)
+
+    task_id = await task_manager.submit(
+        chat_id=chat_id,
+        message_thread_id=message_thread_id,
+        user_id=user_id,
+        prompt=full_prompt,
+        model=session.model,
+        session_id=session.claude_session_id,
+    )
+    state["current_task_id"] = task_id
+    state["last_error"] = ""
+    _save_step_plan_state(state)
+    return task_id
+
+
+def _step_plan_status_text(state: dict) -> str:
+    steps = state.get("steps") or []
+    current_index = int(state.get("current_index") or 0)
+    total = len(steps)
+    current_file = steps[current_index] if 0 <= current_index < total else "-"
+    lines = [
+        "<b>Step Plan Status</b>",
+        "",
+        f"<b>Active:</b> {'yes' if state.get('active') else 'no'}",
+        f"<b>Name:</b> {html.escape(str(state.get('name') or '-'))}",
+        f"<b>Progress:</b> {min(current_index, total)}/{total}",
+        f"<b>Current file:</b> <code>{html.escape(str(current_file))}</code>",
+        f"<b>Current task:</b> <code>{html.escape(str(state.get('current_task_id') or '-'))}</code>",
+        f"<b>Restart between steps:</b> {'yes' if state.get('restart_between_steps') else 'no'}",
+    ]
+    last_error = str(state.get("last_error") or "").strip()
+    if last_error:
+        lines.extend(["", f"<b>Last error:</b> {html.escape(last_error[:500])}"])
+    return "\n".join(lines)
+
+
+class StepPlanObserver:
+    """Observer that advances persisted step plans after background task completion."""
+
+    async def on_task_finished(self, task) -> None:
+        state = _load_step_plan_state()
+        if not state.get("active"):
+            return
+
+        if str(state.get("current_task_id") or "") != task.id:
+            return
+
+        if task.status != TaskStatus.COMPLETED:
+            state["active"] = False
+            state["last_error"] = task.error or f"Task ended with status={task.status.value}"
+            state["current_task_id"] = None
+            _save_step_plan_state(state)
+            try:
+                await self._notify(
+                    int(state.get("chat_id") or task.chat_id),
+                    state.get("message_thread_id"),
+                    "❌ Step plan paused because current step failed. Use /stepplan_status to inspect.",
+                )
+            except Exception:
+                logger.exception("Failed to send step plan failure notification")
+            return
+
+        steps = state.get("steps") or []
+        state["current_index"] = int(state.get("current_index") or 0) + 1
+        state["current_task_id"] = None
+
+        if int(state["current_index"]) >= len(steps):
+            state["active"] = False
+            _save_step_plan_state(state)
+            await self._notify(
+                int(state.get("chat_id") or task.chat_id),
+                state.get("message_thread_id"),
+                "✅ Step plan completed.",
+            )
+            return
+
+        _save_step_plan_state(state)
+        await self._notify(
+            int(state.get("chat_id") or task.chat_id),
+            state.get("message_thread_id"),
+            "✅ Step completed. Restarting bot to continue with the next step...",
+        )
+        if state.get("restart_between_steps", True) and _step_plan_restart_callback:
+            await _step_plan_restart_callback("step_plan_next_step")
+            return
+
+        try:
+            next_task_id = await _submit_current_step_plan_task(state)
+            await self._notify(
+                int(state.get("chat_id") or task.chat_id),
+                state.get("message_thread_id"),
+                f"🔄 Continuing without restart. Next step task queued: <code>{next_task_id}</code>",
+            )
+        except Exception as exc:
+            state = _load_step_plan_state()
+            state["active"] = False
+            state["last_error"] = f"Could not queue next step: {exc}"
+            state["current_task_id"] = None
+            _save_step_plan_state(state)
+            await self._notify(
+                int(state.get("chat_id") or task.chat_id),
+                state.get("message_thread_id"),
+                f"❌ Step plan paused: {html.escape(str(exc)[:300])}",
+            )
+
+    async def _notify(self, chat_id: int, message_thread_id: int | None, text: str) -> None:
+        if not task_manager:
+            return
+        await task_manager.bot.send_message(
+            chat_id=chat_id,
+            message_thread_id=message_thread_id,
+            text=text,
+            parse_mode="HTML",
+        )
+
+
+_step_plan_observer = StepPlanObserver()
+
+
+def get_step_plan_observer() -> StepPlanObserver:
+    return _step_plan_observer
+
+
+async def resume_step_plan_after_restart() -> None:
+    """Resume pending step plan on startup if active."""
+    state = _load_step_plan_state()
+    if not state.get("active"):
+        return
+    if not task_manager:
+        return
+
+    steps = state.get("steps") or []
+    current_index = int(state.get("current_index") or 0)
+    if current_index >= len(steps):
+        state["active"] = False
+        state["current_task_id"] = None
+        _save_step_plan_state(state)
+        return
+
+    # Task IDs from previous process are stale after restart.
+    state["current_task_id"] = None
+    _save_step_plan_state(state)
+
+    try:
+        task_id = await _submit_current_step_plan_task(state)
+        await task_manager.bot.send_message(
+            chat_id=int(state.get("chat_id") or 0),
+            message_thread_id=state.get("message_thread_id"),
+            text=(
+                "🔁 <b>Step plan resumed after restart</b>\n"
+                f"Queued step {current_index + 1}/{len(steps)} as task "
+                f"<code>{task_id}</code>."
+            ),
+            parse_mode="HTML",
+        )
+    except Exception as exc:
+        state = _load_step_plan_state()
+        state["active"] = False
+        state["last_error"] = f"Resume failed: {exc}"
+        _save_step_plan_state(state)
+        logger.exception("Failed to resume step plan after restart")
 
 
 def _is_authorized(user_id: int | None, chat_id: int | None = None) -> bool:
@@ -593,6 +862,9 @@ async def cmd_start(message: Message) -> None:
         "/schedule_cancel <id> — Cancel recurring schedule",
         "/bg <task> — Run task in background",
         "/bg_cancel <id> — Cancel background task",
+        "/stepplan_start <folder> [--no-restart] — Start persisted step plan (admin)",
+        "/stepplan_status — Show persisted step plan status",
+        "/stepplan_stop — Stop persisted step plan",
         "/cancel — Cancel current request",
     ])
 
@@ -1249,6 +1521,127 @@ async def cmd_bg_cancel(message: Message) -> None:
         await message.answer(f"✅ Cancelled task <code>{full_task_id[:8]}</code>", parse_mode="HTML")
     else:
         await message.answer("Could not cancel task.")
+
+
+@router.message(F.text.startswith("/stepplan_start"))
+async def cmd_stepplan_start(message: Message) -> None:
+    """Start persisted step-by-step implementation plan."""
+    if not _is_authorized(message.from_user and message.from_user.id, message.chat.id):
+        return
+    if not _is_admin(message.from_user and message.from_user.id):
+        await message.answer("Only admin can start a step plan.")
+        return
+    if not task_manager:
+        await message.answer("Background tasks not available.")
+        return
+
+    raw_args = (message.text or "")[len("/stepplan_start"):].strip()
+    if not raw_args:
+        await message.answer(
+            "Usage: /stepplan_start <folder_path> [--no-restart]\n"
+            "Example: /stepplan_start \"/home/claude-developer/.../Ouroboros Improvement Plan\""
+        )
+        return
+
+    try:
+        argv = shlex.split(raw_args)
+    except ValueError as exc:
+        await message.answer(f"Invalid arguments: {exc}")
+        return
+
+    restart_between_steps = True
+    folder_tokens: list[str] = []
+    for token in argv:
+        if token == "--no-restart":
+            restart_between_steps = False
+            continue
+        folder_tokens.append(token)
+
+    if not folder_tokens:
+        await message.answer("Please provide a folder path.")
+        return
+
+    folder_path = " ".join(folder_tokens)
+    try:
+        steps = _load_plan_steps_from_folder(folder_path)
+    except Exception as exc:
+        await message.answer(f"Could not load plan folder: {exc}")
+        return
+
+    if not steps:
+        await message.answer(
+            "No step files found. Expected files like:\n"
+            "<code>01 - Something.md</code>",
+            parse_mode="HTML",
+        )
+        return
+
+    state = _step_plan_default_state()
+    state.update(
+        {
+            "active": True,
+            "name": Path(folder_path).expanduser().resolve().name,
+            "folder_path": str(Path(folder_path).expanduser().resolve()),
+            "chat_id": message.chat.id,
+            "message_thread_id": _thread_id(message),
+            "user_id": _actor_id(message),
+            "steps": steps,
+            "current_index": 0,
+            "current_task_id": None,
+            "restart_between_steps": restart_between_steps,
+            "last_error": "",
+        }
+    )
+    _save_step_plan_state(state)
+
+    try:
+        task_id = await _submit_current_step_plan_task(state)
+    except Exception as exc:
+        state = _load_step_plan_state()
+        state["active"] = False
+        state["last_error"] = f"Failed to queue first step: {exc}"
+        _save_step_plan_state(state)
+        await message.answer(f"Could not queue first step: {exc}")
+        return
+
+    await message.answer(
+        "✅ <b>Step plan started</b>\n"
+        f"<b>Steps:</b> {len(steps)}\n"
+        f"<b>Restart between steps:</b> {'yes' if restart_between_steps else 'no'}\n"
+        f"<b>First task:</b> <code>{task_id}</code>",
+        parse_mode="HTML",
+    )
+
+
+@router.message(F.text == "/stepplan_status")
+async def cmd_stepplan_status(message: Message) -> None:
+    if not _is_authorized(message.from_user and message.from_user.id, message.chat.id):
+        return
+    state = _load_step_plan_state()
+    await message.answer(_step_plan_status_text(state), parse_mode="HTML")
+
+
+@router.message(F.text == "/stepplan_stop")
+async def cmd_stepplan_stop(message: Message) -> None:
+    if not _is_authorized(message.from_user and message.from_user.id, message.chat.id):
+        return
+    if not _is_admin(message.from_user and message.from_user.id):
+        await message.answer("Only admin can stop a step plan.")
+        return
+
+    state = _load_step_plan_state()
+    running_task_id = str(state.get("current_task_id") or "")
+    state["active"] = False
+    state["current_task_id"] = None
+    state["last_error"] = ""
+    _save_step_plan_state(state)
+
+    cancelled = False
+    if running_task_id and task_manager:
+        cancelled = await task_manager.cancel(running_task_id)
+
+    suffix = " Running step task cancelled." if cancelled else ""
+    await message.answer(f"🛑 Step plan stopped.{suffix}")
 
 
 @router.message(F.text.startswith("/schedule_every"))

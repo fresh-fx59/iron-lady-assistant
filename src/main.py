@@ -1,5 +1,7 @@
 import asyncio
 import logging
+import os
+import signal
 import subprocess
 from pathlib import Path
 
@@ -25,7 +27,16 @@ from .config import (
     TELEGRAM_BACKOFF_FACTOR,
     TELEGRAM_BACKOFF_JITTER,
 )
-from .bot import router, provider_manager, task_manager, schedule_manager, memory_manager
+from .bot import (
+    router,
+    provider_manager,
+    task_manager,
+    schedule_manager,
+    memory_manager,
+    get_step_plan_observer,
+    resume_step_plan_after_restart,
+    set_step_plan_restart_callback,
+)
 from .metrics import start_metrics_server
 from .autonomy import AutonomyEngine, LearningJournal
 
@@ -87,6 +98,13 @@ async def send_ready_notification(bot: Bot) -> None:
         logging.warning("Could not send ready notification: %s", e)
 
 
+async def restart_process_for_step_plan(reason: str) -> None:
+    """Trigger process restart so step plan can continue across clean boots."""
+    logging.warning("Step plan requested restart: %s", reason)
+    await asyncio.sleep(1.0)
+    os.kill(os.getpid(), signal.SIGTERM)
+
+
 async def main() -> None:
     logging.basicConfig(
         level=logging.INFO,
@@ -116,7 +134,8 @@ async def main() -> None:
         failure_window_minutes=AUTONOMY_FAILURE_WINDOW_MINUTES,
         alert_cooldown_minutes=AUTONOMY_ALERT_COOLDOWN_MINUTES,
     )
-    task_manager = TaskManager(bot, observers=[autonomy_engine])
+    set_step_plan_restart_callback(restart_process_for_step_plan)
+    task_manager = TaskManager(bot, observers=[autonomy_engine, get_step_plan_observer()])
     await task_manager.start()
     schedule_manager = ScheduleManager(task_manager, MEMORY_DIR / "schedules.db")
     await schedule_manager.start()
@@ -142,6 +161,9 @@ async def main() -> None:
         BotCommand(command="schedule_cancel", description="Cancel recurring schedule"),
         BotCommand(command="bg", description="Run task in background"),
         BotCommand(command="bg_cancel", description="Cancel background task"),
+        BotCommand(command="stepplan_start", description="Start persisted step plan (admin)"),
+        BotCommand(command="stepplan_status", description="Show persisted step plan"),
+        BotCommand(command="stepplan_stop", description="Stop persisted step plan"),
         BotCommand(command="cancel", description="Cancel current request"),
     ])
 
@@ -149,6 +171,7 @@ async def main() -> None:
 
     # Send startup notification
     await send_startup_notification(bot, short_commit)
+    await resume_step_plan_after_restart()
 
     logging.info("Bot starting...")
     try:

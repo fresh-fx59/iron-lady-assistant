@@ -28,6 +28,7 @@ from src.bot import (
     cmd_stepplan_start,
     cmd_stepplan_status,
     cmd_stepplan_stop,
+    handle_image,
     handle_message,
     _ChatState,
     _save_step_plan_state,
@@ -37,6 +38,7 @@ from src.bot import (
     _is_transient_codex_error,
     _run_codex_with_retries,
     _reset_to_commit,
+    _build_augmented_prompt,
     VALID_MODELS,
 )
 
@@ -631,6 +633,46 @@ class TestMessageHandling:
 
 
 @pytest.mark.asyncio
+class TestImageHandling:
+    async def test_image_with_caption_and_ocr_forwards_override(self, mock_message):
+        mock_message.photo = [type("Photo", (), {"file_id": "small"})(), type("Photo", (), {"file_id": "large"})()]
+        mock_message.document = None
+        mock_message.caption = "please parse this"
+        mock_message.bot.get_file = AsyncMock(return_value=type("F", (), {"file_path": "photos/file.jpg"})())
+        mock_message.bot.download_file = AsyncMock()
+
+        with (
+            patch("src.bot.ocr.is_available", return_value=True),
+            patch("src.bot.ocr.extract_text", new=AsyncMock(return_value="Total: 42 USD")),
+            patch("src.bot._handle_message_inner", new=AsyncMock()) as inner_mock,
+        ):
+            await handle_image(mock_message)
+
+        inner_mock.assert_awaited_once()
+        override = inner_mock.await_args.kwargs["override_text"]
+        assert "[Image message]" in override
+        assert "Caption: please parse this" in override
+        assert "OCR text:\nTotal: 42 USD" in override
+
+    async def test_image_without_ocr_still_forwards_context(self, mock_message):
+        mock_message.photo = [type("Photo", (), {"file_id": "large"})()]
+        mock_message.document = None
+        mock_message.caption = ""
+        mock_message.bot.get_file = AsyncMock(return_value=type("F", (), {"file_path": "photos/file.jpg"})())
+        mock_message.bot.download_file = AsyncMock()
+
+        with (
+            patch("src.bot.ocr.is_available", return_value=False),
+            patch("src.bot._handle_message_inner", new=AsyncMock()) as inner_mock,
+        ):
+            await handle_image(mock_message)
+
+        inner_mock.assert_awaited_once()
+        override = inner_mock.await_args.kwargs["override_text"]
+        assert "OCR unavailable or failed" in override
+
+
+@pytest.mark.asyncio
 class TestStepPlanCommands:
     async def test_stepplan_start_queues_first_step(self, mock_message, tmppath, monkeypatch):
         plan_dir = tmppath / "plan"
@@ -738,6 +780,45 @@ class TestCodexTransientRetries:
         assert _is_transient_codex_error(
             "Reconnecting... 1/5 (stream disconnected before completion: Transport error: timeout)"
         )
+
+
+class TestPromptHealthInvariants:
+    def test_build_augmented_prompt_includes_health_invariants_when_enabled(self, monkeypatch):
+        monkeypatch.setattr("src.bot._as_text", lambda value: value if isinstance(value, str) else "")
+        monkeypatch.setattr(
+            "src.bot.memory_manager",
+            type("M", (), {"build_context": lambda self, _: "", "build_instructions": lambda self: ""})(),
+        )
+        monkeypatch.setattr(
+            "src.bot.identity_manager",
+            type("I", (), {"build_context": lambda self: ""})(),
+        )
+        monkeypatch.setattr(
+            "src.bot.context_plugins",
+            type("T", (), {"build_context": lambda self, _: ""})(),
+        )
+        monkeypatch.setattr("src.bot.config.HEALTH_INVARIANTS_ENABLED", True)
+
+        prompt = _build_augmented_prompt("hello")
+        assert "<health_invariants>" in prompt
+
+    def test_build_augmented_prompt_skips_health_invariants_when_disabled(self, monkeypatch):
+        monkeypatch.setattr(
+            "src.bot.memory_manager",
+            type("M", (), {"build_context": lambda self, _: "", "build_instructions": lambda self: ""})(),
+        )
+        monkeypatch.setattr(
+            "src.bot.identity_manager",
+            type("I", (), {"build_context": lambda self: ""})(),
+        )
+        monkeypatch.setattr(
+            "src.bot.context_plugins",
+            type("T", (), {"build_context": lambda self, _: ""})(),
+        )
+        monkeypatch.setattr("src.bot.config.HEALTH_INVARIANTS_ENABLED", False)
+
+        prompt = _build_augmented_prompt("hello")
+        assert "<health_invariants>" not in prompt
 
     @pytest.mark.asyncio
     async def test_retries_and_recovers_on_transient_codex_error(self, mock_message):

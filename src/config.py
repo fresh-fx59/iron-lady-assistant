@@ -6,7 +6,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-VERSION: str = "0.18.12"
+VERSION: str = "0.18.14"
 
 # ── Bot token (required) ────────────────────────────────────
 BOT_TOKEN: str = os.getenv("TELEGRAM_BOT_TOKEN", "")
@@ -62,6 +62,18 @@ CODEX_TRANSIENT_MAX_RETRIES: int = int(os.getenv("CODEX_TRANSIENT_MAX_RETRIES", 
 CODEX_TRANSIENT_RETRY_BACKOFF_SECONDS: float = float(
     os.getenv("CODEX_TRANSIENT_RETRY_BACKOFF_SECONDS", "2.0")
 )
+HEALTH_INVARIANTS_ENABLED: bool = (
+    os.getenv("HEALTH_INVARIANTS_ENABLED", "1").strip().lower() not in {"0", "false", "no"}
+)
+HEALTH_INVARIANTS_MAX_CHARS: int = int(os.getenv("HEALTH_INVARIANTS_MAX_CHARS", "1200"))
+HEALTH_INVARIANTS_STALE_HOURS: int = int(os.getenv("HEALTH_INVARIANTS_STALE_HOURS", "72"))
+HEALTH_INVARIANTS_PROVIDER_FAIL_WARN_RATIO: float = float(
+    os.getenv("HEALTH_INVARIANTS_PROVIDER_FAIL_WARN_RATIO", "0.30")
+)
+HEALTH_INVARIANTS_EMPTY_WARN_RATIO: float = float(
+    os.getenv("HEALTH_INVARIANTS_EMPTY_WARN_RATIO", "0.20")
+)
+HEALTH_INVARIANTS_MIN_SAMPLE_SIZE: int = int(os.getenv("HEALTH_INVARIANTS_MIN_SAMPLE_SIZE", "5"))
 PROGRESS_DEBOUNCE_SECONDS: float = float(os.getenv("PROGRESS_DEBOUNCE_SECONDS", "3.0"))
 METRICS_PORT: int = int(os.getenv("METRICS_PORT", "9101"))
 AUTONOMY_ENABLED: bool = os.getenv("AUTONOMY_ENABLED", "1").strip().lower() not in {"0", "false", "no"}

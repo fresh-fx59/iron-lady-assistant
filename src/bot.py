@@ -21,8 +21,9 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 from aiogram.enums import ChatAction
 from aiogram.exceptions import TelegramAPIError
 
-from . import bridge, config, metrics, transcribe
+from . import bridge, config, metrics, ocr, transcribe
 from .core.context_plugins import ContextPluginRegistry
+from .health_invariants import HealthInvariants
 from .identity import IdentityManager
 from .sessions import SessionManager, make_scope_key
 from .formatter import markdown_to_html, split_message, strip_html
@@ -47,6 +48,7 @@ self_mod_manager = SelfModificationManager(Path(__file__).resolve().parent.paren
 task_manager: TaskManager | None = None  # Set in main()
 schedule_manager: ScheduleManager | None = None  # Set in main()
 _step_plan_restart_callback: Callable[[str], Awaitable[None]] | None = None
+health_invariants = HealthInvariants()
 
 # Restore persisted provider selections from sessions
 for _scope_id, _session in session_manager.sessions.items():
@@ -535,12 +537,26 @@ def _build_augmented_prompt(raw_prompt: str) -> str:
     identity_context = _as_text(identity_manager.build_context())
     tool_context = _as_text(context_plugins.build_context(raw_prompt))
     memory_instructions = _as_text(memory_manager.build_instructions())
+    invariants_context = ""
+    if config.HEALTH_INVARIANTS_ENABLED:
+        invariants_context = health_invariants.build_block(
+            app_version=config.VERSION,
+            memory_dir=config.MEMORY_DIR,
+            max_chars=config.HEALTH_INVARIANTS_MAX_CHARS,
+            stale_after_hours=config.HEALTH_INVARIANTS_STALE_HOURS,
+            provider_fail_warn_ratio=config.HEALTH_INVARIANTS_PROVIDER_FAIL_WARN_RATIO,
+            empty_warn_ratio=config.HEALTH_INVARIANTS_EMPTY_WARN_RATIO,
+            min_sample_size=config.HEALTH_INVARIANTS_MIN_SAMPLE_SIZE,
+            claude_md_path=_repo_root() / "CLAUDE.md",
+        )
 
     prompt_parts: list[str] = []
     if memory_context:
         prompt_parts.append(memory_context)
     if identity_context:
         prompt_parts.append(identity_context)
+    if invariants_context:
+        prompt_parts.append(invariants_context)
     if tool_context:
         prompt_parts.append(tool_context)
     prompt_parts.append(raw_prompt + memory_instructions)
@@ -2088,6 +2104,70 @@ async def handle_voice(message: Message) -> None:
         await message.answer("An internal error occurred while processing your voice message.")
 
 
+@router.message(F.photo)
+@router.message(F.document.mime_type.startswith("image/"))
+async def handle_image(message: Message) -> None:
+    """Extract text from image (OCR) and process as text message."""
+    if not _is_authorized(message.from_user and message.from_user.id, message.chat.id):
+        return
+
+    import tempfile
+
+    caption = (message.caption or "").strip()
+    file_id: str | None = None
+
+    if message.photo:
+        file_id = message.photo[-1].file_id
+    elif message.document and (message.document.mime_type or "").lower().startswith("image/"):
+        file_id = message.document.file_id
+
+    if not file_id:
+        await message.answer("Image message was received, but no valid image file was found.")
+        return
+
+    file = await message.bot.get_file(file_id)
+    suffix = Path(file.file_path or "").suffix or ".jpg"
+    tmp = tempfile.NamedTemporaryFile(suffix=suffix, delete=False)
+    ocr_text = ""
+    ocr_error = False
+    try:
+        await message.bot.download_file(file.file_path, tmp.name)
+        if ocr.is_available():
+            try:
+                ocr_text = await ocr.extract_text(tmp.name)
+            except Exception:
+                logger.exception("Image OCR failed")
+                ocr_error = True
+        else:
+            ocr_error = True
+    except Exception:
+        logger.exception("Image download failed")
+        await message.answer("Failed to download image for OCR.")
+        return
+    finally:
+        os.unlink(tmp.name)
+
+    parts = ["[Image message]"]
+    if caption:
+        parts.append(f"Caption: {caption}")
+    if ocr_text:
+        parts.append(f"OCR text:\n{ocr_text[:8000]}")
+    elif ocr_error:
+        parts.append(
+            "OCR unavailable or failed on this host. "
+            "Install Tesseract (`sudo apt-get install -y tesseract-ocr`) to enable OCR."
+        )
+
+    override = "\n\n".join(parts).strip()
+    try:
+        await _handle_message_inner(message, override_text=override)
+    except Exception:
+        logger.exception("Unhandled exception in handle_image")
+        metrics.MESSAGES_TOTAL.labels(status="error").inc()
+        _record_error(_scope_key_from_message(message))
+        await message.answer("An internal error occurred while processing your image message.")
+
+
 @router.message(F.text)
 async def handle_message(message: Message) -> None:
     try:
@@ -2214,6 +2294,7 @@ async def _handle_message_inner(message: Message, override_text: str | None = No
                 )
             )
             if should_fallback:
+                health_invariants.record_provider_result(success=False)
                 next_provider = provider_manager.advance(scope_key)
                 if next_provider:
                     reason = (
@@ -2308,6 +2389,7 @@ async def _handle_message_inner(message: Message, override_text: str | None = No
             _clear_errors(scope_key)
         elif final_response:
             if final_response.is_error:
+                health_invariants.record_provider_result(success=False)
                 error_text = final_response.text or "(No response)"
                 logger.warning(
                     "Chat %d: provider '%s' returned error response: %r",
@@ -2323,6 +2405,7 @@ async def _handle_message_inner(message: Message, override_text: str | None = No
                 await message.answer(error_text, reply_markup=reply_markup)
                 await progress.finish()
             else:
+                health_invariants.record_provider_result(success=True)
                 clean_text, media_refs, audio_as_voice = _extract_media_directives(final_response.text or "")
 
                 for media_ref in media_refs:
@@ -2352,6 +2435,7 @@ async def _handle_message_inner(message: Message, override_text: str | None = No
 
                 if not chunks:
                     if not media_refs:
+                        health_invariants.record_empty_response(is_empty=True)
                         logger.warning(
                             "Chat %d: Got empty response object - text='%s', is_error=%s, session_id=%s, cost=%.6f",
                             message.chat.id,
@@ -2361,6 +2445,10 @@ async def _handle_message_inner(message: Message, override_text: str | None = No
                             final_response.cost_usd,
                         )
                         chunks = ["(empty response)"]
+                    else:
+                        health_invariants.record_empty_response(is_empty=False)
+                else:
+                    health_invariants.record_empty_response(is_empty=False)
 
                 for chunk in chunks:
                     if not chunk.strip():
@@ -2476,6 +2564,7 @@ async def _keep_typing(message: Message) -> None:
                     await message.bot.send_chat_action(chat_id=message.chat.id, action=ChatAction.TYPING)
             except TelegramAPIError as e:
                 logger.debug("Typing indicator failed (transient): %s", e)
+                health_invariants.record_progress_channel_error()
             await asyncio.sleep(5)
     except asyncio.CancelledError:
         return

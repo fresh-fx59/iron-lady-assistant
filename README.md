@@ -86,6 +86,12 @@ All settings are read from `.env`.
 - `TELEGRAM_BACKOFF_FACTOR` (optional, default `1.5`): exponential reconnect multiplier
 - `TELEGRAM_BACKOFF_JITTER` (optional, default `0.1`): reconnect delay randomization
 - `PROGRESS_DEBOUNCE_SECONDS` (optional, default `3.0`): progress update pacing
+- `HEALTH_INVARIANTS_ENABLED` (optional, default `1`): inject runtime health-invariants block into prompt context
+- `HEALTH_INVARIANTS_MAX_CHARS` (optional, default `1200`): max size of health-invariants block
+- `HEALTH_INVARIANTS_STALE_HOURS` (optional, default `72`): memory staleness threshold used by invariants
+- `HEALTH_INVARIANTS_PROVIDER_FAIL_WARN_RATIO` (optional, default `0.30`): anomaly threshold for provider failures
+- `HEALTH_INVARIANTS_EMPTY_WARN_RATIO` (optional, default `0.20`): anomaly threshold for empty responses
+- `HEALTH_INVARIANTS_MIN_SAMPLE_SIZE` (optional, default `5`): minimum sample size before ratio-based anomaly checks
 - `METRICS_PORT` (optional, default `9101`): Prometheus endpoint port (`0` disables)
 - `MEMORY_DIR` (optional, default `memory/`): persistent memory path
 - `TOOLS_DIR` (optional, default `tools/`): custom tool definitions path
@@ -196,7 +202,9 @@ cat .deploy/deploy.log
     ├── scheduler.py
     ├── self_modify.py
     ├── progress.py
+    ├── health_invariants.py
     ├── formatter.py
+    ├── ocr.py
     └── metrics.py
 ```
 

@@ -5,6 +5,7 @@ and message handling. These are observable user-facing behaviors.
 """
 
 import asyncio
+from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
@@ -34,6 +35,11 @@ from src.bot import (
     _save_step_plan_state,
     _load_step_plan_state,
     _get_state,
+    _load_scope_snapshots,
+    _save_scope_snapshots,
+    _is_followup_already_completed,
+    _mark_followup_completed,
+    resume_scope_snapshots_after_restart,
     _is_authorized,
     _is_transient_codex_error,
     _run_codex_with_retries,
@@ -732,6 +738,52 @@ class TestStepPlanCommands:
         assert state["active"] is False
         assert not state["current_task_id"]
         manager.cancel.assert_awaited_once_with("task-running")
+
+
+@pytest.mark.asyncio
+class TestScopeSnapshotRecovery:
+    async def test_restore_pending_inputs_after_restart(self, monkeypatch):
+        manager = AsyncMock()
+        manager.bot = AsyncMock()
+        manager.bot.send_message = AsyncMock()
+        monkeypatch.setattr("src.bot.task_manager", manager)
+        monkeypatch.setattr("src.bot.config.ALLOWED_USER_IDS", {123456789})
+        monkeypatch.setattr("src.bot.config.SCOPE_SNAPSHOT_ENABLED", True)
+        monkeypatch.setattr("src.bot.config.SCOPE_SNAPSHOT_MAX_AGE_MINUTES", 180)
+
+        _save_scope_snapshots(
+            {
+                "123456789:main": {
+                    "scope_key": "123456789:main",
+                    "chat_id": 123456789,
+                    "message_thread_id": None,
+                    "pending_inputs": ["remember this"],
+                    "inflight_pending_inputs": [],
+                    "inflight_pending_hash": "",
+                    "completed_pending_hashes": [],
+                    "processing": False,
+                    "updated_at": datetime.now(timezone.utc).isoformat(),
+                }
+            }
+        )
+
+        await resume_scope_snapshots_after_restart()
+
+        state = _get_state("123456789:main")
+        assert state.pending_inputs == ["remember this"]
+        manager.bot.send_message.assert_awaited_once()
+
+    async def test_duplicate_followup_hash_prevents_replay(self):
+        _save_scope_snapshots(
+            {
+                "123456789:main": {
+                    "scope_key": "123456789:main",
+                    "completed_pending_hashes": [],
+                }
+            }
+        )
+        _mark_followup_completed("123456789:main", "abc123")
+        assert _is_followup_already_completed("123456789:main", "abc123") is True
 
 
 # ── Contract 8: Chat state management ───────────────────────────

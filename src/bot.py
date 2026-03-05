@@ -1,5 +1,6 @@
 import asyncio
 from dataclasses import dataclass, field
+import hashlib
 import html
 import inspect
 import json
@@ -9,7 +10,7 @@ import re
 import shlex
 import shutil
 import subprocess
-from datetime import datetime, timezone as tz
+from datetime import datetime, timedelta, timezone as tz
 from pathlib import Path
 from typing import Awaitable, Callable
 from urllib.parse import urlparse
@@ -86,6 +87,7 @@ _VOICE_COMPATIBLE_EXTENSIONS = {".ogg", ".opus", ".mp3", ".m4a"}
 _AUDIO_EXTENSIONS = _VOICE_COMPATIBLE_EXTENSIONS | {".wav", ".aac", ".flac"}
 _IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png"}
 _STEP_PLAN_STATE_PATH = config.MEMORY_DIR / "step_plan_state.json"
+_SCOPE_SNAPSHOT_PATH = config.MEMORY_DIR / "scope_snapshot.json"
 _STEP_PLAN_FILE_PATTERN = re.compile(r"^(\d+)\s*-\s*.+\.md$", re.IGNORECASE)
 
 
@@ -127,7 +129,133 @@ def _drain_pending_inputs(state: _ChatState) -> list[str]:
     return pending
 
 
-async def _cancel_active_scope_run(state: _ChatState, require_process: bool = False) -> bool:
+def _parse_scope_key_components(scope_key: str) -> tuple[int, int | None]:
+    chat_raw, _, thread_raw = scope_key.partition(":")
+    chat_id = int(chat_raw)
+    if not thread_raw or thread_raw == "main":
+        return chat_id, None
+    return chat_id, int(thread_raw)
+
+
+def _snapshot_default_record(scope_key: str) -> dict:
+    chat_id, message_thread_id = _parse_scope_key_components(scope_key)
+    return {
+        "scope_key": scope_key,
+        "chat_id": chat_id,
+        "message_thread_id": message_thread_id,
+        "pending_inputs": [],
+        "inflight_pending_inputs": [],
+        "inflight_pending_hash": "",
+        "completed_pending_hashes": [],
+        "processing": False,
+        "provider": "",
+        "claude_session_id": "",
+        "codex_session_id": "",
+        "updated_at": datetime.now(tz.utc).isoformat(),
+    }
+
+
+def _load_scope_snapshots() -> dict[str, dict]:
+    if not _SCOPE_SNAPSHOT_PATH.exists():
+        return {}
+    try:
+        data = json.loads(_SCOPE_SNAPSHOT_PATH.read_text(encoding="utf-8"))
+    except Exception:
+        logger.warning("Failed to load scope snapshot state", exc_info=True)
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    snapshots: dict[str, dict] = {}
+    for scope_key, payload in data.items():
+        if not isinstance(scope_key, str) or not isinstance(payload, dict):
+            continue
+        row = _snapshot_default_record(scope_key)
+        row.update(payload)
+        snapshots[scope_key] = row
+    return snapshots
+
+
+def _save_scope_snapshots(snapshots: dict[str, dict]) -> None:
+    _SCOPE_SNAPSHOT_PATH.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = _SCOPE_SNAPSHOT_PATH.with_suffix(".tmp")
+    tmp_path.write_text(
+        json.dumps(snapshots, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    tmp_path.replace(_SCOPE_SNAPSHOT_PATH)
+
+
+def _update_scope_snapshot(
+    scope_key: str,
+    *,
+    state: _ChatState | None = None,
+    session: object | None = None,
+    processing: bool | None = None,
+) -> None:
+    if not config.SCOPE_SNAPSHOT_ENABLED:
+        return
+    snapshots = _load_scope_snapshots()
+    row = snapshots.get(scope_key, _snapshot_default_record(scope_key))
+    if state is not None:
+        row["pending_inputs"] = list(state.pending_inputs)
+    if session is not None:
+        row["provider"] = str(getattr(session, "provider", "") or "")
+        row["claude_session_id"] = str(getattr(session, "claude_session_id", "") or "")
+        row["codex_session_id"] = str(getattr(session, "codex_session_id", "") or "")
+    if processing is not None:
+        row["processing"] = bool(processing)
+    row["updated_at"] = datetime.now(tz.utc).isoformat()
+    snapshots[scope_key] = row
+    _save_scope_snapshots(snapshots)
+
+
+def _mark_followup_inflight(scope_key: str, inputs: list[str]) -> str:
+    if not config.SCOPE_SNAPSHOT_ENABLED:
+        return ""
+    digest = hashlib.sha1("\n".join(inputs).encode("utf-8")).hexdigest()[:16]
+    snapshots = _load_scope_snapshots()
+    row = snapshots.get(scope_key, _snapshot_default_record(scope_key))
+    row["inflight_pending_inputs"] = list(inputs)
+    row["inflight_pending_hash"] = digest
+    row["updated_at"] = datetime.now(tz.utc).isoformat()
+    snapshots[scope_key] = row
+    _save_scope_snapshots(snapshots)
+    return digest
+
+
+def _is_followup_already_completed(scope_key: str, pending_hash: str) -> bool:
+    if not config.SCOPE_SNAPSHOT_ENABLED or not pending_hash:
+        return False
+    snapshots = _load_scope_snapshots()
+    row = snapshots.get(scope_key)
+    if not row:
+        return False
+    hashes = row.get("completed_pending_hashes") or []
+    return pending_hash in hashes
+
+
+def _mark_followup_completed(scope_key: str, pending_hash: str) -> None:
+    if not config.SCOPE_SNAPSHOT_ENABLED or not pending_hash:
+        return
+    snapshots = _load_scope_snapshots()
+    row = snapshots.get(scope_key, _snapshot_default_record(scope_key))
+    hashes = list(row.get("completed_pending_hashes") or [])
+    if pending_hash not in hashes:
+        hashes.append(pending_hash)
+    row["completed_pending_hashes"] = hashes[-config.SCOPE_SNAPSHOT_COMPLETED_HASHES_LIMIT :]
+    row["inflight_pending_inputs"] = []
+    row["inflight_pending_hash"] = ""
+    row["updated_at"] = datetime.now(tz.utc).isoformat()
+    snapshots[scope_key] = row
+    _save_scope_snapshots(snapshots)
+
+
+async def _cancel_active_scope_run(
+    state: _ChatState,
+    require_process: bool = False,
+    scope_key: str | None = None,
+    session: object | None = None,
+) -> bool:
     """Request cancellation and kill the active subprocess if present."""
     if not state.lock.locked():
         return False
@@ -141,6 +269,8 @@ async def _cancel_active_scope_run(state: _ChatState, require_process: bool = Fa
         kill_result = proc.kill()
         if inspect.isawaitable(kill_result):
             await kill_result
+    if scope_key:
+        _update_scope_snapshot(scope_key, state=state, session=session, processing=False)
     return True
 
 
@@ -418,6 +548,59 @@ async def resume_step_plan_after_restart() -> None:
         state["last_error"] = f"Resume failed: {exc}"
         _save_step_plan_state(state)
         logger.exception("Failed to resume step plan after restart")
+
+
+async def resume_scope_snapshots_after_restart() -> None:
+    """Restore pending scope inputs from persisted snapshots."""
+    if not config.SCOPE_SNAPSHOT_ENABLED or not task_manager:
+        return
+    snapshots = _load_scope_snapshots()
+    if not snapshots:
+        return
+
+    now = datetime.now(tz.utc)
+    max_age = timedelta(minutes=max(1, config.SCOPE_SNAPSHOT_MAX_AGE_MINUTES))
+    restored_lines: list[str] = []
+
+    for scope_key, row in snapshots.items():
+        updated_raw = str(row.get("updated_at") or "")
+        try:
+            updated_at = datetime.fromisoformat(updated_raw)
+            if updated_at.tzinfo is None:
+                updated_at = updated_at.replace(tzinfo=tz.utc)
+        except Exception:
+            continue
+        if (now - updated_at) > max_age:
+            continue
+
+        state = _get_state(scope_key)
+        pending_inputs = list(row.get("pending_inputs") or [])
+        inflight_inputs = list(row.get("inflight_pending_inputs") or [])
+        inflight_hash = str(row.get("inflight_pending_hash") or "")
+        completed_hashes = set(row.get("completed_pending_hashes") or [])
+
+        restored: list[str] = []
+        if inflight_inputs and inflight_hash and inflight_hash not in completed_hashes:
+            restored.extend(inflight_inputs)
+        restored.extend(pending_inputs)
+        if not restored:
+            continue
+
+        state.pending_inputs.extend(restored)
+        _update_scope_snapshot(scope_key, state=state, processing=False)
+        restored_lines.append(f"{scope_key}: restored {len(restored)} pending item(s)")
+
+    if restored_lines:
+        admin_id = min(config.ALLOWED_USER_IDS) if config.ALLOWED_USER_IDS else None
+        if admin_id:
+            await task_manager.bot.send_message(
+                chat_id=admin_id,
+                text=(
+                    "🔁 <b>Scope snapshot restore</b>\n"
+                    + "\n".join(f"• <code>{html.escape(line)}</code>" for line in restored_lines[:20])
+                ),
+                parse_mode="HTML",
+            )
 
 
 def _is_authorized(user_id: int | None, chat_id: int | None = None) -> bool:
@@ -896,12 +1079,15 @@ async def cmd_new(message: Message) -> None:
     scope_key = _scope_key(chat_id, thread_id)
     state = _get_state(scope_key)
     state.reset_generation += 1
-    cancelled = await _cancel_active_scope_run(state)
     session = session_manager.get(chat_id, thread_id)
+    cancelled = await _cancel_active_scope_run(state, scope_key=scope_key, session=session)
     if session.claude_session_id and os.getenv("DISABLE_REFLECTION") != "1":
         asyncio.create_task(_reflect(chat_id, session))
     session_manager.new_conversation(chat_id, thread_id)
     session_manager.new_codex_conversation(chat_id, thread_id)
+    state.pending_inputs.clear()
+    fresh_session = session_manager.get(chat_id, thread_id)
+    _update_scope_snapshot(scope_key, state=state, session=fresh_session, processing=False)
     _clear_errors(scope_key)
     if cancelled:
         await message.answer("Conversation cleared immediately. Active request was cancelled.")
@@ -1221,11 +1407,16 @@ async def cmd_cancel(message: Message) -> None:
         await message.answer("Nothing to cancel.")
         return
 
-    cancelled = await _cancel_active_scope_run(state, require_process=True)
+    session = session_manager.get(chat_id, thread_id)
+    cancelled = await _cancel_active_scope_run(
+        state,
+        require_process=True,
+        scope_key=scope_key,
+        session=session,
+    )
     if not cancelled:
         await message.answer("Nothing to cancel.")
         return
-    session = session_manager.get(chat_id, thread_id)
     provider = _current_provider(scope_key)
     metrics.CLAUDE_REQUESTS_TOTAL.labels(
         model=_current_model_label(session, provider),
@@ -2222,6 +2413,7 @@ async def _handle_message_inner(message: Message, override_text: str | None = No
         queued_text = (override_text or message.text or "").strip()
         if queued_text:
             queued_count = _queue_pending_input(state, queued_text)
+            _update_scope_snapshot(scope_key, state=state)
             await message.answer(
                 f"Working on your previous request. "
                 f"Added this as extra context ({queued_count} queued) and will process it next."
@@ -2236,6 +2428,7 @@ async def _handle_message_inner(message: Message, override_text: str | None = No
         run_generation = state.reset_generation
 
         session = session_manager.get(chat_id, thread_id)
+        _update_scope_snapshot(scope_key, state=state, session=session, processing=True)
         progress = ProgressReporter(message)
         typing_task = asyncio.create_task(_keep_typing(message))
         await progress.show_working()
@@ -2486,6 +2679,7 @@ async def _handle_message_inner(message: Message, override_text: str | None = No
             and final_response.session_id != session.claude_session_id
         ):
             session_manager.update_session_id(chat_id, final_response.session_id, thread_id)
+            session = session_manager.get(chat_id, thread_id)
         if (
             final_response
             and provider.cli == "codex"
@@ -2495,6 +2689,7 @@ async def _handle_message_inner(message: Message, override_text: str | None = No
             and final_response.session_id != session.codex_session_id
         ):
             session_manager.update_codex_session_id(chat_id, final_response.session_id, thread_id)
+            session = session_manager.get(chat_id, thread_id)
 
         # Track metrics
         if final_response:
@@ -2502,16 +2697,25 @@ async def _handle_message_inner(message: Message, override_text: str | None = No
             if state.cancel_requested:
                 status = "cancelled"
             metrics.MESSAGES_TOTAL.labels(status=status).inc()
+        _update_scope_snapshot(scope_key, state=state, session=session, processing=False)
 
     if state.cancel_requested:
         _drain_pending_inputs(state)
+        _update_scope_snapshot(scope_key, state=state, processing=False)
         return
 
     queued_inputs = _drain_pending_inputs(state)
+    _update_scope_snapshot(scope_key, state=state, processing=False)
     if queued_inputs:
+        pending_hash = _mark_followup_inflight(scope_key, queued_inputs)
+        if _is_followup_already_completed(scope_key, pending_hash):
+            logger.info("Chat %s: skipping duplicate follow-up replay hash=%s", scope_key, pending_hash)
+            return
         followup_prompt = _build_midflight_followup_prompt(queued_inputs)
         if followup_prompt:
             await _handle_message_inner(message, override_text=followup_prompt)
+            if not state.cancel_requested:
+                _mark_followup_completed(scope_key, pending_hash)
 
 
 @router.errors()

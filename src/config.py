@@ -6,7 +6,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-VERSION: str = "0.18.14"
+VERSION: str = "0.18.15"
 
 # ── Bot token (required) ────────────────────────────────────
 BOT_TOKEN: str = os.getenv("TELEGRAM_BOT_TOKEN", "")
@@ -74,6 +74,13 @@ HEALTH_INVARIANTS_EMPTY_WARN_RATIO: float = float(
     os.getenv("HEALTH_INVARIANTS_EMPTY_WARN_RATIO", "0.20")
 )
 HEALTH_INVARIANTS_MIN_SAMPLE_SIZE: int = int(os.getenv("HEALTH_INVARIANTS_MIN_SAMPLE_SIZE", "5"))
+SCOPE_SNAPSHOT_ENABLED: bool = (
+    os.getenv("SCOPE_SNAPSHOT_ENABLED", "1").strip().lower() not in {"0", "false", "no"}
+)
+SCOPE_SNAPSHOT_MAX_AGE_MINUTES: int = int(os.getenv("SCOPE_SNAPSHOT_MAX_AGE_MINUTES", "180"))
+SCOPE_SNAPSHOT_COMPLETED_HASHES_LIMIT: int = int(
+    os.getenv("SCOPE_SNAPSHOT_COMPLETED_HASHES_LIMIT", "20")
+)
 PROGRESS_DEBOUNCE_SECONDS: float = float(os.getenv("PROGRESS_DEBOUNCE_SECONDS", "3.0"))
 METRICS_PORT: int = int(os.getenv("METRICS_PORT", "9101"))
 AUTONOMY_ENABLED: bool = os.getenv("AUTONOMY_ENABLED", "1").strip().lower() not in {"0", "false", "no"}

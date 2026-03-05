@@ -35,6 +35,7 @@ from .bot import (
     memory_manager,
     get_step_plan_observer,
     resume_step_plan_after_restart,
+    resume_scope_snapshots_after_restart,
     set_step_plan_restart_callback,
 )
 from .metrics import start_metrics_server
@@ -172,6 +173,7 @@ async def main() -> None:
     # Send startup notification
     await send_startup_notification(bot, short_commit)
     await resume_step_plan_after_restart()
+    await resume_scope_snapshots_after_restart()
 
     logging.info("Bot starting...")
     try:

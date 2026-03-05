@@ -311,12 +311,38 @@ class TaskManager:
             await self._notify_observers(task)
 
     async def _typing_loop(self, task: BackgroundTask) -> None:
+        send_failures = 0
+        fallback_sent = False
         while True:
-            await self.bot.send_chat_action(
-                chat_id=task.chat_id,
-                message_thread_id=task.message_thread_id,
-                action="typing",
-            )
+            try:
+                await self.bot.send_chat_action(
+                    chat_id=task.chat_id,
+                    message_thread_id=task.message_thread_id,
+                    action="typing",
+                )
+                send_failures = 0
+            except Exception as exc:
+                send_failures += 1
+                logger.warning(
+                    "Typing action failed for task %s (attempt=%d): %s",
+                    task.id,
+                    send_failures,
+                    exc,
+                )
+                if not fallback_sent or send_failures % 6 == 0:
+                    try:
+                        await self.bot.send_message(
+                            chat_id=task.chat_id,
+                            message_thread_id=task.message_thread_id,
+                            text="⏳ Still working...",
+                        )
+                        fallback_sent = True
+                    except Exception as notify_exc:
+                        logger.warning(
+                            "Fallback progress notification failed for task %s: %s",
+                            task.id,
+                            notify_exc,
+                        )
             await asyncio.sleep(5)
 
     async def _notify_started(self, task: BackgroundTask) -> None:

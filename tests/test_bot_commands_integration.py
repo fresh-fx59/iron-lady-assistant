@@ -47,6 +47,7 @@ from src.bot import (
     _build_augmented_prompt,
     get_active_work_summary,
     should_restart_step_plan_now,
+    _is_duplicate_outbound,
     VALID_MODELS,
 )
 
@@ -936,6 +937,11 @@ class TestChatStateManagement:
         state2 = _get_state("7778:main")
 
         assert state1 is not state2
+
+    def test_duplicate_outbound_detector(self):
+        scope = "dup:main"
+        assert _is_duplicate_outbound(scope, "hello world") is False
+        assert _is_duplicate_outbound(scope, "hello   world") is True
 
 
 # ── Contract 9: Model validation ─────────────────────────────────

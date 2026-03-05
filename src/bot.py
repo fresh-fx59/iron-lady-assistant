@@ -74,6 +74,7 @@ class _ChatState:
 # Per-conversation state dict
 _chat_states: dict[str, _ChatState] = {}
 _error_counts: dict[str, int] = {}
+_recent_outbound_by_scope: dict[str, tuple[str, datetime]] = {}
 _CODEX_TRANSIENT_ERROR_PATTERNS = (
     re.compile(r"stream disconnected before completion", re.IGNORECASE),
     re.compile(r"transport error:\s*timeout", re.IGNORECASE),
@@ -856,6 +857,22 @@ def _clear_errors(scope_key: str) -> None:
 
 def _should_suggest_rollback(scope_key: str) -> bool:
     return _error_counts.get(scope_key, 0) >= 3
+
+
+def _is_duplicate_outbound(scope_key: str, text: str, *, ttl_seconds: int = 120) -> bool:
+    """Best-effort suppression for immediate duplicate outgoing replies."""
+    normalized = re.sub(r"\s+", " ", text).strip()
+    if not normalized:
+        return False
+    digest = hashlib.sha1(normalized.encode("utf-8")).hexdigest()[:16]
+    now = datetime.now(tz.utc)
+    previous = _recent_outbound_by_scope.get(scope_key)
+    if previous:
+        prev_digest, prev_at = previous
+        if prev_digest == digest and (now - prev_at).total_seconds() <= ttl_seconds:
+            return True
+    _recent_outbound_by_scope[scope_key] = (digest, now)
+    return False
 
 
 def _repo_root() -> Path:
@@ -2879,12 +2896,19 @@ async def _handle_message_inner(message: Message, override_text: str | None = No
                 for chunk in chunks:
                     if not chunk.strip():
                         continue
+                    plain_preview = strip_html(chunk)
+                    if _is_duplicate_outbound(scope_key, plain_preview):
+                        logger.info("Chat %s: suppressed duplicate outgoing chunk", scope_key)
+                        continue
                     try:
                         await message.answer(chunk, parse_mode="HTML")
                     except Exception:
                         plain = strip_html(chunk)
                         for plain_chunk in split_message(plain):
                             if not plain_chunk.strip():
+                                continue
+                            if _is_duplicate_outbound(scope_key, plain_chunk):
+                                logger.info("Chat %s: suppressed duplicate plain outgoing chunk", scope_key)
                                 continue
                             await message.answer(plain_chunk)
 

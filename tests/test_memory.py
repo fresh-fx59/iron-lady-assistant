@@ -50,3 +50,39 @@ def test_consolidate_facts_deduplicates_and_prunes_low_confidence(tmp_path: Path
     assert len(facts) == 1
     assert facts[0]["key"] == "role"
     assert facts[0]["value"] == "Java developer"
+
+
+def test_build_context_prefers_query_relevant_facts(tmp_path: Path) -> None:
+    memory_dir = _memory_dir(tmp_path)
+    manager = MemoryManager(memory_dir)
+    profile_path = memory_dir / "user_profile.yaml"
+    profile = yaml.safe_load(profile_path.read_text(encoding="utf-8"))
+    profile["facts"] = [
+        {"key": "role", "value": "Java developer", "confidence": 1.0, "source": "explicit", "updated": "2026-03-05"},
+        {"key": "coffee_brewing_method", "value": "portafilter espresso machine", "confidence": 1.0, "source": "explicit", "updated": "2026-03-05"},
+        {"key": "location", "value": "Ryazan, Russia", "confidence": 1.0, "source": "explicit", "updated": "2026-03-05"},
+    ]
+    profile_path.write_text(yaml.safe_dump(profile, sort_keys=False), encoding="utf-8")
+
+    context = manager.build_context("How do I improve espresso extraction?")
+
+    assert "<relevant_facts>" in context
+    assert "coffee_brewing_method" in context
+    assert "role: Java developer" not in context
+
+
+def test_build_context_fallback_keeps_relevant_facts_bounded(tmp_path: Path) -> None:
+    memory_dir = _memory_dir(tmp_path)
+    manager = MemoryManager(memory_dir)
+    profile_path = memory_dir / "user_profile.yaml"
+    profile = yaml.safe_load(profile_path.read_text(encoding="utf-8"))
+    profile["facts"] = [
+        {"key": f"k{i}", "value": f"v{i}", "confidence": 0.9, "source": "inferred", "updated": "2026-03-05"}
+        for i in range(8)
+    ]
+    profile_path.write_text(yaml.safe_dump(profile, sort_keys=False), encoding="utf-8")
+
+    context = manager.build_context("Hi")
+
+    # No semantic overlap expected; fallback should not inject all 8 facts.
+    assert context.count("- k") == 6

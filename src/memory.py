@@ -177,8 +177,9 @@ class MemoryManager:
             f for f in facts
             if isinstance(f, dict) and float(f.get("confidence", 1.0)) >= 0.6
         ]
-        if high_conf:
-            lines = [f"- {f.get('key', '?')}: {f.get('value', '?')}" for f in high_conf]
+        relevant_facts = self._select_relevant_facts(high_conf, user_message)
+        if relevant_facts:
+            lines = [f"- {f.get('key', '?')}: {f.get('value', '?')}" for f in relevant_facts]
             sections.append("<relevant_facts>\n" + "\n".join(lines) + "\n</relevant_facts>")
 
         # Episodic — search by keywords from user message
@@ -280,6 +281,41 @@ class MemoryManager:
             if cleaned and cleaned not in _STOP_WORDS and len(cleaned) > 2:
                 words.append(cleaned)
         return words[:10]  # Cap to prevent huge FTS queries
+
+    def _select_relevant_facts(self, facts: list[dict], query: str, limit: int = 10) -> list[dict]:
+        """Select facts relevant to the current query using lightweight keyword overlap."""
+        if not facts:
+            return []
+
+        query_terms = set(self._extract_keywords(query))
+        scored: list[tuple[int, float, str, dict]] = []
+        for fact in facts:
+            if not isinstance(fact, dict):
+                continue
+            key = str(fact.get("key", ""))
+            value = str(fact.get("value", ""))
+            fact_terms = set(self._extract_keywords(f"{key} {value}"))
+            overlap = len(query_terms & fact_terms)
+            if not overlap:
+                continue
+            confidence = float(fact.get("confidence", 1.0))
+            updated = str(fact.get("updated", ""))
+            scored.append((overlap, confidence, updated, fact))
+
+        if scored:
+            scored.sort(key=lambda item: (item[0], item[1], item[2]), reverse=True)
+            return [item[3] for item in scored[:limit]]
+
+        # Fallback when query has no direct semantic overlap: keep context bounded.
+        fallback = sorted(
+            facts,
+            key=lambda fact: (
+                float(fact.get("confidence", 1.0)),
+                str(fact.get("updated", "")),
+            ),
+            reverse=True,
+        )
+        return fallback[: min(limit, 6)]
 
     # ── Display & management ─────────────────────────────────
 

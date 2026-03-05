@@ -146,6 +146,26 @@ class TestNewCommand:
 
         mock_message.answer.assert_not_called()
 
+    async def test_new_cancels_active_run_immediately(self, mock_message):
+        """Should cancel active run and clear queued mid-flight inputs."""
+        mock_message.text = "/new"
+        state = _get_state("123456789:main")
+        state.lock = asyncio.Lock()
+        await state.lock.acquire()
+        mock_proc = AsyncMock()
+        state.process_handle = {"proc": mock_proc}
+        state.pending_inputs = ["extra context 1", "extra context 2"]
+
+        try:
+            await cmd_new(mock_message)
+        finally:
+            state.lock.release()
+
+        mock_proc.kill.assert_called_once()
+        assert state.cancel_requested is True
+        assert state.pending_inputs == []
+        assert "immediately" in mock_message.answer.call_args[0][0].lower()
+
 
 # ── Contract 4: /model command ───────────────────────────────────
 @pytest.mark.asyncio
@@ -154,6 +174,8 @@ class TestModelCommand:
 
     async def test_model_with_arg_sets_model(self, mock_message):
         """Should set model when argument provided."""
+        from src.bot import provider_manager
+        provider_manager.set_provider("123456789:main", "claude")
         mock_message.text = "/model opus"
 
         await cmd_model(mock_message)
@@ -166,7 +188,8 @@ class TestModelCommand:
 
     async def test_model_all_valid_models(self, mock_message):
         """All valid models should be accepted."""
-        from src.bot import session_manager
+        from src.bot import provider_manager, session_manager
+        provider_manager.set_provider("123456789:main", "claude")
 
         for model in VALID_MODELS:
             expected_calls = mock_message.answer.call_count
@@ -177,8 +200,9 @@ class TestModelCommand:
 
     async def test_model_without_arg_shows_current(self, mock_message):
         """Should show current model when no argument."""
+        from src.bot import provider_manager
+        provider_manager.set_provider("123456789:main", "claude")
         mock_message.text = "/model"
-        from src.bot import session_manager
 
         await cmd_model(mock_message)
 
@@ -214,7 +238,8 @@ class TestStatusCommand:
     async def test_status_shows_session_id(self, mock_message):
         """Should show session ID or 'none' for new conversation."""
         mock_message.text = "/status"
-        from src.bot import session_manager
+        from src.bot import provider_manager, session_manager
+        provider_manager.set_provider("123456789:main", "claude")
         session_manager.update_session_id(123456789, "sess-123")
 
         await cmd_status(mock_message)
@@ -239,7 +264,8 @@ class TestStatusCommand:
     async def test_status_shows_model(self, mock_message):
         """Should show current model."""
         mock_message.text = "/status"
-        from src.bot import session_manager
+        from src.bot import provider_manager, session_manager
+        provider_manager.set_provider("123456789:main", "claude")
         session_manager.set_model(123456789, "opus")
 
         await cmd_status(mock_message)
@@ -561,6 +587,43 @@ class TestMessageHandling:
         finally:
             state.lock.release()
 
+    async def test_new_during_active_run_prevents_stale_session_restore(self, mock_message):
+        """A stale in-flight completion must not restore session after /new."""
+        from src.bot import session_manager, provider_manager
+
+        run_started = asyncio.Event()
+        release_run = asyncio.Event()
+        stale_response = type("obj", (object,), {
+            "text": "stale reply",
+            "session_id": "sess-stale",
+            "is_error": False,
+            "cost_usd": 0.001,
+            "duration_ms": 1,
+            "num_turns": 1,
+        })()
+
+        async def delayed_run(*args, **kwargs):
+            run_started.set()
+            await release_run.wait()
+            return stale_response
+
+        provider_manager.set_provider("123456789:main", "claude")
+        with (
+            patch("src.bot._run_claude", new=AsyncMock(side_effect=delayed_run)),
+            patch("src.bot._keep_typing", new=AsyncMock()),
+        ):
+            mock_message.text = "hello"
+            task = asyncio.create_task(handle_message(mock_message))
+            await run_started.wait()
+
+            mock_message.text = "/new"
+            await cmd_new(mock_message)
+            release_run.set()
+            await task
+
+        session = session_manager.get(123456789)
+        assert session.claude_session_id is None
+
 
 # ── Contract 8: Chat state management ───────────────────────────
 class TestChatStateManagement:
@@ -574,6 +637,7 @@ class TestChatStateManagement:
         assert isinstance(state.lock, asyncio.Lock)
         assert state.process_handle is None
         assert state.cancel_requested is False
+        assert state.reset_generation == 0
         assert state.pending_inputs == []
 
     def test_get_returns_same_state(self):

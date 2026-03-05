@@ -60,6 +60,7 @@ class _ChatState:
     lock: asyncio.Lock
     process_handle: dict | None  # Will contain {"proc": proc} when running
     cancel_requested: bool
+    reset_generation: int = 0
     pending_inputs: list[str] = field(default_factory=list)
 
 
@@ -96,7 +97,11 @@ def _scope_key_from_message(message: Message) -> str:
 def _get_state(scope_key: str) -> _ChatState:
     """Get or create state for a conversation scope."""
     if scope_key not in _chat_states:
-        _chat_states[scope_key] = _ChatState(lock=asyncio.Lock(), process_handle=None, cancel_requested=False)
+        _chat_states[scope_key] = _ChatState(
+            lock=asyncio.Lock(),
+            process_handle=None,
+            cancel_requested=False,
+        )
     return _chat_states[scope_key]
 
 
@@ -113,6 +118,23 @@ def _drain_pending_inputs(state: _ChatState) -> list[str]:
     pending = list(state.pending_inputs)
     state.pending_inputs.clear()
     return pending
+
+
+async def _cancel_active_scope_run(state: _ChatState, require_process: bool = False) -> bool:
+    """Request cancellation and kill the active subprocess if present."""
+    if not state.lock.locked():
+        return False
+    has_proc = bool(state.process_handle and state.process_handle.get("proc"))
+    if require_process and not has_proc:
+        return False
+    state.cancel_requested = True
+    _drain_pending_inputs(state)
+    if has_proc:
+        proc = state.process_handle["proc"]
+        kill_result = proc.kill()
+        if inspect.isawaitable(kill_result):
+            await kill_result
+    return True
 
 
 def _build_midflight_followup_prompt(items: list[str]) -> str:
@@ -584,13 +606,19 @@ async def cmd_new(message: Message) -> None:
     chat_id = message.chat.id
     thread_id = _thread_id(message)
     scope_key = _scope_key(chat_id, thread_id)
+    state = _get_state(scope_key)
+    state.reset_generation += 1
+    cancelled = await _cancel_active_scope_run(state)
     session = session_manager.get(chat_id, thread_id)
     if session.claude_session_id and os.getenv("DISABLE_REFLECTION") != "1":
         asyncio.create_task(_reflect(chat_id, session))
     session_manager.new_conversation(chat_id, thread_id)
     session_manager.new_codex_conversation(chat_id, thread_id)
     _clear_errors(scope_key)
-    await message.answer("Conversation cleared. Send a message to start fresh.")
+    if cancelled:
+        await message.answer("Conversation cleared immediately. Active request was cancelled.")
+    else:
+        await message.answer("Conversation cleared. Send a message to start fresh.")
 
 
 async def _reflect(chat_id: int, session: object) -> None:
@@ -901,16 +929,14 @@ async def cmd_cancel(message: Message) -> None:
     scope_key = _scope_key(chat_id, thread_id)
     state = _get_state(scope_key)
 
-    if not state.lock.locked() or not state.process_handle or not state.process_handle.get("proc"):
+    if not state.lock.locked():
         await message.answer("Nothing to cancel.")
         return
 
-    # Kill the process
-    proc = state.process_handle["proc"]
-    kill_result = proc.kill()
-    if inspect.isawaitable(kill_result):
-        await kill_result
-    state.cancel_requested = True
+    cancelled = await _cancel_active_scope_run(state, require_process=True)
+    if not cancelled:
+        await message.answer("Nothing to cancel.")
+        return
     session = session_manager.get(chat_id, thread_id)
     provider = _current_provider(scope_key)
     metrics.CLAUDE_REQUESTS_TOTAL.labels(
@@ -1734,6 +1760,7 @@ async def _handle_message_inner(message: Message, override_text: str | None = No
     async with state.lock:
         # Reset cancellation state
         state.cancel_requested = False
+        run_generation = state.reset_generation
 
         session = session_manager.get(chat_id, thread_id)
         progress = ProgressReporter(message)
@@ -1972,6 +1999,8 @@ async def _handle_message_inner(message: Message, override_text: str | None = No
         if (
             final_response
             and provider.cli != "codex"
+            and not state.cancel_requested
+            and state.reset_generation == run_generation
             and final_response.session_id
             and final_response.session_id != session.claude_session_id
         ):
@@ -1979,6 +2008,8 @@ async def _handle_message_inner(message: Message, override_text: str | None = No
         if (
             final_response
             and provider.cli == "codex"
+            and not state.cancel_requested
+            and state.reset_generation == run_generation
             and final_response.session_id
             and final_response.session_id != session.codex_session_id
         ):

@@ -52,8 +52,17 @@ def clean_env(monkeypatch):
 def reset_session_manager():
     """Ensure session manager state is clean between tests."""
     try:
-        from src.bot import session_manager
+        from src.bot import (
+            session_manager,
+            provider_manager,
+            _chat_states,
+            _error_counts,
+        )
         session_manager.sessions.clear()
+        provider_manager._chat_provider_idx.clear()
+        provider_manager._fallback_since.clear()
+        _chat_states.clear()
+        _error_counts.clear()
     except Exception:
         pass
 

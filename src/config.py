@@ -6,7 +6,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-VERSION: str = "0.18.16"
+VERSION: str = "0.18.17"
 
 # ── Bot token (required) ────────────────────────────────────
 BOT_TOKEN: str = os.getenv("TELEGRAM_BOT_TOKEN", "")
@@ -74,6 +74,10 @@ HEALTH_INVARIANTS_EMPTY_WARN_RATIO: float = float(
     os.getenv("HEALTH_INVARIANTS_EMPTY_WARN_RATIO", "0.20")
 )
 HEALTH_INVARIANTS_MIN_SAMPLE_SIZE: int = int(os.getenv("HEALTH_INVARIANTS_MIN_SAMPLE_SIZE", "5"))
+CONTEXT_COMPILER_ENABLED: bool = (
+    os.getenv("CONTEXT_COMPILER_ENABLED", "1").strip().lower() not in {"0", "false", "no"}
+)
+CONTEXT_COMPILER_MAX_CHARS: int = int(os.getenv("CONTEXT_COMPILER_MAX_CHARS", "1600"))
 SCOPE_SNAPSHOT_ENABLED: bool = (
     os.getenv("SCOPE_SNAPSHOT_ENABLED", "1").strip().lower() not in {"0", "false", "no"}
 )

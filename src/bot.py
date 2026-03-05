@@ -24,6 +24,7 @@ from aiogram.exceptions import TelegramAPIError
 
 from . import bridge, config, metrics, ocr, transcribe
 from .core.context_plugins import ContextPluginRegistry
+from . import context_compiler
 from .health_invariants import HealthInvariants
 from .identity import IdentityManager
 from .sessions import SessionManager, make_scope_key
@@ -791,6 +792,13 @@ def _build_augmented_prompt(raw_prompt: str) -> str:
     identity_context = _as_text(identity_manager.build_context())
     tool_context = _as_text(context_plugins.build_context(raw_prompt))
     memory_instructions = _as_text(memory_manager.build_instructions())
+    compiler_context = ""
+    if config.CONTEXT_COMPILER_ENABLED:
+        compiler_context = context_compiler.build_context(
+            raw_prompt,
+            _repo_root(),
+            max_chars=config.CONTEXT_COMPILER_MAX_CHARS,
+        )
     invariants_context = ""
     if config.HEALTH_INVARIANTS_ENABLED:
         invariants_context = health_invariants.build_block(
@@ -809,6 +817,8 @@ def _build_augmented_prompt(raw_prompt: str) -> str:
         prompt_parts.append(memory_context)
     if identity_context:
         prompt_parts.append(identity_context)
+    if compiler_context:
+        prompt_parts.append(compiler_context)
     if invariants_context:
         prompt_parts.append(invariants_context)
     if tool_context:

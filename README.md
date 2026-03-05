@@ -93,6 +93,8 @@ All settings are read from `.env`.
 - `HEALTH_INVARIANTS_PROVIDER_FAIL_WARN_RATIO` (optional, default `0.30`): anomaly threshold for provider failures
 - `HEALTH_INVARIANTS_EMPTY_WARN_RATIO` (optional, default `0.20`): anomaly threshold for empty responses
 - `HEALTH_INVARIANTS_MIN_SAMPLE_SIZE` (optional, default `5`): minimum sample size before ratio-based anomaly checks
+- `CONTEXT_COMPILER_ENABLED` (optional, default `1`): build compact repo-aware context block before tool context
+- `CONTEXT_COMPILER_MAX_CHARS` (optional, default `1600`): max size of compiled context block
 - `SCOPE_SNAPSHOT_ENABLED` (optional, default `1`): persist per-scope pending queue snapshots for restart recovery
 - `SCOPE_SNAPSHOT_MAX_AGE_MINUTES` (optional, default `180`): max snapshot age eligible for restore
 - `SCOPE_SNAPSHOT_COMPLETED_HASHES_LIMIT` (optional, default `20`): recent follow-up hashes kept to prevent duplicate replay

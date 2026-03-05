@@ -5,7 +5,7 @@ triggers:
 - gog
 - google
 - workspace
-- gmail,
+- gmail
 instructions: '# gog
 
 

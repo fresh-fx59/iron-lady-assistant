@@ -55,8 +55,10 @@ from src.bot import (
     resume_step_plan_after_restart,
     _latest_scope_target,
     _load_plan_steps_from_folder,
+    get_step_plan_observer,
     VALID_MODELS,
 )
+from src.tasks import BackgroundTask, TaskStatus
 
 
 # ── Contract 1: Authorization checking ──────────────────────────
@@ -960,6 +962,73 @@ class TestStepPlanCommands:
         assert state["active"] is False
         assert state["current_index"] == 2
         assert state["last_error"] == ""
+
+    async def test_stepplan_next_step_is_queued_after_restart_cycle(self, monkeypatch, tmppath):
+        step1 = tmppath / "01 - A.md"
+        step2 = tmppath / "02 - B.md"
+        step1.write_text("Applied: [x]\n", encoding="utf-8")
+        step2.write_text("Applied: [ ]\n", encoding="utf-8")
+
+        _save_step_plan_state(
+            {
+                "active": True,
+                "chat_id": 123456789,
+                "message_thread_id": 77,
+                "user_id": 123456789,
+                "steps": [str(step1), str(step2)],
+                "current_index": 0,
+                "current_task_id": "task-step-1",
+                "restart_between_steps": True,
+                "last_error": "",
+            }
+        )
+
+        manager = AsyncMock()
+        manager.bot = AsyncMock()
+        manager.bot.send_message = AsyncMock()
+        manager.submit = AsyncMock(return_value="task-step-2")
+        monkeypatch.setattr("src.bot.task_manager", manager)
+        monkeypatch.setattr("src.bot._step_plan_restart_callback", AsyncMock(return_value=True))
+        fake_provider = type(
+            "Provider",
+            (),
+            {"cli": "codex", "resume_arg": "resume", "model": "gpt-5-codex", "models": ["gpt-5-codex", "default"]},
+        )()
+        monkeypatch.setattr("src.bot.provider_manager.get_provider", lambda _scope: fake_provider)
+        from src.bot import session_manager
+        session_manager.update_codex_session_id(123456789, "codex-sess", message_thread_id=77)
+
+        observer = get_step_plan_observer()
+        done_task = BackgroundTask(
+            id="task-step-1",
+            chat_id=123456789,
+            message_thread_id=77,
+            user_id=123456789,
+            prompt="step1",
+            model="gpt-5-codex",
+            session_id="codex-sess",
+            status=TaskStatus.COMPLETED,
+            created_at=datetime.now(timezone.utc),
+        )
+        await observer.on_task_finished(done_task)
+
+        state_after_finish = _load_step_plan_state()
+        assert state_after_finish["current_index"] == 1
+        assert state_after_finish["current_task_id"] is None
+        manager.submit.assert_not_awaited()
+
+        await resume_step_plan_after_restart()
+
+        manager.submit.assert_awaited_once()
+        submit_kwargs = manager.submit.await_args.kwargs
+        assert submit_kwargs["chat_id"] == 123456789
+        assert submit_kwargs["message_thread_id"] == 77
+        assert "Step plan 2/2 running" in submit_kwargs["feedback_title"]
+
+        final_state = _load_step_plan_state()
+        assert final_state["active"] is True
+        assert final_state["current_index"] == 1
+        assert final_state["current_task_id"] == "task-step-2"
 
     async def test_load_plan_steps_skips_index_file(self, tmppath):
         (tmppath / "00 - Improvement Index.md").write_text("index", encoding="utf-8")

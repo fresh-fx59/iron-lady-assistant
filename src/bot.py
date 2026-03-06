@@ -98,6 +98,10 @@ _AUDIO_AS_VOICE_TAG_RE = re.compile(r"\[\[\s*audio_as_voice\s*\]\]", re.IGNORECA
 # requiring the directive to start the line.
 _MEDIA_LINE_RE = re.compile(r"^\s*(?:[^\w\s]+\s*)?MEDIA:\s*(.+?)\s*$", re.IGNORECASE)
 _LOCAL_PATH_LINE_RE = re.compile(r"^\s*([~/.][^\s]*)\s*$")
+_VOICE_REQUEST_RE = re.compile(
+    r"(?:\bvoice(?:\s*note)?\b|\bvoice\s*reply\b|войс|голос(?:ом|овое|овой)?|аудиосообщени[ея])",
+    re.IGNORECASE,
+)
 _VOICE_COMPATIBLE_EXTENSIONS = {".ogg", ".opus", ".mp3", ".m4a"}
 _AUDIO_EXTENSIONS = _VOICE_COMPATIBLE_EXTENSIONS | {".wav", ".aac", ".flac"}
 _IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png"}
@@ -1795,6 +1799,12 @@ def _extract_media_directives(text: str) -> tuple[str, list[str], bool]:
 
     cleaned_text = "\n".join(text_lines).strip()
     return cleaned_text, media_refs, audio_as_voice
+
+
+def _wants_voice_reply(text: str) -> bool:
+    if not text:
+        return False
+    return bool(_VOICE_REQUEST_RE.search(text))
 
 
 def _default_timezone_name() -> str:
@@ -3502,6 +3512,7 @@ async def _handle_message_inner(
         state.cancel_requested = False
         run_generation = state.reset_generation
         raw_prompt = override_text or message.text or ""
+        request_voice_reply = request_voice_reply or _wants_voice_reply(raw_prompt)
 
         provider = _provider_manager().get_provider(scope_key)
         session = _session_manager().get(chat_id, thread_id)

@@ -6,6 +6,7 @@ from src.bot import (
     _extract_media_directives,
     _maybe_add_local_tts_media,
     _send_media_refs,
+    _wants_voice_reply,
 )
 
 
@@ -29,6 +30,18 @@ def test_extract_media_directives_plain_local_media_path(tmp_path):
     assert clean_text == ""
     assert media_refs == [str(voice_path)]
     assert audio_as_voice is False
+
+
+def test_wants_voice_reply_detects_russian_prompt():
+    assert _wants_voice_reply("пришли мне войс")
+
+
+def test_wants_voice_reply_detects_english_prompt():
+    assert _wants_voice_reply("please send voice reply")
+
+
+def test_wants_voice_reply_ignores_regular_text():
+    assert not _wants_voice_reply("send text answer")
 
 
 @pytest.mark.asyncio

@@ -85,6 +85,14 @@ async def send_startup_notification(bot: Bot, commit: str | None = None) -> None
         except Exception:
             logging.debug("Could not resolve step-plan notification target", exc_info=True)
 
+        if target_chat_id is None:
+            try:
+                latest_scope_target = bot_module._latest_scope_target()  # noqa: SLF001
+                if latest_scope_target:
+                    target_chat_id, target_thread_id = latest_scope_target
+            except Exception:
+                logging.debug("Could not resolve latest scope notification target", exc_info=True)
+
         if target_chat_id is None and ALLOWED_USER_IDS:
             target_chat_id = min(ALLOWED_USER_IDS)
         if target_chat_id is None and bot_module.config.ALLOWED_CHAT_IDS:
@@ -128,6 +136,14 @@ async def send_ready_notification(bot: Bot) -> None:
                     target_thread_id = state.get("message_thread_id")
         except Exception:
             logging.debug("Could not resolve step-plan ready notification target", exc_info=True)
+
+        if target_chat_id is None:
+            try:
+                latest_scope_target = bot_module._latest_scope_target()  # noqa: SLF001
+                if latest_scope_target:
+                    target_chat_id, target_thread_id = latest_scope_target
+            except Exception:
+                logging.debug("Could not resolve latest scope ready target", exc_info=True)
 
         if target_chat_id is None and ALLOWED_USER_IDS:
             target_chat_id = min(ALLOWED_USER_IDS)

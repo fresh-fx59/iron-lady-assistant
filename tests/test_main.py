@@ -10,6 +10,7 @@ async def test_send_startup_notification_sends_boot_message_only(monkeypatch) ->
     bot = AsyncMock()
     monkeypatch.setattr(main, "ALLOWED_USER_IDS", {12345})
     monkeypatch.setattr(main.bot_module, "_load_step_plan_state", lambda: {"active": False})
+    monkeypatch.setattr(main.bot_module, "_latest_scope_target", lambda: None)
 
     await main.send_startup_notification(bot, commit="abc12345")
 
@@ -27,6 +28,7 @@ async def test_send_ready_notification_separate_message(monkeypatch) -> None:
     bot = AsyncMock()
     monkeypatch.setattr(main, "ALLOWED_USER_IDS", {12345})
     monkeypatch.setattr(main.bot_module, "_load_step_plan_state", lambda: {"active": False})
+    monkeypatch.setattr(main.bot_module, "_latest_scope_target", lambda: None)
 
     await main.send_ready_notification(bot)
 
@@ -45,6 +47,7 @@ async def test_send_startup_notification_prefers_active_step_plan_thread(monkeyp
         "_load_step_plan_state",
         lambda: {"active": True, "chat_id": -1001, "message_thread_id": 77},
     )
+    monkeypatch.setattr(main.bot_module, "_latest_scope_target", lambda: (-1002, 99))
 
     await main.send_startup_notification(bot, commit="abc12345")
 
@@ -63,6 +66,7 @@ async def test_send_ready_notification_prefers_active_step_plan_thread(monkeypat
         "_load_step_plan_state",
         lambda: {"active": True, "chat_id": -1001, "message_thread_id": 77},
     )
+    monkeypatch.setattr(main.bot_module, "_latest_scope_target", lambda: (-1002, 99))
 
     await main.send_ready_notification(bot)
 
@@ -70,6 +74,36 @@ async def test_send_ready_notification_prefers_active_step_plan_thread(monkeypat
     kwargs = bot.send_message.await_args.kwargs
     assert kwargs["chat_id"] == -1001
     assert kwargs["message_thread_id"] == 77
+
+
+@pytest.mark.asyncio
+async def test_send_startup_notification_uses_latest_scope_when_no_active_step_plan(monkeypatch) -> None:
+    bot = AsyncMock()
+    monkeypatch.setattr(main, "ALLOWED_USER_IDS", {12345})
+    monkeypatch.setattr(main.bot_module, "_load_step_plan_state", lambda: {"active": False})
+    monkeypatch.setattr(main.bot_module, "_latest_scope_target", lambda: (-1001, 42))
+
+    await main.send_startup_notification(bot, commit="abc12345")
+
+    bot.send_message.assert_awaited_once()
+    kwargs = bot.send_message.await_args.kwargs
+    assert kwargs["chat_id"] == -1001
+    assert kwargs["message_thread_id"] == 42
+
+
+@pytest.mark.asyncio
+async def test_send_ready_notification_uses_latest_scope_when_no_active_step_plan(monkeypatch) -> None:
+    bot = AsyncMock()
+    monkeypatch.setattr(main, "ALLOWED_USER_IDS", {12345})
+    monkeypatch.setattr(main.bot_module, "_load_step_plan_state", lambda: {"active": False})
+    monkeypatch.setattr(main.bot_module, "_latest_scope_target", lambda: (-1001, 42))
+
+    await main.send_ready_notification(bot)
+
+    bot.send_message.assert_awaited_once()
+    kwargs = bot.send_message.await_args.kwargs
+    assert kwargs["chat_id"] == -1001
+    assert kwargs["message_thread_id"] == 42
 
 
 @pytest.mark.asyncio

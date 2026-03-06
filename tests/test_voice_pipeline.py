@@ -21,6 +21,16 @@ MEDIA:/tmp/reply.wav
     assert audio_as_voice is True
 
 
+def test_extract_media_directives_plain_local_media_path(tmp_path):
+    voice_path = tmp_path / "speech.ogg"
+    voice_path.write_bytes(b"ogg")
+    text = f"{voice_path}\n"
+    clean_text, media_refs, audio_as_voice = _extract_media_directives(text)
+    assert clean_text == ""
+    assert media_refs == [str(voice_path)]
+    assert audio_as_voice is False
+
+
 @pytest.mark.asyncio
 async def test_send_media_refs_prefers_voice_for_ogg():
     message = AsyncMock()

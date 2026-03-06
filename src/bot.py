@@ -97,6 +97,7 @@ _AUDIO_AS_VOICE_TAG_RE = re.compile(r"\[\[\s*audio_as_voice\s*\]\]", re.IGNORECA
 # Accept optional visual prefixes like "📍 MEDIA:/tmp/file.mp3" while still
 # requiring the directive to start the line.
 _MEDIA_LINE_RE = re.compile(r"^\s*(?:[^\w\s]+\s*)?MEDIA:\s*(.+?)\s*$", re.IGNORECASE)
+_LOCAL_PATH_LINE_RE = re.compile(r"^\s*([~/.][^\s]*)\s*$")
 _VOICE_COMPATIBLE_EXTENSIONS = {".ogg", ".opus", ".mp3", ".m4a"}
 _AUDIO_EXTENSIONS = _VOICE_COMPATIBLE_EXTENSIONS | {".wav", ".aac", ".flac"}
 _IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png"}
@@ -1782,6 +1783,14 @@ def _extract_media_directives(text: str) -> tuple[str, list[str], bool]:
             if media:
                 media_refs.append(media)
             continue
+        # Be resilient when model returns plain local file path without MEDIA: prefix.
+        path_match = _LOCAL_PATH_LINE_RE.match(line)
+        if path_match:
+            candidate = path_match.group(1).strip().strip("`").strip("\"'")
+            path = Path(candidate).expanduser()
+            if path.exists() and path.is_file() and _media_extension(str(path)):
+                media_refs.append(str(path))
+                continue
         text_lines.append(line)
 
     cleaned_text = "\n".join(text_lines).strip()

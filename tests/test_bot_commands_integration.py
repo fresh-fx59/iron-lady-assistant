@@ -1030,6 +1030,64 @@ class TestStepPlanCommands:
         assert final_state["current_index"] == 1
         assert final_state["current_task_id"] == "task-step-2"
 
+    async def test_stepplan_failed_current_step_pauses_and_does_not_queue_next(
+        self, monkeypatch, tmppath
+    ):
+        step1 = tmppath / "01 - A.md"
+        step2 = tmppath / "02 - B.md"
+        step1.write_text("Applied: [ ]\n", encoding="utf-8")
+        step2.write_text("Applied: [ ]\n", encoding="utf-8")
+
+        _save_step_plan_state(
+            {
+                "active": True,
+                "chat_id": 123456789,
+                "message_thread_id": 77,
+                "user_id": 123456789,
+                "steps": [str(step1), str(step2)],
+                "current_index": 0,
+                "current_task_id": "task-step-1",
+                "restart_between_steps": True,
+                "last_error": "",
+            }
+        )
+
+        manager = AsyncMock()
+        manager.bot = AsyncMock()
+        manager.bot.send_message = AsyncMock()
+        manager.submit = AsyncMock(return_value="task-should-not-run")
+        monkeypatch.setattr("src.bot.task_manager", manager)
+        restart_cb = AsyncMock(return_value=True)
+        monkeypatch.setattr("src.bot._step_plan_restart_callback", restart_cb)
+
+        observer = get_step_plan_observer()
+        failed_task = BackgroundTask(
+            id="task-step-1",
+            chat_id=123456789,
+            message_thread_id=77,
+            user_id=123456789,
+            prompt="step1",
+            model="gpt-5-codex",
+            session_id="codex-sess",
+            status=TaskStatus.FAILED,
+            created_at=datetime.now(timezone.utc),
+            error="simulated failure",
+        )
+        await observer.on_task_finished(failed_task)
+
+        manager.submit.assert_not_awaited()
+        restart_cb.assert_not_awaited()
+
+        state = _load_step_plan_state()
+        assert state["active"] is False
+        assert state["current_index"] == 0
+        assert state["current_task_id"] is None
+        assert "simulated failure" in state["last_error"]
+
+        assert manager.bot.send_message.await_count >= 1
+        notify_texts = [call.kwargs.get("text", "") for call in manager.bot.send_message.await_args_list]
+        assert any("Step plan paused because current step failed" in text for text in notify_texts)
+
     async def test_load_plan_steps_skips_index_file(self, tmppath):
         (tmppath / "00 - Improvement Index.md").write_text("index", encoding="utf-8")
         (tmppath / "01 - A.md").write_text("Applied: [x]\n", encoding="utf-8")

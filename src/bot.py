@@ -35,6 +35,7 @@ from .memory import MemoryManager
 from .progress import ProgressReporter
 from .providers import ProviderManager
 from .scheduler import ScheduleManager
+from .features.state_store import get_default_state_store
 from .plugins.tools_plugin import ToolRegistry
 from .self_modify import SelfModificationManager
 from .tasks import TaskManager, TaskStatus
@@ -97,6 +98,7 @@ _MEDIA_LINE_RE = re.compile(r"^\s*(?:[^\w\s]+\s*)?MEDIA:\s*(.+?)\s*$", re.IGNORE
 _VOICE_COMPATIBLE_EXTENSIONS = {".ogg", ".opus", ".mp3", ".m4a"}
 _AUDIO_EXTENSIONS = _VOICE_COMPATIBLE_EXTENSIONS | {".wav", ".aac", ".flac"}
 _IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png"}
+# Backward-compatible state paths retained for tests/fixtures importing these symbols.
 _STEP_PLAN_STATE_PATH = config.MEMORY_DIR / "step_plan_state.json"
 _SCOPE_SNAPSHOT_PATH = config.MEMORY_DIR / "scope_snapshot.json"
 _STEP_PLAN_FILE_PATTERN = re.compile(r"^(\d+)\s*-\s*.+\.md$", re.IGNORECASE)
@@ -122,6 +124,10 @@ _NUMBER_WORDS = {
     "nine": "9",
     "ten": "10",
 }
+
+
+def _state_store():
+    return get_default_state_store()
 
 
 def _thread_id(message: Message) -> int | None:
@@ -244,56 +250,15 @@ def _parse_scope_key_components(scope_key: str) -> tuple[int, int | None]:
 
 
 def _snapshot_default_record(scope_key: str) -> dict:
-    chat_id, message_thread_id = _parse_scope_key_components(scope_key)
-    return {
-        "scope_key": scope_key,
-        "chat_id": chat_id,
-        "message_thread_id": message_thread_id,
-        "pending_inputs": [],
-        "inflight_pending_inputs": [],
-        "inflight_pending_hash": "",
-        "completed_pending_hashes": [],
-        "processing": False,
-        "provider": "",
-        "active_prompt": "",
-        "active_provider_cli": "",
-        "active_model": "",
-        "active_resume_arg": "",
-        "resume_task_id": "",
-        "claude_session_id": "",
-        "codex_session_id": "",
-        "updated_at": datetime.now(tz.utc).isoformat(),
-    }
+    return _state_store().snapshot_default_record(scope_key)
 
 
 def _load_scope_snapshots() -> dict[str, dict]:
-    if not _SCOPE_SNAPSHOT_PATH.exists():
-        return {}
-    try:
-        data = json.loads(_SCOPE_SNAPSHOT_PATH.read_text(encoding="utf-8"))
-    except Exception:
-        logger.warning("Failed to load scope snapshot state", exc_info=True)
-        return {}
-    if not isinstance(data, dict):
-        return {}
-    snapshots: dict[str, dict] = {}
-    for scope_key, payload in data.items():
-        if not isinstance(scope_key, str) or not isinstance(payload, dict):
-            continue
-        row = _snapshot_default_record(scope_key)
-        row.update(payload)
-        snapshots[scope_key] = row
-    return snapshots
+    return _state_store().load_scope_snapshots()
 
 
 def _save_scope_snapshots(snapshots: dict[str, dict]) -> None:
-    _SCOPE_SNAPSHOT_PATH.parent.mkdir(parents=True, exist_ok=True)
-    tmp_path = _SCOPE_SNAPSHOT_PATH.with_suffix(".tmp")
-    tmp_path.write_text(
-        json.dumps(snapshots, ensure_ascii=False, indent=2),
-        encoding="utf-8",
-    )
-    tmp_path.replace(_SCOPE_SNAPSHOT_PATH)
+    _state_store().save_scope_snapshots(snapshots)
 
 
 def _update_scope_snapshot(
@@ -336,44 +301,15 @@ def _update_scope_snapshot(
 
 
 def _mark_followup_inflight(scope_key: str, inputs: list[str]) -> str:
-    if not config.SCOPE_SNAPSHOT_ENABLED:
-        return ""
-    digest = hashlib.sha1("\n".join(inputs).encode("utf-8")).hexdigest()[:16]
-    snapshots = _load_scope_snapshots()
-    row = snapshots.get(scope_key, _snapshot_default_record(scope_key))
-    row["inflight_pending_inputs"] = list(inputs)
-    row["inflight_pending_hash"] = digest
-    row["updated_at"] = datetime.now(tz.utc).isoformat()
-    snapshots[scope_key] = row
-    _save_scope_snapshots(snapshots)
-    return digest
+    return _state_store().mark_followup_inflight(scope_key, inputs)
 
 
 def _is_followup_already_completed(scope_key: str, pending_hash: str) -> bool:
-    if not config.SCOPE_SNAPSHOT_ENABLED or not pending_hash:
-        return False
-    snapshots = _load_scope_snapshots()
-    row = snapshots.get(scope_key)
-    if not row:
-        return False
-    hashes = row.get("completed_pending_hashes") or []
-    return pending_hash in hashes
+    return _state_store().is_followup_already_completed(scope_key, pending_hash)
 
 
 def _mark_followup_completed(scope_key: str, pending_hash: str) -> None:
-    if not config.SCOPE_SNAPSHOT_ENABLED or not pending_hash:
-        return
-    snapshots = _load_scope_snapshots()
-    row = snapshots.get(scope_key, _snapshot_default_record(scope_key))
-    hashes = list(row.get("completed_pending_hashes") or [])
-    if pending_hash not in hashes:
-        hashes.append(pending_hash)
-    row["completed_pending_hashes"] = hashes[-config.SCOPE_SNAPSHOT_COMPLETED_HASHES_LIMIT :]
-    row["inflight_pending_inputs"] = []
-    row["inflight_pending_hash"] = ""
-    row["updated_at"] = datetime.now(tz.utc).isoformat()
-    snapshots[scope_key] = row
-    _save_scope_snapshots(snapshots)
+    _state_store().mark_followup_completed(scope_key, pending_hash)
 
 
 async def _cancel_active_scope_run(
@@ -511,62 +447,19 @@ async def should_restart_step_plan_now() -> tuple[bool, list[str]]:
 
 
 def _step_plan_default_state() -> dict:
-    return {
-        "active": False,
-        "name": "",
-        "folder_path": "",
-        "chat_id": 0,
-        "message_thread_id": None,
-        "user_id": 0,
-        "steps": [],
-        "current_index": 0,
-        "current_task_id": None,
-        "restart_between_steps": True,
-        "last_error": "",
-        "failure_count": 0,
-        "last_failed_index": None,
-        "auto_resume_blocked_until": "",
-        "updated_at": datetime.now(tz.utc).isoformat(),
-    }
+    return _state_store().step_plan_default_state()
 
 
 def _step_plan_is_blocked(state: dict) -> bool:
-    raw = str(state.get("auto_resume_blocked_until") or "").strip()
-    if not raw:
-        return False
-    try:
-        blocked_until = datetime.fromisoformat(raw)
-        if blocked_until.tzinfo is None:
-            blocked_until = blocked_until.replace(tzinfo=tz.utc)
-    except Exception:
-        return False
-    return blocked_until > datetime.now(tz.utc)
+    return _state_store().step_plan_is_blocked(state)
 
 
 def _load_step_plan_state() -> dict:
-    if not _STEP_PLAN_STATE_PATH.exists():
-        return _step_plan_default_state()
-    try:
-        data = json.loads(_STEP_PLAN_STATE_PATH.read_text(encoding="utf-8"))
-    except Exception:
-        logger.warning("Failed to read step plan state, resetting", exc_info=True)
-        return _step_plan_default_state()
-    if not isinstance(data, dict):
-        return _step_plan_default_state()
-    state = _step_plan_default_state()
-    state.update(data)
-    return state
+    return _state_store().load_step_plan_state()
 
 
 def _save_step_plan_state(state: dict) -> None:
-    payload = _step_plan_default_state()
-    payload.update(state)
-    payload["updated_at"] = datetime.now(tz.utc).isoformat()
-    _STEP_PLAN_STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
-    _STEP_PLAN_STATE_PATH.write_text(
-        json.dumps(payload, ensure_ascii=False, indent=2),
-        encoding="utf-8",
-    )
+    _state_store().save_step_plan_state(state)
 
 
 def _load_plan_steps_from_folder(folder_path: str) -> list[str]:
@@ -683,8 +576,9 @@ def _resolve_step_plan_folder_from_text(user_text: str) -> str | None:
 
     if config.STEP_PLAN_DEFAULT_FOLDER:
         candidate = Path(config.STEP_PLAN_DEFAULT_FOLDER).expanduser().resolve()
-        if candidate.is_dir():
-            return str(candidate)
+        # Accept configured default path even before directory creation; downstream
+        # loader will validate step files and report a concrete error if needed.
+        return str(candidate)
 
     for fallback in _STEP_PLAN_FALLBACK_PATHS:
         candidate = Path(fallback).expanduser().resolve()
@@ -1326,7 +1220,8 @@ def _is_authorized(user_id: int | None, chat_id: int | None = None) -> bool:
 def _is_admin(user_id: int | None) -> bool:
     if user_id is None:
         return False
-    return user_id in config.ALLOWED_USER_IDS
+    # Keep admin gating aligned with runtime/env authorization source.
+    return _is_authorized(user_id, None)
 
 
 def _actor_id(message: Message) -> int:

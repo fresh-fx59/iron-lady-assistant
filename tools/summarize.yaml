@@ -1,7 +1,6 @@
 name: summarize
-description: "Summarize or extract text/transcripts from URLs, podcasts, and local\
+description: "Summarize or extract text/transcripts from URLs, podcasts, and local files (great fallback for \u201Ctran"
 tier: core
-  \ files (great fallback for \u201Ctran"
 triggers:
 - summarize
 - summarize

@@ -52,6 +52,7 @@ from src.bot import (
     _queue_pending_input,
     _first_unapplied_step_index,
     bootstrap_step_plan_after_restart,
+    resume_step_plan_after_restart,
     _latest_scope_target,
     _load_plan_steps_from_folder,
     VALID_MODELS,
@@ -849,7 +850,7 @@ class TestStepPlanCommands:
     async def test_latest_scope_target_uses_session_fallback(self, monkeypatch):
         monkeypatch.setattr("src.bot._load_scope_snapshots", lambda: {})
         monkeypatch.setattr("src.bot.config.ALLOWED_USER_IDS", set())
-        monkeypatch.setattr("src.bot.config.ALLOWED_CHAT_IDS", set())
+        monkeypatch.setattr("src.bot.config.ALLOWED_CHAT_IDS", {-100123})
         fake_session = type(
             "S",
             (),
@@ -866,6 +867,57 @@ class TestStepPlanCommands:
 
         target = _latest_scope_target()
         assert target == (-100123, 42)
+
+    async def test_latest_scope_target_ignores_unauthorized_snapshot_and_falls_back_to_admin(
+        self, monkeypatch
+    ):
+        monkeypatch.setattr(
+            "src.bot._load_scope_snapshots",
+            lambda: {
+                "bad:scope": {
+                    "scope_key": "bad:scope",
+                    "chat_id": -100999,
+                    "message_thread_id": 99,
+                    "updated_at": "2026-03-06T05:30:00+00:00",
+                }
+            },
+        )
+        monkeypatch.setattr("src.bot.config.ALLOWED_USER_IDS", {123456789})
+        monkeypatch.setattr("src.bot.config.ALLOWED_CHAT_IDS", {-1003019299921})
+        monkeypatch.setattr("src.bot.session_manager", type("Mgr", (), {"sessions": {}})())
+
+        target = _latest_scope_target()
+        assert target == (123456789, None)
+
+    async def test_resume_step_plan_after_restart_keeps_active_when_notify_fails(
+        self, monkeypatch, tmppath
+    ):
+        step1 = tmppath / "01 - A.md"
+        step1.write_text("Applied: [ ]\n", encoding="utf-8")
+        _save_step_plan_state(
+            {
+                "active": True,
+                "chat_id": 123456789,
+                "message_thread_id": None,
+                "user_id": 123456789,
+                "steps": [str(step1)],
+                "current_index": 0,
+                "current_task_id": "old-task",
+                "restart_between_steps": True,
+            }
+        )
+
+        manager = AsyncMock()
+        manager.submit = AsyncMock(return_value="task-resumed")
+        manager.bot = AsyncMock()
+        manager.bot.send_message = AsyncMock(side_effect=RuntimeError("telegram down"))
+        monkeypatch.setattr("src.bot.task_manager", manager)
+
+        await resume_step_plan_after_restart()
+
+        state = _load_step_plan_state()
+        assert state["active"] is True
+        assert state["current_task_id"] == "task-resumed"
 
 
 @pytest.mark.asyncio

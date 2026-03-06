@@ -711,11 +711,17 @@ async def _start_step_plan(
 
 
 def _latest_scope_target() -> tuple[int, int | None] | None:
+    def _allowed_target(chat_id: int) -> bool:
+        user_hint = chat_id if chat_id > 0 else None
+        return _is_authorized(user_hint, chat_id)
+
     snapshots = _load_scope_snapshots()
     newest: tuple[datetime, int, int | None] | None = None
     for row in snapshots.values():
         chat_id = int(row.get("chat_id") or 0)
         if not chat_id:
+            continue
+        if not _allowed_target(chat_id):
             continue
         updated_raw = str(row.get("updated_at") or "")
         try:
@@ -737,6 +743,8 @@ def _latest_scope_target() -> tuple[int, int | None] | None:
             chat_id = int(getattr(session, "chat_id", 0) or 0)
             message_thread_id = getattr(session, "message_thread_id", None)
         if not chat_id:
+            continue
+        if not _allowed_target(chat_id):
             continue
         raw_last = str(getattr(session, "last_activity_at", "") or "")
         try:
@@ -806,15 +814,24 @@ async def bootstrap_step_plan_after_restart() -> None:
         logger.exception("Failed to bootstrap step plan after restart")
         return
 
-    await task_manager.bot.send_message(
-        chat_id=chat_id,
-        message_thread_id=message_thread_id,
-        text=(
-            "🔁 <b>Auto-resumed step plan after restart</b>\n"
-            f"Queued step {next_index + 1}/{len(steps)} as task <code>{task_id}</code>."
-        ),
-        parse_mode="HTML",
-    )
+    try:
+        await task_manager.bot.send_message(
+            chat_id=chat_id,
+            message_thread_id=message_thread_id,
+            text=(
+                "🔁 <b>Auto-resumed step plan after restart</b>\n"
+                f"Queued step {next_index + 1}/{len(steps)} as task <code>{task_id}</code>."
+            ),
+            parse_mode="HTML",
+        )
+    except Exception:
+        logger.warning(
+            "Step plan bootstrap notification failed for chat=%s thread=%s task=%s",
+            chat_id,
+            message_thread_id,
+            task_id,
+            exc_info=True,
+        )
 
 
 async def _maybe_autostart_step_plan_from_message(message: Message) -> bool:
@@ -1036,6 +1053,15 @@ async def resume_step_plan_after_restart() -> None:
 
     try:
         task_id = await _submit_current_step_plan_task(state)
+    except Exception as exc:
+        state = _load_step_plan_state()
+        state["active"] = False
+        state["last_error"] = f"Resume failed: {exc}"
+        _save_step_plan_state(state)
+        logger.exception("Failed to resume step plan after restart")
+        return
+
+    try:
         await task_manager.bot.send_message(
             chat_id=int(state.get("chat_id") or 0),
             message_thread_id=state.get("message_thread_id"),
@@ -1046,12 +1072,12 @@ async def resume_step_plan_after_restart() -> None:
             ),
             parse_mode="HTML",
         )
-    except Exception as exc:
-        state = _load_step_plan_state()
-        state["active"] = False
-        state["last_error"] = f"Resume failed: {exc}"
-        _save_step_plan_state(state)
-        logger.exception("Failed to resume step plan after restart")
+    except Exception:
+        logger.warning(
+            "Step plan resume notification failed; task remains active task_id=%s",
+            task_id,
+            exc_info=True,
+        )
 
 
 async def resume_scope_snapshots_after_restart() -> None:

@@ -69,4 +69,4 @@ instructions: |
   ## Reference
 
   - `tools/model-usage/references/codexbar-cli.md`
-setup: Ensure binary installed: codexbar
+setup: "Ensure binary installed: codexbar"

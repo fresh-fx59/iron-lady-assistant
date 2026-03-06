@@ -53,6 +53,7 @@ from src.bot import (
     _first_unapplied_step_index,
     bootstrap_step_plan_after_restart,
     _latest_scope_target,
+    _load_plan_steps_from_folder,
     VALID_MODELS,
 )
 
@@ -811,6 +812,39 @@ class TestStepPlanCommands:
         call = manager.submit.await_args.kwargs
         assert "Step plan 2/2 running" in call["feedback_title"]
         manager.bot.send_message.assert_awaited_once()
+
+    async def test_load_plan_steps_skips_index_file(self, tmppath):
+        (tmppath / "00 - Improvement Index.md").write_text("index", encoding="utf-8")
+        (tmppath / "01 - A.md").write_text("Applied: [x]\n", encoding="utf-8")
+        (tmppath / "02 - B.md").write_text("Applied: [ ]\n", encoding="utf-8")
+        steps = _load_plan_steps_from_folder(str(tmppath))
+        assert len(steps) == 2
+        assert all("00 - Improvement Index.md" not in step for step in steps)
+
+    async def test_bootstrap_picks_step06_when_01_05_applied_even_with_index(
+        self, monkeypatch, tmppath
+    ):
+        (tmppath / "00 - Improvement Index.md").write_text("index", encoding="utf-8")
+        for idx in range(1, 9):
+            mark = "[x]" if idx <= 5 else "[ ]"
+            (tmppath / f"{idx:02d} - Step {idx}.md").write_text(f"Applied: {mark}\n", encoding="utf-8")
+
+        manager = AsyncMock()
+        manager.bot = AsyncMock()
+        manager.bot.send_message = AsyncMock()
+        manager.submit = AsyncMock(return_value="task-06")
+        monkeypatch.setattr("src.bot.task_manager", manager)
+        monkeypatch.setattr("src.bot.config.STEP_PLAN_AUTO_TRIGGER_ENABLED", True)
+        monkeypatch.setattr("src.bot.config.STEP_PLAN_DEFAULT_FOLDER", str(tmppath))
+        monkeypatch.setattr("src.bot.config.ALLOWED_USER_IDS", {123456789})
+        monkeypatch.setattr("src.bot._load_scope_snapshots", lambda: {})
+        monkeypatch.setattr("src.bot._load_step_plan_state", lambda: {"active": False})
+
+        await bootstrap_step_plan_after_restart()
+
+        manager.submit.assert_awaited_once()
+        call = manager.submit.await_args.kwargs
+        assert "Step plan 6/8 running" in call["feedback_title"]
 
     async def test_latest_scope_target_uses_session_fallback(self, monkeypatch):
         monkeypatch.setattr("src.bot._load_scope_snapshots", lambda: {})

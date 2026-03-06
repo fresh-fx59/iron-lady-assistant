@@ -559,7 +559,11 @@ def _load_plan_steps_from_folder(folder_path: str) -> list[str]:
         match = _STEP_PLAN_FILE_PATTERN.match(child.name)
         if not match:
             continue
-        ordered_files.append((int(match.group(1)), child))
+        step_no = int(match.group(1))
+        # Skip control/index notes like "00 - Improvement Index.md".
+        if step_no <= 0:
+            continue
+        ordered_files.append((step_no, child))
 
     ordered_files.sort(key=lambda row: row[0])
     return [str(path) for _, path in ordered_files]

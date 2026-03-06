@@ -63,6 +63,11 @@ TTS_MIN_INTELLIGIBILITY_SCORE: float = max(
     min(1.0, float(os.getenv("LOCAL_TTS_MIN_INTELLIGIBILITY_SCORE", "0.55"))),
 )
 TTS_VERIFY_MAX_CHARS: int = int(os.getenv("LOCAL_TTS_VERIFY_MAX_CHARS", "260"))
+TTS_OPUS_BITRATE: str = os.getenv("LOCAL_TTS_OPUS_BITRATE", "48k").strip() or "48k"
+TTS_FFMPEG_AF: str = os.getenv(
+    "LOCAL_TTS_FFMPEG_AF",
+    "highpass=f=120,lowpass=f=7600,loudnorm=I=-16:TP=-1.5:LRA=11",
+).strip()
 
 _CODE_BLOCK_RE = re.compile(r"```.*?```", re.DOTALL)
 _INLINE_CODE_RE = re.compile(r"`[^`]+`")
@@ -223,7 +228,7 @@ async def _verify_intelligibility(ogg_path: Path, expected_text: str) -> tuple[b
 
 
 async def _convert_wav_to_ogg(wav_path: Path, ogg_path: Path) -> tuple[int, str]:
-    ffmpeg_proc = await asyncio.create_subprocess_exec(
+    ffmpeg_args = [
         FFMPEG_BIN,
         "-y",
         "-i",
@@ -231,7 +236,7 @@ async def _convert_wav_to_ogg(wav_path: Path, ogg_path: Path) -> tuple[int, str]
         "-c:a",
         "libopus",
         "-b:a",
-        "32k",
+        TTS_OPUS_BITRATE,
         "-vbr",
         "on",
         "-compression_level",
@@ -242,7 +247,13 @@ async def _convert_wav_to_ogg(wav_path: Path, ogg_path: Path) -> tuple[int, str]
         "48000",
         "-ac",
         "1",
-        str(ogg_path),
+    ]
+    if TTS_FFMPEG_AF:
+        ffmpeg_args.extend(["-af", TTS_FFMPEG_AF])
+    ffmpeg_args.append(str(ogg_path))
+
+    ffmpeg_proc = await asyncio.create_subprocess_exec(
+        *ffmpeg_args,
         stdout=asyncio.subprocess.DEVNULL,
         stderr=asyncio.subprocess.PIPE,
     )
@@ -284,6 +295,11 @@ async def synthesize_voice(text: str) -> str:
         if use_sherpa:
             add_attempt("sherpa")
         add_attempt("espeak", selected_voice, selected_speed)
+        try:
+            slower_speed = str(max(120, int(selected_speed) - 20))
+        except ValueError:
+            slower_speed = "150"
+        add_attempt("espeak", selected_voice, slower_speed)
         if selected_voice != TTS_VOICE_LATIN:
             add_attempt("espeak", TTS_VOICE_LATIN, TTS_SPEED_LATIN)
 

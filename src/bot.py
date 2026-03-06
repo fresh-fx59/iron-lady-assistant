@@ -822,8 +822,6 @@ async def bootstrap_step_plan_after_restart() -> None:
     if not steps:
         return
     next_index = _first_unapplied_step_index(steps)
-    if next_index >= len(steps):
-        return
     target: tuple[int, int | None] | None = None
     existing_chat_id = int(current.get("chat_id") or 0)
     existing_thread_id = current.get("message_thread_id")
@@ -833,6 +831,38 @@ async def bootstrap_step_plan_after_restart() -> None:
             target = (existing_chat_id, existing_thread_id)
     if not target:
         target = _latest_scope_target()
+
+    if next_index >= len(steps):
+        prev_index = int(current.get("current_index") or 0)
+        prev_error = str(current.get("last_error") or "").strip()
+        current["active"] = False
+        current["steps"] = steps
+        current["current_index"] = len(steps)
+        current["current_task_id"] = None
+        current["last_error"] = ""
+        current["name"] = Path(folder_path).expanduser().resolve().name
+        current["folder_path"] = str(Path(folder_path).expanduser().resolve())
+        _save_step_plan_state(current)
+        if target and (prev_index < len(steps) or prev_error):
+            chat_id, message_thread_id = target
+            try:
+                await task_manager.bot.send_message(
+                    chat_id=chat_id,
+                    message_thread_id=message_thread_id,
+                    text=(
+                        "✅ <b>Step plan already complete</b>\n"
+                        "All steps are marked as applied. Nothing to resume after restart."
+                    ),
+                    parse_mode="HTML",
+                )
+            except Exception:
+                logger.warning(
+                    "Step plan completion notification failed for chat=%s thread=%s",
+                    chat_id,
+                    message_thread_id,
+                    exc_info=True,
+                )
+        return
     if not target:
         return
     chat_id, message_thread_id = target

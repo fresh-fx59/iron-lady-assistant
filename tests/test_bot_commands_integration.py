@@ -918,6 +918,49 @@ class TestStepPlanCommands:
 
         manager.submit.assert_not_awaited()
 
+    async def test_bootstrap_marks_complete_when_all_steps_already_applied(self, monkeypatch, tmppath):
+        step1 = tmppath / "01 - A.md"
+        step2 = tmppath / "02 - B.md"
+        step1.write_text("Applied: [x]\n", encoding="utf-8")
+        step2.write_text("Applied: [x]\n", encoding="utf-8")
+
+        _save_step_plan_state(
+            {
+                "active": False,
+                "chat_id": -1003019299921,
+                "message_thread_id": 777,
+                "user_id": 314102923,
+                "folder_path": str(tmppath),
+                "steps": [str(step1), str(step2)],
+                "current_index": 1,
+                "last_error": "previous failure",
+            }
+        )
+
+        manager = AsyncMock()
+        manager.bot = AsyncMock()
+        manager.bot.send_message = AsyncMock()
+        manager.submit = AsyncMock(return_value="task-should-not-run")
+        monkeypatch.setattr("src.bot.task_manager", manager)
+        monkeypatch.setattr("src.bot.config.STEP_PLAN_AUTO_TRIGGER_ENABLED", True)
+        monkeypatch.setattr("src.bot.config.STEP_PLAN_DEFAULT_FOLDER", str(tmppath))
+        monkeypatch.setattr("src.bot.config.ALLOWED_USER_IDS", {314102923})
+        monkeypatch.setattr("src.bot.config.ALLOWED_CHAT_IDS", {-1003019299921})
+
+        await bootstrap_step_plan_after_restart()
+
+        manager.submit.assert_not_awaited()
+        manager.bot.send_message.assert_awaited_once()
+        notify_kwargs = manager.bot.send_message.await_args.kwargs
+        assert notify_kwargs["chat_id"] == -1003019299921
+        assert notify_kwargs["message_thread_id"] == 777
+        assert "already complete" in notify_kwargs["text"]
+
+        state = _load_step_plan_state()
+        assert state["active"] is False
+        assert state["current_index"] == 2
+        assert state["last_error"] == ""
+
     async def test_load_plan_steps_skips_index_file(self, tmppath):
         (tmppath / "00 - Improvement Index.md").write_text("index", encoding="utf-8")
         (tmppath / "01 - A.md").write_text("Applied: [x]\n", encoding="utf-8")

@@ -1,4 +1,5 @@
 import asyncio
+from collections import deque
 from dataclasses import dataclass, field
 import hashlib
 import html
@@ -71,6 +72,8 @@ class _ChatState:
     cancel_requested: bool
     reset_generation: int = 0
     pending_inputs: list[str] = field(default_factory=list)
+    recent_midflight_fingerprints: deque[str] = field(default_factory=lambda: deque(maxlen=32))
+    recent_midflight_token_sets: deque[frozenset[str]] = field(default_factory=lambda: deque(maxlen=32))
 
 
 # Per-conversation state dict
@@ -99,6 +102,19 @@ _STEP_PLAN_FALLBACK_PATHS = (
     "/home/claude-developer/syncthing/data/syncthing-main/Obsidian/DefaultObsidianVault/"
     "Projects/Iron Lady Assistant/Ouroboros Improvement Plan",
 )
+_MIDFLIGHT_TOKEN_RE = re.compile(r"\w+", re.UNICODE)
+_NUMBER_WORDS = {
+    "one": "1",
+    "two": "2",
+    "three": "3",
+    "four": "4",
+    "five": "5",
+    "six": "6",
+    "seven": "7",
+    "eight": "8",
+    "nine": "9",
+    "ten": "10",
+}
 
 
 def _thread_id(message: Message) -> int | None:
@@ -124,10 +140,83 @@ def _get_state(scope_key: str) -> _ChatState:
     return _chat_states[scope_key]
 
 
-def _queue_pending_input(state: _ChatState, text: str) -> int:
+def _normalize_midflight_text(text: str) -> str:
+    return re.sub(r"\s+", " ", (text or "").strip().lower())
+
+
+def _tokenize_midflight_text(text: str) -> frozenset[str]:
+    normalized = _normalize_midflight_text(text)
+    raw_tokens = _MIDFLIGHT_TOKEN_RE.findall(normalized)
+    tokens: list[str] = []
+    for tok in raw_tokens:
+        canonical = _NUMBER_WORDS.get(tok, tok)
+        for suffix in ("ing", "ion", "ions", "ed", "es", "s"):
+            if canonical.endswith(suffix) and len(canonical) > len(suffix) + 2:
+                canonical = canonical[: -len(suffix)]
+                break
+        if len(canonical) >= 3 or canonical.isdigit():
+            tokens.append(canonical)
+    return frozenset(tokens)
+
+
+def _fingerprint_midflight_text(text: str) -> str:
+    normalized = _normalize_midflight_text(text)
+    if not normalized:
+        return ""
+    return hashlib.sha1(normalized.encode("utf-8")).hexdigest()[:16]
+
+
+def _remember_midflight_input(state: _ChatState, text: str) -> None:
+    fingerprint = _fingerprint_midflight_text(text)
+    if fingerprint:
+        state.recent_midflight_fingerprints.append(fingerprint)
+    tokens = _tokenize_midflight_text(text)
+    if tokens:
+        state.recent_midflight_token_sets.append(tokens)
+
+
+def _is_semantic_midflight_duplicate(state: _ChatState, text: str) -> tuple[bool, str]:
+    normalized = _normalize_midflight_text(text)
+    if not normalized:
+        return True, "empty"
+
+    fingerprint = _fingerprint_midflight_text(text)
+    pending_fingerprints = {_fingerprint_midflight_text(item) for item in state.pending_inputs}
+    if fingerprint in pending_fingerprints or fingerprint in set(state.recent_midflight_fingerprints):
+        return True, "exact"
+
+    candidate_tokens = _tokenize_midflight_text(text)
+    if len(candidate_tokens) < 5:
+        return False, ""
+
+    compared_sets: list[frozenset[str]] = []
+    for item in state.pending_inputs:
+        item_tokens = _tokenize_midflight_text(item)
+        if item_tokens:
+            compared_sets.append(item_tokens)
+    compared_sets.extend(list(state.recent_midflight_token_sets))
+    for tokens in compared_sets:
+        intersection = len(candidate_tokens & tokens)
+        if intersection < 3:
+            continue
+        union = len(candidate_tokens | tokens)
+        if union == 0:
+            continue
+        jaccard = intersection / union
+        if jaccard >= 0.55:
+            return True, "semantic"
+
+    return False, ""
+
+
+def _queue_pending_input(state: _ChatState, text: str) -> tuple[int, str]:
     """Queue additional user context while current request is running."""
+    duplicate, reason = _is_semantic_midflight_duplicate(state, text)
+    if duplicate:
+        return len(state.pending_inputs), reason
     state.pending_inputs.append(text)
-    return len(state.pending_inputs)
+    _remember_midflight_input(state, text)
+    return len(state.pending_inputs), ""
 
 
 def _drain_pending_inputs(state: _ChatState) -> list[str]:
@@ -871,6 +960,8 @@ async def resume_scope_snapshots_after_restart() -> None:
             pass
         else:
             state.pending_inputs.extend(restored)
+            for item in restored:
+                _remember_midflight_input(state, item)
             _update_scope_snapshot(scope_key, state=state, processing=False)
             restored_lines.append(f"{scope_key}: restored {len(restored)} pending item(s)")
             notice_lines.append(
@@ -2854,12 +2945,23 @@ async def _handle_message_inner(message: Message, override_text: str | None = No
         metrics.MESSAGES_TOTAL.labels(status="busy").inc()
         queued_text = (override_text or message.text or "").strip()
         if queued_text:
-            queued_count = _queue_pending_input(state, queued_text)
+            queued_count, dedup_reason = _queue_pending_input(state, queued_text)
             _update_scope_snapshot(scope_key, state=state)
-            await message.answer(
-                f"Working on your previous request. "
-                f"Added this as extra context ({queued_count} queued) and will process it next."
-            )
+            if dedup_reason:
+                logger.info(
+                    "Chat %s: skipped duplicate mid-flight input reason=%s",
+                    scope_key,
+                    dedup_reason,
+                )
+                await message.answer(
+                    "Working on your previous request. "
+                    "This extra message looks duplicate, so I skipped re-queueing it."
+                )
+            else:
+                await message.answer(
+                    f"Working on your previous request. "
+                    f"Added this as extra context ({queued_count} queued) and will process it next."
+                )
         else:
             await message.answer("Still processing your previous message, please wait...")
         return

@@ -49,6 +49,7 @@ from src.bot import (
     should_restart_step_plan_now,
     _is_duplicate_outbound,
     _cost_guardrail_actions_from_anomalies,
+    _queue_pending_input,
     VALID_MODELS,
 )
 
@@ -969,6 +970,32 @@ class TestChatStateManagement:
         scope = "dup:main"
         assert _is_duplicate_outbound(scope, "hello world") is False
         assert _is_duplicate_outbound(scope, "hello   world") is True
+
+    def test_midflight_dedup_exact_duplicate(self):
+        state = _ChatState(lock=asyncio.Lock(), process_handle=None, cancel_requested=False)
+        count, reason = _queue_pending_input(state, "Please continue with step 4 now")
+        assert count == 1
+        assert reason == ""
+        count2, reason2 = _queue_pending_input(state, "please   continue with step 4 now")
+        assert count2 == 1
+        assert reason2 == "exact"
+
+    def test_midflight_dedup_semantic_duplicate(self):
+        state = _ChatState(lock=asyncio.Lock(), process_handle=None, cancel_requested=False)
+        _queue_pending_input(state, "Please continue implementing step four with restart enabled")
+        count, reason = _queue_pending_input(
+            state,
+            "Continue step 4 implementation with restart turned on please",
+        )
+        assert count == 1
+        assert reason == "semantic"
+
+    def test_midflight_non_duplicate_still_queued(self):
+        state = _ChatState(lock=asyncio.Lock(), process_handle=None, cancel_requested=False)
+        _queue_pending_input(state, "Continue step 4 implementation with restart")
+        count, reason = _queue_pending_input(state, "Also add tests for typing progress fallback")
+        assert count == 2
+        assert reason == ""
 
 
 # ── Contract 9: Model validation ─────────────────────────────────

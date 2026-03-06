@@ -1129,6 +1129,74 @@ class TestPromptHealthInvariants:
         prompt = _build_augmented_prompt("hello")
         assert "<health_invariants>" not in prompt
 
+    def test_build_augmented_prompt_applies_light_compaction(self, monkeypatch):
+        huge = "X" * 5000
+        monkeypatch.setattr(
+            "src.bot.memory_manager",
+            type(
+                "M",
+                (),
+                {"build_context": lambda self, _: huge, "build_instructions": lambda self: "\n<memory_instructions/>"},
+            )(),
+        )
+        monkeypatch.setattr(
+            "src.bot.identity_manager",
+            type("I", (), {"build_context": lambda self: "<identity>must keep</identity>"})(),
+        )
+        monkeypatch.setattr(
+            "src.bot.context_plugins",
+            type("T", (), {"build_context": lambda self, _: huge})(),
+        )
+        monkeypatch.setattr("src.bot.context_compiler.build_context", lambda *_args, **_kwargs: huge)
+        monkeypatch.setattr("src.bot.health_invariants.build_block", lambda **_kwargs: huge)
+        monkeypatch.setattr("src.bot.config.CONTEXT_COMPACTION_ENABLED", True)
+        monkeypatch.setattr("src.bot.config.CONTEXT_COMPACTION_LIGHT_THRESHOLD_CHARS", 3000)
+        monkeypatch.setattr("src.bot.config.CONTEXT_COMPACTION_AGGRESSIVE_THRESHOLD_CHARS", 999999)
+        monkeypatch.setattr("src.bot.config.CONTEXT_COMPACTION_LIGHT_BLOCK_CHARS", 400)
+        monkeypatch.setattr("src.bot.config.CONTEXT_COMPILER_ENABLED", True)
+        monkeypatch.setattr("src.bot.config.HEALTH_INVARIANTS_ENABLED", True)
+
+        prompt = _build_augmented_prompt("latest user intent")
+        assert "<context_compaction>" in prompt
+        assert "policy: light" in prompt
+        assert "<identity>must keep</identity>" in prompt
+        assert "latest user intent" in prompt
+        assert "<memory_instructions/>" in prompt
+
+    def test_build_augmented_prompt_applies_aggressive_compaction(self, monkeypatch):
+        noisy = "\n".join([f"- trace line {i} tool progress" for i in range(300)])
+        monkeypatch.setattr(
+            "src.bot.memory_manager",
+            type(
+                "M",
+                (),
+                {"build_context": lambda self, _: noisy, "build_instructions": lambda self: "\n<keep/>"},
+            )(),
+        )
+        monkeypatch.setattr(
+            "src.bot.identity_manager",
+            type("I", (), {"build_context": lambda self: "<identity>hard constraints</identity>"})(),
+        )
+        monkeypatch.setattr(
+            "src.bot.context_plugins",
+            type("T", (), {"build_context": lambda self, _: noisy})(),
+        )
+        monkeypatch.setattr("src.bot.context_compiler.build_context", lambda *_args, **_kwargs: noisy)
+        monkeypatch.setattr("src.bot.health_invariants.build_block", lambda **_kwargs: noisy)
+        monkeypatch.setattr("src.bot.config.CONTEXT_COMPACTION_ENABLED", True)
+        monkeypatch.setattr("src.bot.config.CONTEXT_COMPACTION_LIGHT_THRESHOLD_CHARS", 200)
+        monkeypatch.setattr("src.bot.config.CONTEXT_COMPACTION_AGGRESSIVE_THRESHOLD_CHARS", 400)
+        monkeypatch.setattr("src.bot.config.CONTEXT_COMPACTION_AGGRESSIVE_BLOCK_CHARS", 380)
+        monkeypatch.setattr("src.bot.config.CONTEXT_COMPILER_ENABLED", True)
+        monkeypatch.setattr("src.bot.config.HEALTH_INVARIANTS_ENABLED", True)
+
+        prompt = _build_augmented_prompt("latest intent must survive")
+        assert "policy: aggressive" in prompt
+        assert "<context_compaction_block name=\"memory_context\">" in prompt
+        assert "<identity>hard constraints</identity>" in prompt
+        assert "latest intent must survive" in prompt
+        assert "<keep/>" in prompt
+
     @pytest.mark.asyncio
     async def test_retries_and_recovers_on_transient_codex_error(self, mock_message):
         response_error = type("obj", (object,), {

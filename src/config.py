@@ -6,7 +6,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-VERSION: str = "0.18.25"
+VERSION: str = "0.18.26"
 
 # ── Bot token (required) ────────────────────────────────────
 BOT_TOKEN: str = os.getenv("TELEGRAM_BOT_TOKEN", "")
@@ -78,6 +78,21 @@ CONTEXT_COMPILER_ENABLED: bool = (
     os.getenv("CONTEXT_COMPILER_ENABLED", "1").strip().lower() not in {"0", "false", "no"}
 )
 CONTEXT_COMPILER_MAX_CHARS: int = int(os.getenv("CONTEXT_COMPILER_MAX_CHARS", "1600"))
+CONTEXT_COMPACTION_ENABLED: bool = (
+    os.getenv("CONTEXT_COMPACTION_ENABLED", "1").strip().lower() not in {"0", "false", "no"}
+)
+CONTEXT_COMPACTION_LIGHT_THRESHOLD_CHARS: int = int(
+    os.getenv("CONTEXT_COMPACTION_LIGHT_THRESHOLD_CHARS", "12000")
+)
+CONTEXT_COMPACTION_AGGRESSIVE_THRESHOLD_CHARS: int = int(
+    os.getenv("CONTEXT_COMPACTION_AGGRESSIVE_THRESHOLD_CHARS", "20000")
+)
+CONTEXT_COMPACTION_LIGHT_BLOCK_CHARS: int = int(
+    os.getenv("CONTEXT_COMPACTION_LIGHT_BLOCK_CHARS", "1800")
+)
+CONTEXT_COMPACTION_AGGRESSIVE_BLOCK_CHARS: int = int(
+    os.getenv("CONTEXT_COMPACTION_AGGRESSIVE_BLOCK_CHARS", "900")
+)
 SCOPE_SNAPSHOT_ENABLED: bool = (
     os.getenv("SCOPE_SNAPSHOT_ENABLED", "1").strip().lower() not in {"0", "false", "no"}
 )

@@ -1353,6 +1353,90 @@ def _inject_tool_request(prompt_text: str, tool_name: str) -> str:
     return f"{base}\n\nUSE_TOOL: {tool_name}\n"
 
 
+def _estimate_prompt_chars(parts: list[str]) -> int:
+    if not parts:
+        return 0
+    return sum(len(part) for part in parts) + (2 * (len(parts) - 1))
+
+
+def _context_compaction_policy(total_chars: int) -> str:
+    if not config.CONTEXT_COMPACTION_ENABLED:
+        return "none"
+    if total_chars >= config.CONTEXT_COMPACTION_AGGRESSIVE_THRESHOLD_CHARS:
+        return "aggressive"
+    if total_chars >= config.CONTEXT_COMPACTION_LIGHT_THRESHOLD_CHARS:
+        return "light"
+    return "none"
+
+
+def _compact_block_light(name: str, text: str, max_chars: int) -> str:
+    if len(text) <= max_chars:
+        return text
+    head = max_chars // 2
+    tail = max_chars - head - 48
+    if tail < 120:
+        tail = 120
+    compacted = (
+        text[:head].rstrip()
+        + f"\n... [{name} compacted, omitted {max(0, len(text) - (head + tail))} chars] ...\n"
+        + text[-tail:].lstrip()
+    )
+    return compacted[:max_chars]
+
+
+def _compact_block_aggressive(name: str, text: str, max_chars: int) -> str:
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    keywords = ("must", "never", "always", "rule", "constraint", "priority", "command", "tool", "goal")
+    selected: list[str] = []
+    for line in lines:
+        lower = line.lower()
+        if line.startswith("- ") or any(key in lower for key in keywords):
+            selected.append(line)
+        if len(selected) >= 8:
+            break
+    if not selected:
+        selected = lines[:6]
+    payload_lines = [
+        f"<context_compaction_block name=\"{name}\">",
+        f"mode: aggressive",
+        f"source_lines: {len(lines)}",
+        "summary:",
+        *[f"- {line[:220]}" for line in selected],
+        "</context_compaction_block>",
+    ]
+    compacted = "\n".join(payload_lines)
+    if len(compacted) > max_chars:
+        compacted = compacted[: max(0, max_chars - 20)].rstrip() + "\n... [truncated]"
+    return compacted
+
+
+def _apply_context_compaction(parts: dict[str, str]) -> tuple[dict[str, str], str, int, int]:
+    ordered = [value for value in parts.values() if value]
+    before_chars = _estimate_prompt_chars(ordered)
+    policy = _context_compaction_policy(before_chars)
+    if policy == "none":
+        return parts, policy, before_chars, before_chars
+
+    compacted = dict(parts)
+    if policy == "light":
+        block_limit = max(300, config.CONTEXT_COMPACTION_LIGHT_BLOCK_CHARS)
+        for key in ("memory_context", "compiler_context", "invariants_context", "tool_context"):
+            value = compacted.get(key) or ""
+            if not value:
+                continue
+            compacted[key] = _compact_block_light(key, value, block_limit)
+    else:
+        block_limit = max(240, config.CONTEXT_COMPACTION_AGGRESSIVE_BLOCK_CHARS)
+        for key in ("memory_context", "compiler_context", "invariants_context", "tool_context"):
+            value = compacted.get(key) or ""
+            if not value:
+                continue
+            compacted[key] = _compact_block_aggressive(key, value, block_limit)
+
+    after_chars = _estimate_prompt_chars([value for value in compacted.values() if value])
+    return compacted, policy, before_chars, after_chars
+
+
 def _build_augmented_prompt(raw_prompt: str) -> str:
     """Compose prompt with memory, identity, tools, and memory instructions."""
     memory_context = _as_text(memory_manager.build_context(raw_prompt))
@@ -1379,18 +1463,45 @@ def _build_augmented_prompt(raw_prompt: str) -> str:
             claude_md_path=_repo_root() / "CLAUDE.md",
         )
 
+    parts = {
+        "memory_context": memory_context,
+        "identity_context": identity_context,
+        "compiler_context": compiler_context,
+        "invariants_context": invariants_context,
+        "tool_context": tool_context,
+        # Keep latest user intent + memory instructions uncompressed.
+        "user_block": raw_prompt + memory_instructions,
+    }
+    compacted_parts, policy, before_chars, after_chars = _apply_context_compaction(parts)
+
     prompt_parts: list[str] = []
-    if memory_context:
-        prompt_parts.append(memory_context)
-    if identity_context:
-        prompt_parts.append(identity_context)
-    if compiler_context:
-        prompt_parts.append(compiler_context)
-    if invariants_context:
-        prompt_parts.append(invariants_context)
-    if tool_context:
-        prompt_parts.append(tool_context)
-    prompt_parts.append(raw_prompt + memory_instructions)
+    for key in (
+        "memory_context",
+        "identity_context",
+        "compiler_context",
+        "invariants_context",
+        "tool_context",
+        "user_block",
+    ):
+        value = compacted_parts.get(key) or ""
+        if value:
+            prompt_parts.append(value)
+
+    if policy != "none":
+        marker = (
+            "<context_compaction>\n"
+            f"policy: {policy}\n"
+            f"before_chars: {before_chars}\n"
+            f"after_chars: {after_chars}\n"
+            "</context_compaction>"
+        )
+        prompt_parts.insert(0, marker)
+        logger.info(
+            "context_compaction applied policy=%s before_chars=%d after_chars=%d",
+            policy,
+            before_chars,
+            after_chars,
+        )
     return "\n\n".join(prompt_parts)
 
 

@@ -1,10 +1,12 @@
 import asyncio
+import inspect
 import logging
 import uuid
 from dataclasses import dataclass
 from datetime import datetime
 from enum import Enum
-from typing import Final, Protocol, Sequence
+from time import monotonic
+from typing import AsyncIterator, Final, Protocol, Sequence
 
 from aiogram import Bot
 
@@ -51,11 +53,47 @@ class TaskObserver(Protocol):
         """Called when a task reaches terminal status."""
 
 
+@dataclass(frozen=True)
+class ToolTimeoutPolicy:
+    io_seconds: float = 20.0
+    network_seconds: float = 90.0
+    browser_seconds: float = 120.0
+    local_shell_seconds: float = 45.0
+    default_seconds: float = 60.0
+    retryable_timeout_retries: int = 1
+
+
+@dataclass(frozen=True)
+class ToolExecutionState:
+    name: str
+    args_preview: str | None
+    category: str
+    timeout_seconds: float
+    started_monotonic: float
+
+
+@dataclass(frozen=True)
+class ToolTimeoutRecord:
+    tool_name: str
+    args_preview: str
+    category: str
+    timeout_seconds: float
+    recovery_action: str
+
+    def to_error_text(self) -> str:
+        return (
+            "TOOL_TIMEOUT "
+            f"tool={self.tool_name} category={self.category} timeout_s={self.timeout_seconds:.1f} "
+            f"recovery={self.recovery_action} args={self.args_preview}"
+        )
+
+
 class TaskManager:
     """Manages background task execution and notifications."""
 
     _MAX_CONCURRENT: Final[int] = 3  # Max background tasks running at once
     _TASK_TIMEOUT: Final[int] = 600  # 10 minutes max per task
+    _TOOL_TIMEOUT_POLICY: Final[ToolTimeoutPolicy] = ToolTimeoutPolicy()
 
     def __init__(self, bot: Bot, observers: Sequence[TaskObserver] | None = None):
         self.bot = bot
@@ -212,12 +250,157 @@ class TaskManager:
             await self._process_queue()
             await asyncio.sleep(1)
 
-    async def _collect_result_event(self, stream) -> bridge.ClaudeResponse | None:
-        """Consume provider stream until a RESULT event is received."""
-        async for event in stream:
+    @staticmethod
+    def _normalize_tool_name(tool_name: str | None) -> str:
+        return (tool_name or "").strip().lower()
+
+    @classmethod
+    def _tool_category(cls, tool_name: str | None) -> str:
+        name = cls._normalize_tool_name(tool_name)
+        if name in {"read", "write", "edit", "glob", "grep", "ls", "list"}:
+            return "io"
+        if "browser" in name or name in {"playwright", "puppeteer"}:
+            return "browser"
+        if any(token in name for token in ("http", "web", "url", "fetch", "search", "weather", "api")):
+            return "network"
+        if name in {"bash", "shell", "exec_command", "terminal", "command"}:
+            return "local_shell"
+        return "default"
+
+    @classmethod
+    def _tool_timeout_seconds(cls, category: str) -> float:
+        policy = cls._TOOL_TIMEOUT_POLICY
+        if category == "io":
+            return policy.io_seconds
+        if category == "network":
+            return policy.network_seconds
+        if category == "browser":
+            return policy.browser_seconds
+        if category == "local_shell":
+            return policy.local_shell_seconds
+        return policy.default_seconds
+
+    @classmethod
+    def _is_tool_retryable(cls, tool_name: str | None, category: str) -> bool:
+        name = cls._normalize_tool_name(tool_name)
+        if category in {"network", "io"}:
+            return True
+        return name in {"read", "glob", "grep", "web_search", "weather", "summarize"}
+
+    @classmethod
+    def _is_stateful_tool(cls, tool_name: str | None, category: str) -> bool:
+        name = cls._normalize_tool_name(tool_name)
+        return category in {"local_shell", "browser"} or name in {"task", "python", "sql"}
+
+    async def _terminate_process(self, process_handle: dict | None) -> None:
+        if not process_handle:
+            return
+        proc = process_handle.get("proc")
+        if not proc:
+            return
+        try:
+            if proc.returncode is None:
+                maybe_awaitable = proc.kill()
+                if inspect.isawaitable(maybe_awaitable):
+                    await maybe_awaitable
+                await proc.wait()
+        except Exception:
+            logger.exception("Failed to terminate timed-out provider subprocess")
+
+    async def _collect_result_event(
+        self,
+        stream: AsyncIterator[bridge.StreamEvent],
+    ) -> tuple[bridge.ClaudeResponse | None, ToolTimeoutRecord | None]:
+        """Consume provider stream until RESULT or tool-specific timeout."""
+        iterator = stream.__aiter__()
+        active_tool: ToolExecutionState | None = None
+
+        while True:
+            timeout_s = self._TASK_TIMEOUT
+            if active_tool:
+                elapsed = max(0.0, monotonic() - active_tool.started_monotonic)
+                remaining = active_tool.timeout_seconds - elapsed
+                if remaining <= 0:
+                    recovery_action = "reset_session" if self._is_stateful_tool(
+                        active_tool.name, active_tool.category
+                    ) else "preserve_session"
+                    return None, ToolTimeoutRecord(
+                        tool_name=active_tool.name or "unknown_tool",
+                        args_preview=active_tool.args_preview or "-",
+                        category=active_tool.category,
+                        timeout_seconds=active_tool.timeout_seconds,
+                        recovery_action=recovery_action,
+                    )
+                timeout_s = min(timeout_s, remaining)
+
+            try:
+                event = await asyncio.wait_for(iterator.__anext__(), timeout=timeout_s)
+            except StopAsyncIteration:
+                return None, None
+            except asyncio.TimeoutError:
+                if active_tool:
+                    recovery_action = "reset_session" if self._is_stateful_tool(
+                        active_tool.name, active_tool.category
+                    ) else "preserve_session"
+                    return None, ToolTimeoutRecord(
+                        tool_name=active_tool.name or "unknown_tool",
+                        args_preview=active_tool.args_preview or "-",
+                        category=active_tool.category,
+                        timeout_seconds=active_tool.timeout_seconds,
+                        recovery_action=recovery_action,
+                    )
+                raise
+
+            if event.event_type == bridge.StreamEventType.TOOL_USE:
+                category = self._tool_category(event.tool_name)
+                active_tool = ToolExecutionState(
+                    name=event.tool_name or "unknown_tool",
+                    args_preview=event.tool_input,
+                    category=category,
+                    timeout_seconds=self._tool_timeout_seconds(category),
+                    started_monotonic=monotonic(),
+                )
+                continue
+
             if event.event_type == bridge.StreamEventType.RESULT:
-                return event.response
+                return event.response, None
+
         return None
+
+    async def _run_provider_attempt(
+        self,
+        task: BackgroundTask,
+    ) -> tuple[bridge.ClaudeResponse | None, ToolTimeoutRecord | None]:
+        process_handle: dict = {}
+        if task.provider_cli == "codex":
+            stream = bridge.stream_codex_message(
+                prompt=task.prompt,
+                session_id=task.session_id,
+                model=task.model,
+                resume_arg=task.resume_arg,
+                working_dir=config.CLAUDE_WORKING_DIR,
+                process_handle=process_handle,
+            )
+        else:
+            stream = bridge.stream_message(
+                prompt=task.prompt,
+                session_id=task.session_id,
+                model=task.model,
+                working_dir=config.CLAUDE_WORKING_DIR,
+                process_handle=process_handle,
+            )
+
+        try:
+            response, tool_timeout = await asyncio.wait_for(
+                self._collect_result_event(stream),
+                timeout=self._TASK_TIMEOUT,
+            )
+            if tool_timeout:
+                await self._terminate_process(process_handle)
+            return response, tool_timeout
+        except Exception:
+            await self._terminate_process(process_handle)
+            raise
 
     async def _execute_task(self, task: BackgroundTask) -> None:
         """Execute a single background task."""
@@ -228,28 +411,42 @@ class TaskManager:
             if task.live_feedback:
                 await self._notify_started(task)
                 typing_task = asyncio.create_task(self._typing_loop(task))
+            tool_timeout: ToolTimeoutRecord | None = None
+            retries_left = self._TOOL_TIMEOUT_POLICY.retryable_timeout_retries
 
-            if task.provider_cli == "codex":
-                stream = bridge.stream_codex_message(
-                    prompt=task.prompt,
-                    session_id=task.session_id,
-                    model=task.model,
-                    resume_arg=task.resume_arg,
-                    working_dir=config.CLAUDE_WORKING_DIR,
-                )
-            else:
-                stream = bridge.stream_message(
-                    prompt=task.prompt,
-                    session_id=task.session_id,
-                    model=task.model,
-                    working_dir=config.CLAUDE_WORKING_DIR,
+            while True:
+                response, tool_timeout = await self._run_provider_attempt(task)
+                if not tool_timeout:
+                    break
+
+                logger.warning(
+                    "task_tool_timeout task_id=%s tool=%s category=%s timeout_s=%.1f args=%s recovery=%s",
+                    task.id,
+                    tool_timeout.tool_name,
+                    tool_timeout.category,
+                    tool_timeout.timeout_seconds,
+                    tool_timeout.args_preview,
+                    tool_timeout.recovery_action,
                 )
 
-            # Stream the provider response with timeout
-            response = await asyncio.wait_for(
-                self._collect_result_event(stream),
-                timeout=self._TASK_TIMEOUT,
-            )
+                retryable = self._is_tool_retryable(
+                    tool_timeout.tool_name,
+                    tool_timeout.category,
+                )
+                if not retryable or retries_left <= 0:
+                    task.error = tool_timeout.to_error_text()
+                    break
+
+                retries_left -= 1
+                if tool_timeout.recovery_action == "reset_session":
+                    task.session_id = None
+                logger.info(
+                    "Retrying timed-out task %s (tool=%s, retries_left=%d, recovery=%s)",
+                    task.id,
+                    tool_timeout.tool_name,
+                    retries_left,
+                    tool_timeout.recovery_action,
+                )
 
             # Update task with results
             task.completed_at = datetime.now()
@@ -276,8 +473,10 @@ class TaskManager:
                     await self._notify_completion(task)
             else:
                 task.status = TaskStatus.FAILED
-                task.error = "No response received"
+                task.error = task.error or "No response received"
                 logger.warning("Task %s: no response", task.id)
+                metrics.BG_TASKS_TOTAL.labels(status="failed").inc()
+                await self._notify_failure(task)
 
         except asyncio.TimeoutError:
             task.status = TaskStatus.FAILED

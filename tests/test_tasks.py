@@ -6,6 +6,7 @@ import pytest
 
 from src.tasks import BackgroundTask, TaskManager, TaskStatus
 from src import bridge
+from src.tasks import ToolTimeoutPolicy
 
 
 @pytest.mark.asyncio
@@ -67,3 +68,130 @@ async def test_execute_task_stream_result_does_not_raise_typeerror(monkeypatch) 
 
     assert task.status == TaskStatus.COMPLETED
     assert task.response == "ok"
+
+
+@pytest.mark.asyncio
+async def test_execute_task_marks_structured_tool_timeout_and_kills_process(monkeypatch) -> None:
+    bot = AsyncMock()
+    manager = TaskManager(bot)
+    task = BackgroundTask(
+        id="task-timeout",
+        chat_id=123,
+        message_thread_id=None,
+        user_id=123,
+        prompt="x",
+        model="sonnet",
+        session_id="sess-1",
+        status=TaskStatus.RUNNING,
+        created_at=datetime.now(),
+    )
+
+    fake_proc = AsyncMock()
+    fake_proc.returncode = None
+    fake_proc.kill = AsyncMock()
+    fake_proc.wait = AsyncMock()
+
+    async def fake_stream_message(**kwargs):  # noqa: ARG001
+        process_handle = kwargs.get("process_handle")
+        if process_handle is not None:
+            process_handle["proc"] = fake_proc
+        yield bridge.StreamEvent(
+            event_type=bridge.StreamEventType.TOOL_USE,
+            tool_name="Bash",
+            tool_input="sleep 1000",
+        )
+        await asyncio.sleep(3600)
+
+    monkeypatch.setattr("src.tasks.bridge.stream_message", fake_stream_message)
+    monkeypatch.setattr(
+        TaskManager,
+        "_TOOL_TIMEOUT_POLICY",
+        ToolTimeoutPolicy(
+            io_seconds=0.02,
+            network_seconds=0.02,
+            browser_seconds=0.02,
+            local_shell_seconds=0.02,
+            default_seconds=0.02,
+            retryable_timeout_retries=1,
+        ),
+    )
+    monkeypatch.setattr(TaskManager, "_TASK_TIMEOUT", 2)
+
+    await manager._execute_task(task)  # noqa: SLF001
+
+    assert task.status == TaskStatus.FAILED
+    assert task.error is not None
+    assert "TOOL_TIMEOUT" in task.error
+    assert "tool=Bash" in task.error
+    assert "recovery=reset_session" in task.error
+    fake_proc.kill.assert_awaited_once()
+    fake_proc.wait.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_execute_task_retries_once_for_idempotent_tool_timeout(monkeypatch) -> None:
+    bot = AsyncMock()
+    manager = TaskManager(bot)
+    task = BackgroundTask(
+        id="task-retry",
+        chat_id=123,
+        message_thread_id=None,
+        user_id=123,
+        prompt="x",
+        model="sonnet",
+        session_id="sess-1",
+        status=TaskStatus.RUNNING,
+        created_at=datetime.now(),
+    )
+
+    attempts = {"count": 0}
+    timed_out_proc = AsyncMock()
+    timed_out_proc.returncode = None
+    timed_out_proc.kill = AsyncMock()
+    timed_out_proc.wait = AsyncMock()
+
+    async def fake_stream_message(**kwargs):  # noqa: ARG001
+        attempts["count"] += 1
+        process_handle = kwargs.get("process_handle")
+        if attempts["count"] == 1:
+            if process_handle is not None:
+                process_handle["proc"] = timed_out_proc
+            yield bridge.StreamEvent(
+                event_type=bridge.StreamEventType.TOOL_USE,
+                tool_name="Read",
+                tool_input="/tmp/file.txt",
+            )
+            await asyncio.sleep(3600)
+            return
+
+        yield bridge.StreamEvent(
+            event_type=bridge.StreamEventType.RESULT,
+            response=bridge.ClaudeResponse(
+                text="ok-after-retry",
+                session_id="sess-2",
+                is_error=False,
+                cost_usd=0.0,
+            ),
+        )
+
+    monkeypatch.setattr("src.tasks.bridge.stream_message", fake_stream_message)
+    monkeypatch.setattr(
+        TaskManager,
+        "_TOOL_TIMEOUT_POLICY",
+        ToolTimeoutPolicy(
+            io_seconds=0.02,
+            network_seconds=0.02,
+            browser_seconds=0.02,
+            local_shell_seconds=0.02,
+            default_seconds=0.02,
+            retryable_timeout_retries=1,
+        ),
+    )
+    monkeypatch.setattr(TaskManager, "_TASK_TIMEOUT", 2)
+
+    await manager._execute_task(task)  # noqa: SLF001
+
+    assert attempts["count"] == 2
+    assert task.status == TaskStatus.COMPLETED
+    assert task.response == "ok-after-retry"
+    timed_out_proc.kill.assert_awaited_once()

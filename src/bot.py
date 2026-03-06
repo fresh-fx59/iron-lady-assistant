@@ -721,9 +721,33 @@ def _latest_scope_target() -> tuple[int, int | None] | None:
             newest = candidate
     if newest:
         return newest[1], newest[2]
+    session_rows = []
+    for key, session in session_manager.sessions.items():
+        try:
+            chat_id, message_thread_id = _parse_scope_key_components(str(key))
+        except Exception:
+            chat_id = int(getattr(session, "chat_id", 0) or 0)
+            message_thread_id = getattr(session, "message_thread_id", None)
+        if not chat_id:
+            continue
+        raw_last = str(getattr(session, "last_activity_at", "") or "")
+        try:
+            last_at = datetime.fromisoformat(raw_last)
+            if last_at.tzinfo is None:
+                last_at = last_at.replace(tzinfo=tz.utc)
+        except Exception:
+            last_at = datetime.min.replace(tzinfo=tz.utc)
+        session_rows.append((last_at, chat_id, message_thread_id))
+    if session_rows:
+        session_rows.sort(key=lambda row: row[0], reverse=True)
+        _, chat_id, message_thread_id = session_rows[0]
+        return chat_id, message_thread_id
     if config.ALLOWED_USER_IDS:
         admin_id = min(config.ALLOWED_USER_IDS)
         return admin_id, None
+    if config.ALLOWED_CHAT_IDS:
+        chat_id = min(config.ALLOWED_CHAT_IDS)
+        return chat_id, None
     return None
 
 

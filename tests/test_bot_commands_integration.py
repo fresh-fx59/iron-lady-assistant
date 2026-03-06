@@ -52,6 +52,7 @@ from src.bot import (
     _queue_pending_input,
     _first_unapplied_step_index,
     bootstrap_step_plan_after_restart,
+    _latest_scope_target,
     VALID_MODELS,
 )
 
@@ -810,6 +811,27 @@ class TestStepPlanCommands:
         call = manager.submit.await_args.kwargs
         assert "Step plan 2/2 running" in call["feedback_title"]
         manager.bot.send_message.assert_awaited_once()
+
+    async def test_latest_scope_target_uses_session_fallback(self, monkeypatch):
+        monkeypatch.setattr("src.bot._load_scope_snapshots", lambda: {})
+        monkeypatch.setattr("src.bot.config.ALLOWED_USER_IDS", set())
+        monkeypatch.setattr("src.bot.config.ALLOWED_CHAT_IDS", set())
+        fake_session = type(
+            "S",
+            (),
+            {
+                "chat_id": -100123,
+                "message_thread_id": 42,
+                "last_activity_at": "2026-03-06T05:00:00+00:00",
+            },
+        )()
+        monkeypatch.setattr(
+            "src.bot.session_manager",
+            type("Mgr", (), {"sessions": {"-100123:42": fake_session}})(),
+        )
+
+        target = _latest_scope_target()
+        assert target == (-100123, 42)
 
 
 @pytest.mark.asyncio

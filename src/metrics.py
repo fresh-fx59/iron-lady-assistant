@@ -67,6 +67,12 @@ BG_TASKS_TOTAL = Counter(
     ["status"],  # completed, failed, cancelled, timeout
 )
 
+COST_GUARDRAIL_EVENTS = Counter(
+    "telegrambot_cost_guardrail_events_total",
+    "Cost guardrail anomaly events and actions",
+    ["anomaly", "action", "source"],
+)
+
 # Current model gauge (set per chat, last used)
 CURRENT_MODEL = Gauge(
     "telegrambot_current_model",

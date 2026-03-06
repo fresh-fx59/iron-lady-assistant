@@ -34,6 +34,7 @@ from .bot import (
     schedule_manager,
     memory_manager,
     get_step_plan_observer,
+    get_cost_guardrail_observer,
     resume_step_plan_after_restart,
     resume_scope_snapshots_after_restart,
     set_step_plan_restart_callback,
@@ -147,7 +148,10 @@ async def main() -> None:
         alert_cooldown_minutes=AUTONOMY_ALERT_COOLDOWN_MINUTES,
     )
     set_step_plan_restart_callback(restart_process_for_step_plan)
-    task_manager = TaskManager(bot, observers=[autonomy_engine, get_step_plan_observer()])
+    task_manager = TaskManager(
+        bot,
+        observers=[autonomy_engine, get_step_plan_observer(), get_cost_guardrail_observer()],
+    )
     await task_manager.start()
     schedule_manager = ScheduleManager(task_manager, MEMORY_DIR / "schedules.db")
     await schedule_manager.start()

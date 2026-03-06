@@ -25,6 +25,7 @@ from aiogram.exceptions import TelegramAPIError
 from . import bridge, config, metrics, ocr, transcribe
 from .core.context_plugins import ContextPluginRegistry
 from . import context_compiler
+from .cost_guardrails import CostGuardrailEngine
 from .health_invariants import HealthInvariants
 from .identity import IdentityManager
 from .sessions import SessionManager, make_scope_key
@@ -51,6 +52,7 @@ task_manager: TaskManager | None = None  # Set in main()
 schedule_manager: ScheduleManager | None = None  # Set in main()
 _step_plan_restart_callback: Callable[[str], Awaitable[bool]] | None = None
 health_invariants = HealthInvariants()
+cost_guardrails = CostGuardrailEngine()
 
 # Restore persisted provider selections from sessions
 for _scope_id, _session in session_manager.sessions.items():
@@ -623,6 +625,46 @@ def get_step_plan_observer() -> StepPlanObserver:
     return _step_plan_observer
 
 
+class CostGuardrailObserver:
+    """Observer that evaluates background task cost anomalies per scope."""
+
+    async def on_task_finished(self, task) -> None:
+        if task.status not in (TaskStatus.COMPLETED, TaskStatus.FAILED):
+            return
+        scope_key = _scope_key(task.chat_id, task.message_thread_id)
+        event, anomalies = cost_guardrails.record_event(
+            scope_key=scope_key,
+            provider=task.provider_cli,
+            cost_usd=task.cost_usd,
+            empty_response=(not (task.response or "").strip()),
+            is_error=(task.status == TaskStatus.FAILED),
+            reason="background_task",
+        )
+        if not anomalies:
+            return
+        await _handle_cost_guardrail_anomalies(
+            source="background_task",
+            scope_key=scope_key,
+            chat_id=task.chat_id,
+            message_thread_id=task.message_thread_id,
+            anomalies=anomalies,
+        )
+        logger.info(
+            "cost_guardrail_event_recorded scope=%s provider=%s cost=%.6f reason=%s",
+            scope_key,
+            event.provider,
+            event.cost_usd,
+            event.reason,
+        )
+
+
+_cost_guardrail_observer = CostGuardrailObserver()
+
+
+def get_cost_guardrail_observer() -> CostGuardrailObserver:
+    return _cost_guardrail_observer
+
+
 async def resume_step_plan_after_restart() -> None:
     """Resume pending step plan on startup if active."""
     state = _load_step_plan_state()
@@ -857,6 +899,66 @@ def _clear_errors(scope_key: str) -> None:
 
 def _should_suggest_rollback(scope_key: str) -> bool:
     return _error_counts.get(scope_key, 0) >= 3
+
+
+def _cost_guardrail_actions_from_anomalies(anomalies: list[str]) -> list[str]:
+    actions: list[str] = []
+    if "sudden_cost_spike" in anomalies:
+        actions.append("model_downgrade_haiku")
+    if "provider_specific_drift" in anomalies:
+        actions.append("provider_reset")
+    if "repeated_empty_expensive_calls" in anomalies:
+        actions.append("session_reset")
+    return actions
+
+
+async def _handle_cost_guardrail_anomalies(
+    *,
+    source: str,
+    scope_key: str,
+    chat_id: int,
+    message_thread_id: int | None,
+    anomalies: list[str],
+) -> None:
+    if not anomalies:
+        return
+
+    actions = _cost_guardrail_actions_from_anomalies(anomalies)
+    for anomaly in anomalies:
+        if not actions:
+            metrics.COST_GUARDRAIL_EVENTS.labels(anomaly=anomaly, action="none", source=source).inc()
+            continue
+        for action in actions:
+            metrics.COST_GUARDRAIL_EVENTS.labels(anomaly=anomaly, action=action, source=source).inc()
+
+    if "model_downgrade_haiku" in actions:
+        session_manager.set_model(chat_id, "haiku", message_thread_id)
+    if "provider_reset" in actions:
+        provider = provider_manager.reset(scope_key)
+        session_manager.set_provider(chat_id, provider.name, message_thread_id)
+    if "session_reset" in actions:
+        session_manager.new_conversation(chat_id, message_thread_id)
+        session_manager.new_codex_conversation(chat_id, message_thread_id)
+
+    logger.warning(
+        "cost_guardrail_event source=%s scope=%s anomalies=%s actions=%s",
+        source,
+        scope_key,
+        ",".join(anomalies),
+        ",".join(actions) if actions else "none",
+    )
+
+    if task_manager:
+        details = (
+            f"Anomalies: <code>{html.escape(', '.join(anomalies))}</code>\n"
+            f"Actions: <code>{html.escape(', '.join(actions) if actions else 'none')}</code>"
+        )
+        await task_manager.bot.send_message(
+            chat_id=chat_id,
+            message_thread_id=message_thread_id,
+            text=f"⚠️ <b>Cost guardrail triggered</b>\n{details}",
+            parse_mode="HTML",
+        )
 
 
 def _is_duplicate_outbound(scope_key: str, text: str, *, ttl_seconds: int = 120) -> bool:
@@ -2673,6 +2775,7 @@ async def _handle_message_inner(message: Message, override_text: str | None = No
         await progress.show_working()
 
         final_response: bridge.ClaudeResponse | None = None
+        response_empty = False
 
         try:
             provider = provider_manager.get_provider(scope_key)
@@ -2878,6 +2981,7 @@ async def _handle_message_inner(message: Message, override_text: str | None = No
 
                 if not chunks:
                     if not media_refs:
+                        response_empty = True
                         health_invariants.record_empty_response(is_empty=True)
                         logger.warning(
                             "Chat %d: Got empty response object - text='%s', is_error=%s, session_id=%s, cost=%.6f",
@@ -2925,6 +3029,31 @@ async def _handle_message_inner(message: Message, override_text: str | None = No
                 reply_markup=reply_markup,
             )
             await progress.finish()
+
+        if final_response and not state.cancel_requested:
+            event, anomalies = cost_guardrails.record_event(
+                scope_key=scope_key,
+                provider=provider.name,
+                cost_usd=final_response.cost_usd,
+                empty_response=response_empty,
+                is_error=final_response.is_error,
+                reason="foreground",
+            )
+            if anomalies:
+                await _handle_cost_guardrail_anomalies(
+                    source="foreground",
+                    scope_key=scope_key,
+                    chat_id=chat_id,
+                    message_thread_id=thread_id,
+                    anomalies=anomalies,
+                )
+            logger.info(
+                "cost_guardrail_event_recorded scope=%s provider=%s cost=%.6f reason=%s",
+                scope_key,
+                event.provider,
+                event.cost_usd,
+                event.reason,
+            )
 
         # Update session ID if we got one back
         if (

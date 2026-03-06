@@ -48,6 +48,7 @@ from src.bot import (
     get_active_work_summary,
     should_restart_step_plan_now,
     _is_duplicate_outbound,
+    _cost_guardrail_actions_from_anomalies,
     VALID_MODELS,
 )
 
@@ -953,6 +954,18 @@ class TestModelValidation:
         assert "sonnet" in VALID_MODELS
         assert "opus" in VALID_MODELS
         assert "haiku" in VALID_MODELS
+
+
+class TestCostGuardrailActions:
+    def test_action_mapping(self):
+        actions = _cost_guardrail_actions_from_anomalies(
+            ["sudden_cost_spike", "provider_specific_drift", "repeated_empty_expensive_calls"]
+        )
+        assert actions == [
+            "model_downgrade_haiku",
+            "provider_reset",
+            "session_reset",
+        ]
 
 
 class TestCodexTransientRetries:

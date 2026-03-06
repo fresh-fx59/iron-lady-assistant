@@ -119,6 +119,8 @@ All settings are read from `.env`.
 - `LOCAL_TTS_MIN_INTELLIGIBILITY_SCORE` (optional, default `0.55`): minimum similarity score for accepted voice output
 - `LOCAL_TTS_SHERPA_MIN_INTELLIGIBILITY_SCORE` (optional, default `0.35`): softer threshold for sherpa outputs to preserve natural speech quality
 - `LOCAL_TTS_VERIFY_MAX_CHARS` (optional, default `260`): skip verification for long texts to keep latency bounded
+- `LOCAL_TTS_VERIFY_SHERPA` (optional, default `0`): verify sherpa output via whisper.cpp; keep off to avoid false rejections
+- `LOCAL_TTS_STRICT_CYRILLIC_QUALITY` (optional, default `1`): for Cyrillic text, prefer sherpa-only path and avoid espeak fallback unless sherpa fails hard
 - `LOCAL_TTS_OPUS_BITRATE` (optional, default `64k`): Opus bitrate for voice-note encoding quality
 - `LOCAL_TTS_FFMPEG_AF` (optional, default empty): ffmpeg audio filter chain, disabled by default to keep natural timbre
 - `SHERPA_ONNX_RUNTIME_DIR` (optional): sherpa runtime dir for offline neural TTS

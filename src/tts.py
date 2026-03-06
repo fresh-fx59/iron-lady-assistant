@@ -72,6 +72,12 @@ TTS_FFMPEG_AF: str = os.getenv(
     "LOCAL_TTS_FFMPEG_AF",
     "",
 ).strip()
+TTS_VERIFY_SHERPA: bool = (
+    os.getenv("LOCAL_TTS_VERIFY_SHERPA", "0").strip().lower() not in {"0", "false", "no"}
+)
+TTS_STRICT_CYRILLIC_QUALITY: bool = (
+    os.getenv("LOCAL_TTS_STRICT_CYRILLIC_QUALITY", "1").strip().lower() not in {"0", "false", "no"}
+)
 
 _CODE_BLOCK_RE = re.compile(r"```.*?```", re.DOTALL)
 _INLINE_CODE_RE = re.compile(r"`[^`]+`")
@@ -302,16 +308,24 @@ async def synthesize_voice(text: str) -> str:
                 seen.add(key)
                 attempts.append(key)
 
+        cyrillic_text = _is_cyrillic_dominant(spoken_text)
         if use_sherpa:
             add_attempt("sherpa")
-        add_attempt("espeak", selected_voice, selected_speed)
-        try:
-            slower_speed = str(max(120, int(selected_speed) - 20))
-        except ValueError:
-            slower_speed = "150"
-        add_attempt("espeak", selected_voice, slower_speed)
-        if selected_voice != TTS_VOICE_LATIN:
-            add_attempt("espeak", TTS_VOICE_LATIN, TTS_SPEED_LATIN)
+        # Keep Russian quality stable: avoid espeak fallback unless sherpa is unavailable or strict mode disabled.
+        allow_espeak_attempts = not (
+            TTS_STRICT_CYRILLIC_QUALITY
+            and cyrillic_text
+            and use_sherpa
+        )
+        if allow_espeak_attempts:
+            add_attempt("espeak", selected_voice, selected_speed)
+            try:
+                slower_speed = str(max(120, int(selected_speed) - 20))
+            except ValueError:
+                slower_speed = "150"
+            add_attempt("espeak", selected_voice, slower_speed)
+            if selected_voice != TTS_VOICE_LATIN:
+                add_attempt("espeak", TTS_VOICE_LATIN, TTS_SPEED_LATIN)
 
         errors: list[str] = []
         for engine, voice, speed in attempts:
@@ -335,16 +349,19 @@ async def synthesize_voice(text: str) -> str:
                 errors.append("ogg output missing")
                 continue
 
-            min_score = (
-                TTS_SHERPA_MIN_INTELLIGIBILITY_SCORE
-                if engine == "sherpa"
-                else TTS_MIN_INTELLIGIBILITY_SCORE
-            )
-            ok, detail = await _verify_intelligibility(
-                ogg_path,
-                spoken_text,
-                min_score=min_score,
-            )
+            if engine == "sherpa" and not TTS_VERIFY_SHERPA:
+                ok, detail = True, "sherpa verification disabled"
+            else:
+                min_score = (
+                    TTS_SHERPA_MIN_INTELLIGIBILITY_SCORE
+                    if engine == "sherpa"
+                    else TTS_MIN_INTELLIGIBILITY_SCORE
+                )
+                ok, detail = await _verify_intelligibility(
+                    ogg_path,
+                    spoken_text,
+                    min_score=min_score,
+                )
             if ok:
                 cleanup_file(str(wav_path))
                 return str(ogg_path)

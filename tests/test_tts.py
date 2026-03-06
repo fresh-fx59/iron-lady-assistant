@@ -81,6 +81,8 @@ async def test_synthesize_voice_prefers_sherpa_for_cyrillic(monkeypatch):
 async def test_synthesize_voice_retries_when_intelligibility_low(monkeypatch):
     monkeypatch.setattr(tts, "_prepare_spoken_text", lambda _text: "Привет, Алекс")
     monkeypatch.setattr(tts, "TTS_ENGINE", "auto")
+    monkeypatch.setattr(tts, "TTS_STRICT_CYRILLIC_QUALITY", False)
+    monkeypatch.setattr(tts, "TTS_VERIFY_SHERPA", True)
     monkeypatch.setattr(tts, "_sherpa_available", lambda: True)
     monkeypatch.setattr(tts, "_run_sherpa_to_wav", AsyncMock(return_value=(0, "")))
     monkeypatch.setattr(tts, "_run_tts_to_wav", AsyncMock(return_value=(0, "")))

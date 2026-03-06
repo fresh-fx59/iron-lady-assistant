@@ -1190,6 +1190,14 @@ async def resume_scope_snapshots_after_restart() -> None:
             continue
 
         state = _get_state(scope_key)
+        chat_id = int(row.get("chat_id") or 0)
+        message_thread_id = row.get("message_thread_id")
+        stale_resume_task_id = str(row.get("resume_task_id") or "").strip()
+        if stale_resume_task_id:
+            # Task IDs from previous process are stale after restart.
+            _update_scope_snapshot(scope_key, resume_task_id="")
+            row["resume_task_id"] = ""
+
         pending_inputs = list(row.get("pending_inputs") or [])
         inflight_inputs = list(row.get("inflight_pending_inputs") or [])
         inflight_hash = str(row.get("inflight_pending_hash") or "")
@@ -1212,15 +1220,17 @@ async def resume_scope_snapshots_after_restart() -> None:
                 f"Recovered {len(restored)} queued input item(s) after restart."
             )
 
+        resumed_task_id = ""
         if bool(row.get("processing")) and str(row.get("active_prompt") or "").strip():
-            if str(row.get("resume_task_id") or "").strip():
-                continue
-            chat_id = int(row.get("chat_id") or 0)
-            message_thread_id = row.get("message_thread_id")
             active_prompt = str(row.get("active_prompt") or "")
             active_provider_cli = str(row.get("active_provider_cli") or "claude")
             active_model = str(row.get("active_model") or "sonnet")
             active_resume_arg = str(row.get("active_resume_arg") or "")
+            followup_context = _build_midflight_followup_prompt(restored)
+            if followup_context:
+                # Consume restored queue into resumed prompt to preserve ordering.
+                _drain_pending_inputs(state)
+                active_prompt = f"{active_prompt.rstrip()}\n\n{followup_context}"
             if active_provider_cli == "codex" and active_model in {"", "default"}:
                 session = _session_manager().get(chat_id, message_thread_id)
                 if session.codex_model and session.codex_model != "default":
@@ -1238,7 +1248,7 @@ async def resume_scope_snapshots_after_restart() -> None:
                 else str(row.get("claude_session_id") or "")
             ) or None
             prompt = _build_augmented_prompt(active_prompt)
-            resume_task_id = await tm.submit(
+            resumed_task_id = await tm.submit(
                 chat_id=chat_id,
                 user_id=chat_id,
                 prompt=prompt,
@@ -1252,19 +1262,58 @@ async def resume_scope_snapshots_after_restart() -> None:
             )
             _update_scope_snapshot(
                 scope_key,
+                state=state,
                 processing=False,
                 active_prompt="",
                 active_provider_cli="",
                 active_model="",
                 active_resume_arg="",
-                resume_task_id=resume_task_id,
+                resume_task_id=resumed_task_id,
             )
-            resumed_lines.append(f"{scope_key}: resumed interrupted run as task {resume_task_id[:8]}")
+            resumed_lines.append(f"{scope_key}: resumed interrupted run as task {resumed_task_id[:8]}")
             notice_lines.append(
-                f"Resuming interrupted request as task <code>{html.escape(resume_task_id[:8])}</code>."
+                f"Resuming interrupted request as task <code>{html.escape(resumed_task_id[:8])}</code>."
             )
 
-        chat_id = int(row.get("chat_id") or 0)
+        if restored and not resumed_task_id and chat_id:
+            followup_prompt = _build_midflight_followup_prompt(restored)
+            if followup_prompt:
+                _drain_pending_inputs(state)
+                provider = _provider_manager().get_provider(scope_key)
+                provider_cli = provider.cli if _find_provider_cli(provider.cli) else "claude"
+                resume_arg = provider.resume_arg if provider_cli == "codex" else None
+                session = _session_manager().get(chat_id, message_thread_id)
+                session_id = (
+                    session.codex_session_id if provider_cli == "codex" else session.claude_session_id
+                )
+                task_model = _codex_task_model(session, provider) if provider_cli == "codex" else session.model
+                resumed_task_id = await tm.submit(
+                    chat_id=chat_id,
+                    user_id=chat_id,
+                    prompt=_build_augmented_prompt(followup_prompt),
+                    model=task_model,
+                    session_id=session_id,
+                    message_thread_id=message_thread_id,
+                    provider_cli=provider_cli,
+                    resume_arg=resume_arg,
+                    live_feedback=True,
+                    feedback_title="🔄 <b>Resuming queued context after restart...</b>",
+                )
+                _update_scope_snapshot(
+                    scope_key,
+                    state=state,
+                    processing=False,
+                    active_prompt="",
+                    active_provider_cli="",
+                    active_model="",
+                    active_resume_arg="",
+                    resume_task_id=resumed_task_id,
+                )
+                resumed_lines.append(f"{scope_key}: resumed queued context as task {resumed_task_id[:8]}")
+                notice_lines.append(
+                    f"Queued recovered context as task <code>{html.escape(resumed_task_id[:8])}</code>."
+                )
+
         if notice_lines and chat_id:
             try:
                 await tm.bot.send_message(

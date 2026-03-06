@@ -1234,7 +1234,7 @@ class TestStepPlanCommands:
 
 @pytest.mark.asyncio
 class TestScopeSnapshotRecovery:
-    async def test_restore_pending_inputs_after_restart(self, monkeypatch):
+    async def test_restore_pending_inputs_after_restart_queues_followup(self, monkeypatch):
         manager = AsyncMock()
         manager.bot = AsyncMock()
         manager.bot.send_message = AsyncMock()
@@ -1263,7 +1263,11 @@ class TestScopeSnapshotRecovery:
         await resume_scope_snapshots_after_restart()
 
         state = _get_state("123456789:main")
-        assert state.pending_inputs == ["remember this"]
+        assert state.pending_inputs == []
+        manager.submit.assert_awaited_once()
+        call = manager.submit.await_args.kwargs
+        assert "Additional user information arrived while the previous response was being generated." in call["prompt"]
+        assert "remember this" in call["prompt"]
         assert manager.bot.send_message.await_count >= 1
 
     async def test_resume_interrupted_run_after_restart(self, monkeypatch):
@@ -1305,6 +1309,46 @@ class TestScopeSnapshotRecovery:
         assert call["model"] == "gpt-5-codex"
         assert call["session_id"] == "sess-codex-1"
         assert call["live_feedback"] is True
+
+    async def test_resume_interrupted_run_includes_restored_queue_context(self, monkeypatch):
+        manager = AsyncMock()
+        manager.bot = AsyncMock()
+        manager.bot.send_message = AsyncMock()
+        manager.submit = AsyncMock(return_value="task-resume-1234")
+        monkeypatch.setattr("src.bot.task_manager", manager)
+        monkeypatch.setattr("src.bot.config.ALLOWED_USER_IDS", {123456789})
+        monkeypatch.setattr("src.bot.config.SCOPE_SNAPSHOT_ENABLED", True)
+        monkeypatch.setattr("src.bot.config.SCOPE_SNAPSHOT_MAX_AGE_MINUTES", 180)
+
+        _save_scope_snapshots(
+            {
+                "123456789:main": {
+                    "scope_key": "123456789:main",
+                    "chat_id": 123456789,
+                    "message_thread_id": None,
+                    "pending_inputs": ["also add Gemini guardrails"],
+                    "inflight_pending_inputs": [],
+                    "inflight_pending_hash": "",
+                    "completed_pending_hashes": [],
+                    "processing": True,
+                    "active_prompt": "continue this work",
+                    "active_provider_cli": "codex",
+                    "active_model": "gpt-5-codex",
+                    "active_resume_arg": "auto",
+                    "codex_session_id": "sess-codex-1",
+                    "updated_at": datetime.now(timezone.utc).isoformat(),
+                }
+            }
+        )
+
+        await resume_scope_snapshots_after_restart()
+
+        manager.submit.assert_awaited_once()
+        call = manager.submit.await_args.kwargs
+        assert "continue this work" in call["prompt"]
+        assert "also add Gemini guardrails" in call["prompt"]
+        state = _get_state("123456789:main")
+        assert state.pending_inputs == []
 
     async def test_resume_interrupted_codex_default_model_uses_explicit_model(self, monkeypatch):
         manager = AsyncMock()
@@ -1352,6 +1396,43 @@ class TestScopeSnapshotRecovery:
         assert call["model"] == "gpt-5-codex"
         assert call["session_id"] == "sess-codex-1"
         assert call["live_feedback"] is True
+
+    async def test_resume_ignores_stale_resume_task_marker(self, monkeypatch):
+        manager = AsyncMock()
+        manager.bot = AsyncMock()
+        manager.bot.send_message = AsyncMock()
+        manager.submit = AsyncMock(return_value="task-resume-new")
+        monkeypatch.setattr("src.bot.task_manager", manager)
+        monkeypatch.setattr("src.bot.config.ALLOWED_USER_IDS", {123456789})
+        monkeypatch.setattr("src.bot.config.SCOPE_SNAPSHOT_ENABLED", True)
+        monkeypatch.setattr("src.bot.config.SCOPE_SNAPSHOT_MAX_AGE_MINUTES", 180)
+
+        _save_scope_snapshots(
+            {
+                "123456789:main": {
+                    "scope_key": "123456789:main",
+                    "chat_id": 123456789,
+                    "message_thread_id": None,
+                    "pending_inputs": [],
+                    "inflight_pending_inputs": [],
+                    "inflight_pending_hash": "",
+                    "completed_pending_hashes": [],
+                    "processing": True,
+                    "active_prompt": "continue this work",
+                    "active_provider_cli": "claude",
+                    "active_model": "sonnet",
+                    "active_resume_arg": "",
+                    "resume_task_id": "task-stale-old-process",
+                    "updated_at": datetime.now(timezone.utc).isoformat(),
+                }
+            }
+        )
+
+        await resume_scope_snapshots_after_restart()
+
+        manager.submit.assert_awaited_once()
+        snapshots = _load_scope_snapshots()
+        assert snapshots["123456789:main"]["resume_task_id"] == "task-resume-new"
 
     async def test_restart_recovery_notifies_original_thread(self, monkeypatch):
         manager = AsyncMock()

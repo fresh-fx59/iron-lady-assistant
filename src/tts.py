@@ -24,6 +24,36 @@ TTS_SPEED_CYRILLIC: str = os.getenv("LOCAL_TTS_SPEED_WPM_CYRILLIC", "170")
 TTS_SPEED_LATIN: str = os.getenv("LOCAL_TTS_SPEED_WPM_LATIN", TTS_SPEED)
 TTS_MAX_CHARS: int = int(os.getenv("LOCAL_TTS_MAX_CHARS", "1200"))
 FFMPEG_BIN: str = shutil.which("ffmpeg") or str(_LOCAL_BIN / "ffmpeg")
+TTS_ENGINE: str = os.getenv("LOCAL_TTS_ENGINE", "auto").strip().lower()
+
+SHERPA_RUNTIME_DIR: str = os.getenv(
+    "SHERPA_ONNX_RUNTIME_DIR",
+    str(Path.home() / "local" / "sherpa-onnx-tts" / "runtime"),
+)
+SHERPA_MODEL_DIR: str = os.getenv(
+    "SHERPA_ONNX_MODEL_DIR",
+    str(Path.home() / "local" / "sherpa-onnx-tts" / "models" / "vits-piper-ru_RU-ruslan-medium"),
+)
+SHERPA_MODEL_FILE: str = os.getenv(
+    "SHERPA_ONNX_MODEL_FILE",
+    str(Path(SHERPA_MODEL_DIR) / "ru_RU-ruslan-medium.onnx"),
+)
+SHERPA_TOKENS_FILE: str = os.getenv(
+    "SHERPA_ONNX_TOKENS_FILE",
+    str(Path(SHERPA_MODEL_DIR) / "tokens.txt"),
+)
+SHERPA_DATA_DIR: str = os.getenv(
+    "SHERPA_ONNX_DATA_DIR",
+    str(Path(SHERPA_MODEL_DIR) / "espeak-ng-data"),
+)
+SHERPA_BIN: str = os.getenv(
+    "SHERPA_ONNX_TTS_BIN",
+    str(Path(SHERPA_RUNTIME_DIR) / "bin" / "sherpa-onnx-offline-tts"),
+)
+SHERPA_LIB_DIR: str = os.getenv(
+    "SHERPA_ONNX_LIB_DIR",
+    str(Path(SHERPA_RUNTIME_DIR) / "lib"),
+)
 
 _CODE_BLOCK_RE = re.compile(r"```.*?```", re.DOTALL)
 _INLINE_CODE_RE = re.compile(r"`[^`]+`")
@@ -41,6 +71,16 @@ def is_available() -> bool:
         and os.path.isfile(FFMPEG_BIN)
         and os.access(FFMPEG_BIN, os.X_OK)
     )
+
+
+def _sherpa_available() -> bool:
+    required_files = (
+        SHERPA_BIN,
+        SHERPA_MODEL_FILE,
+        SHERPA_TOKENS_FILE,
+        SHERPA_DATA_DIR,
+    )
+    return all(os.path.exists(path) for path in required_files)
 
 
 def _prepare_spoken_text(text: str) -> str:
@@ -103,6 +143,35 @@ async def _run_tts_to_wav(
     return tts_proc.returncode, tts_stderr.decode(errors="ignore")
 
 
+async def _run_sherpa_to_wav(spoken_text: str, wav_path: Path) -> tuple[int, str]:
+    env = os.environ.copy()
+    if SHERPA_LIB_DIR and os.path.isdir(SHERPA_LIB_DIR):
+        env["LD_LIBRARY_PATH"] = (
+            f"{SHERPA_LIB_DIR}:{env.get('LD_LIBRARY_PATH', '')}"
+            if env.get("LD_LIBRARY_PATH")
+            else SHERPA_LIB_DIR
+        )
+    proc = await asyncio.create_subprocess_exec(
+        SHERPA_BIN,
+        f"--vits-model={SHERPA_MODEL_FILE}",
+        f"--vits-tokens={SHERPA_TOKENS_FILE}",
+        f"--vits-data-dir={SHERPA_DATA_DIR}",
+        f"--output-filename={wav_path}",
+        spoken_text,
+        stdout=asyncio.subprocess.DEVNULL,
+        stderr=asyncio.subprocess.PIPE,
+        env=env,
+    )
+    _, stderr = await proc.communicate()
+    return proc.returncode, stderr.decode(errors="ignore")
+
+
+def _is_cyrillic_dominant(text: str) -> bool:
+    cyr = len(_CYRILLIC_RE.findall(text))
+    lat = len(_LATIN_RE.findall(text))
+    return cyr > lat
+
+
 async def synthesize_voice(text: str) -> str:
     """Synthesize text to OGG/Opus suitable for Telegram sendVoice."""
     spoken_text = _prepare_spoken_text(text)
@@ -114,26 +183,43 @@ async def synthesize_voice(text: str) -> str:
     ogg_path = tmp_dir / "speech.ogg"
 
     try:
-        selected_voice = _select_voice(spoken_text)
-        selected_speed = _select_speed(spoken_text)
-        code, stderr_text = await _run_tts_to_wav(
-            spoken_text,
-            wav_path,
-            selected_voice,
-            selected_speed,
-        )
-        if code != 0 and selected_voice != TTS_VOICE_LATIN:
-            logger.warning(
-                "TTS failed with voice '%s', retrying with fallback '%s'",
-                selected_voice,
-                TTS_VOICE_LATIN,
+        use_sherpa = (
+            TTS_ENGINE == "sherpa"
+            or (
+                TTS_ENGINE == "auto"
+                and _is_cyrillic_dominant(spoken_text)
+                and _sherpa_available()
             )
+        )
+
+        code = 1
+        stderr_text = ""
+        if use_sherpa:
+            code, stderr_text = await _run_sherpa_to_wav(spoken_text, wav_path)
+            if code != 0:
+                logger.warning("Sherpa TTS failed, falling back to espeak: %s", stderr_text[-200:])
+
+        if code != 0:
+            selected_voice = _select_voice(spoken_text)
+            selected_speed = _select_speed(spoken_text)
             code, stderr_text = await _run_tts_to_wav(
                 spoken_text,
                 wav_path,
-                TTS_VOICE_LATIN,
-                TTS_SPEED_LATIN,
+                selected_voice,
+                selected_speed,
             )
+            if code != 0 and selected_voice != TTS_VOICE_LATIN:
+                logger.warning(
+                    "TTS failed with voice '%s', retrying with fallback '%s'",
+                    selected_voice,
+                    TTS_VOICE_LATIN,
+                )
+                code, stderr_text = await _run_tts_to_wav(
+                    spoken_text,
+                    wav_path,
+                    TTS_VOICE_LATIN,
+                    TTS_SPEED_LATIN,
+                )
         if code != 0:
             raise RuntimeError(f"TTS synthesis failed: {stderr_text[-200:]}")
 

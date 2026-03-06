@@ -110,10 +110,13 @@ All settings are read from `.env`.
 - `LOCAL_TTS_VOICE` (optional, default `auto`): voice selection mode/preset (`auto` picks by text script)
 - `LOCAL_TTS_VOICE_CYRILLIC` (optional, default `ru`): preferred voice preset for Cyrillic-heavy text
 - `LOCAL_TTS_VOICE_LATIN` (optional, default `en`): preferred voice preset for Latin-heavy text
+- `LOCAL_TTS_ENGINE` (optional, default `auto`): `auto`/`sherpa`/`espeak` local TTS engine selection
 - `LOCAL_TTS_SPEED_WPM` (optional, default `220`): local TTS speech speed in words per minute
 - `LOCAL_TTS_SPEED_WPM_CYRILLIC` (optional, default `170`): speech speed for Cyrillic-heavy text
 - `LOCAL_TTS_SPEED_WPM_LATIN` (optional, default `220`): speech speed for Latin-heavy text
 - `LOCAL_TTS_MAX_CHARS` (optional, default `1200`): max text length sent to TTS after cleanup
+- `SHERPA_ONNX_RUNTIME_DIR` (optional): sherpa runtime dir for offline neural TTS
+- `SHERPA_ONNX_MODEL_DIR` (optional): sherpa model dir (for example `vits-piper-ru_RU-ruslan-medium`)
 
 ## Upgrade and Rollback
 

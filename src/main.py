@@ -30,8 +30,6 @@ from .config import (
 from .bot import (
     router,
     provider_manager,
-    task_manager,
-    schedule_manager,
     memory_manager,
     get_step_plan_observer,
     get_cost_guardrail_observer,
@@ -41,6 +39,7 @@ from .bot import (
     set_step_plan_restart_callback,
     should_restart_step_plan_now,
 )
+from . import bot as bot_module
 from .metrics import start_metrics_server
 from .autonomy import AutonomyEngine, LearningJournal
 
@@ -136,7 +135,6 @@ async def main() -> None:
     dp.startup.register(send_ready_notification)
 
     # Initialize task manager
-    global task_manager, schedule_manager
     from .tasks import TaskManager
     from .scheduler import ScheduleManager
     autonomy_engine = AutonomyEngine(
@@ -149,13 +147,13 @@ async def main() -> None:
         alert_cooldown_minutes=AUTONOMY_ALERT_COOLDOWN_MINUTES,
     )
     set_step_plan_restart_callback(restart_process_for_step_plan)
-    task_manager = TaskManager(
+    bot_module.task_manager = TaskManager(
         bot,
         observers=[autonomy_engine, get_step_plan_observer(), get_cost_guardrail_observer()],
     )
-    await task_manager.start()
-    schedule_manager = ScheduleManager(task_manager, MEMORY_DIR / "schedules.db")
-    await schedule_manager.start()
+    await bot_module.task_manager.start()
+    bot_module.schedule_manager = ScheduleManager(bot_module.task_manager, MEMORY_DIR / "schedules.db")
+    await bot_module.schedule_manager.start()
 
     await bot.set_my_commands([
         BotCommand(command="start", description="Welcome message"),
@@ -205,10 +203,10 @@ async def main() -> None:
             ),
         )
     finally:
-        if schedule_manager:
-            await schedule_manager.stop()
-        if task_manager:
-            await task_manager.stop()
+        if bot_module.schedule_manager:
+            await bot_module.schedule_manager.stop()
+        if bot_module.task_manager:
+            await bot_module.task_manager.stop()
         provider_manager.shutdown()
         await bot.session.close()
 

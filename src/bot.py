@@ -604,7 +604,14 @@ async def _submit_current_step_plan_task(state: dict) -> str:
     chat_id = int(state.get("chat_id") or 0)
     message_thread_id = state.get("message_thread_id")
     user_id = int(state.get("user_id") or 0)
+    scope_key = _scope_key(chat_id, message_thread_id)
+    provider = provider_manager.get_provider(scope_key)
     session = session_manager.get(chat_id, message_thread_id)
+    provider_cli = provider.cli if _find_provider_cli(provider.cli) else "claude"
+    resume_arg = provider.resume_arg if provider_cli == "codex" else None
+    session_id = (
+        session.codex_session_id if provider_cli == "codex" else session.claude_session_id
+    )
 
     task_id = await task_manager.submit(
         chat_id=chat_id,
@@ -612,7 +619,9 @@ async def _submit_current_step_plan_task(state: dict) -> str:
         user_id=user_id,
         prompt=full_prompt,
         model=session.model,
-        session_id=session.claude_session_id,
+        session_id=session_id,
+        provider_cli=provider_cli,
+        resume_arg=resume_arg,
         live_feedback=True,
         feedback_title=(
             f"🛠️ <b>Step plan {current_index + 1}/{len(steps)} running...</b>\n"
@@ -2446,7 +2455,14 @@ async def cmd_bg(message: Message) -> None:
 
     chat_id = message.chat.id
     thread_id = _thread_id(message)
+    scope_key = _scope_key(chat_id, thread_id)
+    provider = provider_manager.get_provider(scope_key)
     session = session_manager.get(chat_id, thread_id)
+    provider_cli = provider.cli if _find_provider_cli(provider.cli) else "claude"
+    resume_arg = provider.resume_arg if provider_cli == "codex" else None
+    session_id = (
+        session.codex_session_id if provider_cli == "codex" else session.claude_session_id
+    )
 
     full_prompt = _build_augmented_prompt(prompt)
 
@@ -2456,7 +2472,9 @@ async def cmd_bg(message: Message) -> None:
         user_id=_actor_id(message),
         prompt=full_prompt,
         model=session.model,
-        session_id=session.claude_session_id,
+        session_id=session_id,
+        provider_cli=provider_cli,
+        resume_arg=resume_arg,
     )
 
     lines = [

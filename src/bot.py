@@ -417,6 +417,22 @@ def _codex_model_arg(session: object, provider) -> str | None:
     return model
 
 
+def _codex_task_model(session: object, provider) -> str:
+    """Return explicit non-default Codex model for background execution."""
+    model = _codex_model_arg(session, provider)
+    if model:
+        return model
+
+    candidates: list[str] = []
+    if provider.model:
+        candidates.append(provider.model)
+    candidates.extend(provider.models or [])
+    for candidate in candidates:
+        if candidate and candidate != "default":
+            return candidate
+    return "gpt-5-codex"
+
+
 def _codex_working_dir() -> str:
     """Run Codex from user home so it can access files under that tree."""
     return str(Path.home())
@@ -536,7 +552,13 @@ async def cmd_model(message: Message) -> None:
     """Show model selection keyboard."""
     if not _is_authorized(message.from_user and message.from_user.id, message.chat.id):
         return
-    session = session_manager.get(message.chat.id)
+    chat_id = message.chat.id
+    provider = provider_manager.get_provider(chat_id)
+    session = session_manager.get(chat_id)
+    provider_cli = provider.cli if _find_provider_cli(provider.cli) else "claude"
+    resume_arg = provider.resume_arg if provider_cli == "codex" else None
+    session_id = session.codex_session_id if provider_cli == "codex" else session.claude_session_id
+    task_model = _codex_task_model(session, provider) if provider_cli == "codex" else session.model
     provider = _current_provider(message.chat.id)
     current = _current_model_label(session, provider)
 

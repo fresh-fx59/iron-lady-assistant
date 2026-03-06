@@ -10,7 +10,6 @@ environment variables passed to the subprocess). The first provider with an
 empty ``env`` is assumed to be the native Anthropic backend.
 """
 
-import asyncio
 import json
 import logging
 import os
@@ -21,6 +20,8 @@ from pathlib import Path
 from threading import Thread
 from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
+
+from . import config
 
 logger = logging.getLogger(__name__)
 
@@ -225,9 +226,12 @@ class ProviderManager:
             return False
         return any(pat.search(text) for pat in self._cfg.rate_limit_patterns)
 
-    def subprocess_env(self, provider: Provider) -> dict[str, str]:
+    def subprocess_env(self, provider: Provider, *, allow_gemini_api: bool = True) -> dict[str, str]:
         """Build subprocess environment with provider's env vars applied."""
         env = os.environ.copy()
         env.pop("CLAUDECODE", None)
         env.update(provider.env)
+        if config.GEMINI_IMAGE_ONLY_MODE and not allow_gemini_api:
+            for key in ("GEMINI_API_KEY", "GOOGLE_API_KEY", "GOOGLE_GENERATIVE_AI_API_KEY"):
+                env.pop(key, None)
         return env

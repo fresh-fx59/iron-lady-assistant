@@ -167,3 +167,42 @@ def test_guardrail_blocks_risky_when_approval_required(tmp_path: Path) -> None:
 
     assert '<tool name="discord">' not in context
     assert "Guardrail-blocked tools: discord (requires-approval)" in context
+
+
+def test_guardrail_blocks_gemini_outside_image_generation(tmp_path: Path) -> None:
+    (tmp_path / "gemini.yaml").write_text(
+        "\n".join(
+            [
+                "name: gemini",
+                "description: Gemini tool",
+                "tier: extended",
+                "triggers: [gemini]",
+                "instructions: |",
+                "  Use gemini tool.",
+            ]
+        )
+    )
+    registry = PluginToolRegistry(tmp_path)
+    context = registry.build_context("USE_TOOL: gemini\nPlease summarize this repo.")
+
+    assert '<tool name="gemini">' not in context
+    assert "Guardrail-blocked tools: gemini (gemini-image-only)" in context
+
+
+def test_guardrail_allows_gemini_for_image_generation(tmp_path: Path) -> None:
+    (tmp_path / "gemini.yaml").write_text(
+        "\n".join(
+            [
+                "name: gemini",
+                "description: Gemini tool",
+                "tier: extended",
+                "triggers: [gemini]",
+                "instructions: |",
+                "  Use gemini tool.",
+            ]
+        )
+    )
+    registry = PluginToolRegistry(tmp_path)
+    context = registry.build_context("USE_TOOL: gemini\nGenerate image of a red fox in snow.")
+
+    assert '<tool name="gemini">' in context

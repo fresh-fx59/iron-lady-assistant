@@ -26,6 +26,8 @@ from typing import Literal
 
 import yaml
 
+from .. import config
+
 logger = logging.getLogger(__name__)
 _USE_TOOL_PATTERN = re.compile(r"^\s*USE_TOOL:\s*([A-Za-z0-9_.-]+)\s*$", re.IGNORECASE | re.MULTILINE)
 ToolTier = Literal["core", "extended"]
@@ -140,10 +142,37 @@ class ToolRegistry:
             logger.warning("Failed to load tool definition %s: %s", name, exc)
             return None
 
-    def _check_guardrails(self, manifest: ToolManifest) -> str | None:
+    @staticmethod
+    def _is_image_generation_message(message: str) -> bool:
+        text = (message or "").lower()
+        if not text:
+            return False
+        image_markers = (
+            "image generation",
+            "generate image",
+            "create image",
+            "edit image",
+            "nano-banana-pro",
+            "openai-image-gen",
+            "use_tool: nano-banana-pro",
+            "use_tool: openai-image-gen",
+            "картин",
+            "изображ",
+            "сгенерируй изображ",
+            "создай изображ",
+        )
+        return any(marker in text for marker in image_markers)
+
+    def _check_guardrails(self, manifest: ToolManifest, user_message: str) -> str | None:
         name = manifest.name.lower()
         if name in self._denylist:
             return "denylisted"
+        if (
+            config.GEMINI_IMAGE_ONLY_MODE
+            and name in {"gemini", "summarize"}
+            and not self._is_image_generation_message(user_message)
+        ):
+            return "gemini-image-only"
         if self._require_approval_for_risky and manifest.risky:
             return "requires-approval"
         return None
@@ -165,7 +194,7 @@ class ToolRegistry:
             full = self._load_full(name)
             if not full:
                 continue
-            blocked_reason = self._check_guardrails(full.manifest)
+            blocked_reason = self._check_guardrails(full.manifest, user_message)
             if blocked_reason:
                 blocked.append(f"{full.manifest.name} ({blocked_reason})")
                 continue
@@ -185,7 +214,7 @@ class ToolRegistry:
                 if trigger.lower() in msg_lower:
                     full = self._load_full(manifest.name)
                     if full and full.manifest.name not in seen_names:
-                        blocked_reason = self._check_guardrails(full.manifest)
+                        blocked_reason = self._check_guardrails(full.manifest, user_message)
                         if blocked_reason:
                             blocked.append(f"{full.manifest.name} ({blocked_reason})")
                             break

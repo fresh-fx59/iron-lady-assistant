@@ -1534,6 +1534,46 @@ def _inject_tool_request(prompt_text: str, tool_name: str) -> str:
     return f"{base}\n\nUSE_TOOL: {tool_name}\n"
 
 
+def _is_image_generation_request(text: str) -> bool:
+    normalized = (text or "").lower()
+    if not normalized:
+        return False
+    requested_tools = set(ToolRegistry.extract_requested_tools(text))
+    if requested_tools & {"nano-banana-pro", "openai-image-gen"}:
+        return True
+    markers = (
+        "image generation",
+        "generate image",
+        "create image",
+        "edit image",
+        "nano-banana-pro",
+        "openai-image-gen",
+        "картин",
+        "изображ",
+        "сгенерируй изображ",
+        "создай изображ",
+        "отрисуй",
+    )
+    return any(marker in normalized for marker in markers)
+
+
+def _allows_gemini_api_for_request(text: str) -> bool:
+    if not config.GEMINI_IMAGE_ONLY_MODE:
+        return True
+    return _is_image_generation_request(text)
+
+
+def _is_tool_allowed_by_gemini_policy(tool_name: str, prompt_text: str) -> bool:
+    if not config.GEMINI_IMAGE_ONLY_MODE:
+        return True
+    normalized = (tool_name or "").strip().lower()
+    if normalized == "gemini":
+        return _allows_gemini_api_for_request(prompt_text)
+    if normalized == "summarize":
+        return _allows_gemini_api_for_request(prompt_text)
+    return True
+
+
 def _estimate_prompt_chars(parts: list[str]) -> int:
     if not parts:
         return 0
@@ -3496,7 +3536,11 @@ async def _handle_message_inner(
                 active_resume_arg=provider.resume_arg or "",
                 resume_task_id="",
             )
-            env = _provider_manager().subprocess_env(provider)
+            allow_gemini_api = _allows_gemini_api_for_request(raw_prompt)
+            env = _provider_manager().subprocess_env(
+                provider,
+                allow_gemini_api=allow_gemini_api,
+            )
             logger.info(
                 "Chat %s: using provider '%s' (cli=%s) with env=%s",
                 scope_key,
@@ -3555,7 +3599,10 @@ async def _handle_message_inner(
                         scope_key, provider.name, next_provider.name, final_response.text,
                     )
                     provider = next_provider
-                    env = _provider_manager().subprocess_env(next_provider)
+                    env = _provider_manager().subprocess_env(
+                        next_provider,
+                        allow_gemini_api=allow_gemini_api,
+                    )
                     if next_provider.cli == "codex":
                         codex_model = _codex_model_arg(session, next_provider)
                         final_response = await _run_codex_with_retries(
@@ -3590,35 +3637,52 @@ async def _handle_message_inner(
                     scope_key,
                     selected_tool,
                 )
-                await progress.report_tool("tool_selector", selected_tool)
-                forced_prompt = _inject_tool_request(
-                    override_text or message.text or "",
-                    selected_tool,
-                )
-                if provider.cli == "codex":
-                    codex_model = _codex_model_arg(session, provider)
-                    retry_response = await _run_codex_with_retries(
-                        message,
-                        state,
-                        session,
-                        progress,
-                        codex_model,
-                        session.codex_session_id,
-                        provider.resume_arg,
-                        env,
-                        override_text=forced_prompt,
+                source_prompt = override_text or message.text or ""
+                if not _is_tool_allowed_by_gemini_policy(selected_tool, source_prompt):
+                    final_response = bridge.ClaudeResponse(
+                        text=(
+                            "Tool policy blocked this action: Gemini API calls are allowed "
+                            "only for image generation tasks."
+                        ),
+                        session_id=(
+                            session.codex_session_id
+                            if provider.cli == "codex"
+                            else session.claude_session_id
+                        ),
+                        is_error=True,
+                        cost_usd=0.0,
+                        num_turns=1,
                     )
                 else:
-                    retry_response = await _run_claude(
-                        message,
-                        state,
-                        session,
-                        progress,
-                        env,
-                        override_text=forced_prompt,
+                    await progress.report_tool("tool_selector", selected_tool)
+                    forced_prompt = _inject_tool_request(
+                        source_prompt,
+                        selected_tool,
                     )
-                if retry_response:
-                    final_response = retry_response
+                    if provider.cli == "codex":
+                        codex_model = _codex_model_arg(session, provider)
+                        retry_response = await _run_codex_with_retries(
+                            message,
+                            state,
+                            session,
+                            progress,
+                            codex_model,
+                            session.codex_session_id,
+                            provider.resume_arg,
+                            env,
+                            override_text=forced_prompt,
+                        )
+                    else:
+                        retry_response = await _run_claude(
+                            message,
+                            state,
+                            session,
+                            progress,
+                            env,
+                            override_text=forced_prompt,
+                        )
+                    if retry_response:
+                        final_response = retry_response
         finally:
             typing_task.cancel()
             try:

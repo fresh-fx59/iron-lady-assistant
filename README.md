@@ -101,6 +101,7 @@ All settings are read from `.env`.
 - `METRICS_PORT` (optional, default `9101`): Prometheus endpoint port (`0` disables)
 - `MEMORY_DIR` (optional, default `memory/`): persistent memory path
 - `TOOLS_DIR` (optional, default `tools/`): custom tool definitions path
+- `GEMINI_IMAGE_ONLY_MODE` (optional, default `1`): strips Gemini API credentials and blocks Gemini-oriented tools for non-image tasks
 - `AUTONOMY_ENABLED` (optional, default `1`): enable background self-learning and proactive alerts
 - `AUTONOMY_FAILURE_THRESHOLD` (optional, default `3`): failures required before proactive alert
 - `AUTONOMY_FAILURE_WINDOW_MINUTES` (optional, default `60`): rolling window for failure detection

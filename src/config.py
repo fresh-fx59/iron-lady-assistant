@@ -6,7 +6,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-VERSION: str = "0.18.50"
+VERSION: str = "0.19.0"
 
 # ── Bot token (required) ────────────────────────────────────
 BOT_TOKEN: str = os.getenv("TELEGRAM_BOT_TOKEN", "")
@@ -131,4 +131,7 @@ TOOL_DENYLIST: set[str] = {
 }
 TOOL_REQUIRE_APPROVAL_FOR_RISKY: bool = (
     os.getenv("TOOL_REQUIRE_APPROVAL_FOR_RISKY", "0").strip().lower() in {"1", "true", "yes"}
+)
+GEMINI_IMAGE_ONLY_MODE: bool = (
+    os.getenv("GEMINI_IMAGE_ONLY_MODE", "1").strip().lower() not in {"0", "false", "no"}
 )

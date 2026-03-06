@@ -5,7 +5,7 @@ and message handling. These are observable user-facing behaviors.
 """
 
 import asyncio
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
@@ -851,6 +851,72 @@ class TestStepPlanCommands:
         call = manager.submit.await_args.kwargs
         assert "Step plan 2/2 running" in call["feedback_title"]
         manager.bot.send_message.assert_awaited_once()
+
+    async def test_bootstrap_prefers_existing_step_plan_thread_target(self, monkeypatch, tmppath):
+        step1 = tmppath / "01 - A.md"
+        step2 = tmppath / "02 - B.md"
+        step1.write_text("Applied: [x]\n", encoding="utf-8")
+        step2.write_text("Applied: [ ]\n", encoding="utf-8")
+
+        _save_step_plan_state(
+            {
+                "active": False,
+                "chat_id": -1003019299921,
+                "message_thread_id": 777,
+                "user_id": 314102923,
+                "folder_path": str(tmppath),
+                "steps": [str(step1), str(step2)],
+                "current_index": 1,
+            }
+        )
+
+        manager = AsyncMock()
+        manager.bot = AsyncMock()
+        manager.bot.send_message = AsyncMock()
+        manager.submit = AsyncMock(return_value="task-thread")
+        monkeypatch.setattr("src.bot.task_manager", manager)
+        monkeypatch.setattr("src.bot.config.STEP_PLAN_AUTO_TRIGGER_ENABLED", True)
+        monkeypatch.setattr("src.bot.config.STEP_PLAN_DEFAULT_FOLDER", str(tmppath))
+        monkeypatch.setattr("src.bot.config.ALLOWED_USER_IDS", {314102923})
+        monkeypatch.setattr("src.bot.config.ALLOWED_CHAT_IDS", {-1003019299921})
+        monkeypatch.setattr("src.bot._latest_scope_target", lambda: (314102923, None))
+
+        await bootstrap_step_plan_after_restart()
+
+        manager.submit.assert_awaited_once()
+        kwargs = manager.submit.await_args.kwargs
+        assert kwargs["chat_id"] == -1003019299921
+        assert kwargs["message_thread_id"] == 777
+
+    async def test_bootstrap_skips_when_auto_resume_temporarily_blocked(self, monkeypatch, tmppath):
+        step1 = tmppath / "01 - A.md"
+        step1.write_text("Applied: [ ]\n", encoding="utf-8")
+        blocked_until = (datetime.now(timezone.utc) + timedelta(minutes=20)).isoformat()
+        _save_step_plan_state(
+            {
+                "active": False,
+                "chat_id": 123456789,
+                "message_thread_id": None,
+                "folder_path": str(tmppath),
+                "steps": [str(step1)],
+                "current_index": 0,
+                "failure_count": 2,
+                "last_failed_index": 0,
+                "auto_resume_blocked_until": blocked_until,
+            }
+        )
+
+        manager = AsyncMock()
+        manager.bot = AsyncMock()
+        manager.bot.send_message = AsyncMock()
+        manager.submit = AsyncMock(return_value="task-should-not-run")
+        monkeypatch.setattr("src.bot.task_manager", manager)
+        monkeypatch.setattr("src.bot.config.STEP_PLAN_AUTO_TRIGGER_ENABLED", True)
+        monkeypatch.setattr("src.bot.config.STEP_PLAN_DEFAULT_FOLDER", str(tmppath))
+
+        await bootstrap_step_plan_after_restart()
+
+        manager.submit.assert_not_awaited()
 
     async def test_load_plan_steps_skips_index_file(self, tmppath):
         (tmppath / "00 - Improvement Index.md").write_text("index", encoding="utf-8")

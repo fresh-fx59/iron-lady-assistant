@@ -106,6 +106,8 @@ _STEP_PLAN_FALLBACK_PATHS = (
     "/home/claude-developer/syncthing/data/syncthing-main/Obsidian/DefaultObsidianVault/"
     "Projects/Iron Lady Assistant/Ouroboros Improvement Plan",
 )
+_STEP_PLAN_AUTORESUME_FAILURE_THRESHOLD = 2
+_STEP_PLAN_AUTORESUME_BLOCK_MINUTES = 30
 _MIDFLIGHT_TOKEN_RE = re.compile(r"\w+", re.UNICODE)
 _APPLIED_CHECK_RE = re.compile(r"^\s*Applied:\s*\[(x|X)\]\s*$", re.IGNORECASE | re.MULTILINE)
 _NUMBER_WORDS = {
@@ -521,8 +523,24 @@ def _step_plan_default_state() -> dict:
         "current_task_id": None,
         "restart_between_steps": True,
         "last_error": "",
+        "failure_count": 0,
+        "last_failed_index": None,
+        "auto_resume_blocked_until": "",
         "updated_at": datetime.now(tz.utc).isoformat(),
     }
+
+
+def _step_plan_is_blocked(state: dict) -> bool:
+    raw = str(state.get("auto_resume_blocked_until") or "").strip()
+    if not raw:
+        return False
+    try:
+        blocked_until = datetime.fromisoformat(raw)
+        if blocked_until.tzinfo is None:
+            blocked_until = blocked_until.replace(tzinfo=tz.utc)
+    except Exception:
+        return False
+    return blocked_until > datetime.now(tz.utc)
 
 
 def _load_step_plan_state() -> dict:
@@ -701,6 +719,9 @@ async def _start_step_plan(
             "current_task_id": None,
             "restart_between_steps": restart_between_steps,
             "last_error": "",
+            "failure_count": 0,
+            "last_failed_index": None,
+            "auto_resume_blocked_until": "",
         }
     )
     _save_step_plan_state(state)
@@ -788,6 +809,12 @@ async def bootstrap_step_plan_after_restart() -> None:
     current = _load_step_plan_state()
     if current.get("active"):
         return
+    if _step_plan_is_blocked(current):
+        logger.warning(
+            "Step plan auto-resume blocked after repeated failures until %s",
+            current.get("auto_resume_blocked_until"),
+        )
+        return
     folder_path = _resolve_step_plan_folder_from_text("")
     if not folder_path:
         return
@@ -797,7 +824,15 @@ async def bootstrap_step_plan_after_restart() -> None:
     next_index = _first_unapplied_step_index(steps)
     if next_index >= len(steps):
         return
-    target = _latest_scope_target()
+    target: tuple[int, int | None] | None = None
+    existing_chat_id = int(current.get("chat_id") or 0)
+    existing_thread_id = current.get("message_thread_id")
+    if existing_chat_id:
+        user_hint = existing_chat_id if existing_chat_id > 0 else None
+        if _is_authorized(user_hint, existing_chat_id):
+            target = (existing_chat_id, existing_thread_id)
+    if not target:
+        target = _latest_scope_target()
     if not target:
         return
     chat_id, message_thread_id = target
@@ -929,15 +964,32 @@ class StepPlanObserver:
             return
 
         if task.status != TaskStatus.COMPLETED:
+            failed_index = int(state.get("current_index") or 0)
+            last_failed_index = state.get("last_failed_index")
+            if last_failed_index == failed_index:
+                state["failure_count"] = int(state.get("failure_count") or 0) + 1
+            else:
+                state["failure_count"] = 1
+            state["last_failed_index"] = failed_index
+            if int(state.get("failure_count") or 0) >= _STEP_PLAN_AUTORESUME_FAILURE_THRESHOLD:
+                blocked_until = datetime.now(tz.utc) + timedelta(minutes=_STEP_PLAN_AUTORESUME_BLOCK_MINUTES)
+                state["auto_resume_blocked_until"] = blocked_until.isoformat()
             state["active"] = False
             state["last_error"] = task.error or f"Task ended with status={task.status.value}"
             state["current_task_id"] = None
             _save_step_plan_state(state)
             try:
+                fail_note = ""
+                if state.get("auto_resume_blocked_until"):
+                    fail_note = (
+                        "\n\nAuto-resume is temporarily paused after repeated failures. "
+                        "Use /stepplan_start to retry immediately after applying a fix."
+                    )
                 await self._notify(
                     int(state.get("chat_id") or task.chat_id),
                     state.get("message_thread_id"),
-                    "❌ Step plan paused because current step failed. Use /stepplan_status to inspect.",
+                    "❌ Step plan paused because current step failed. Use /stepplan_status to inspect."
+                    + fail_note,
                 )
             except Exception:
                 logger.exception("Failed to send step plan failure notification")
@@ -946,6 +998,9 @@ class StepPlanObserver:
         steps = state.get("steps") or []
         state["current_index"] = int(state.get("current_index") or 0) + 1
         state["current_task_id"] = None
+        state["failure_count"] = 0
+        state["last_failed_index"] = None
+        state["auto_resume_blocked_until"] = ""
 
         if int(state["current_index"]) >= len(steps):
             state["active"] = False

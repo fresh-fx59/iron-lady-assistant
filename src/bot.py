@@ -1,5 +1,6 @@
 import asyncio
 from dataclasses import dataclass, replace
+import hashlib
 import html
 import inspect
 import json
@@ -70,6 +71,7 @@ class _ChatState:
 # Per-conversation state dict
 _chat_states: dict[str, _ChatState] = {}
 _error_counts: dict[str, int] = {}
+_recent_outbound_by_scope: dict[str, tuple[str, datetime]] = {}
 _CODEX_TRANSIENT_ERROR_PATTERNS = (
     re.compile(r"stream disconnected before completion", re.IGNORECASE),
     re.compile(r"transport error:\s*timeout", re.IGNORECASE),
@@ -244,6 +246,47 @@ def _clear_errors(scope_key: str) -> None:
 
 def _should_suggest_rollback(scope_key: str) -> bool:
     return _error_counts.get(scope_key, 0) >= 3
+
+
+def _is_duplicate_outbound(scope_key: str, text: str, *, ttl_seconds: int = 120) -> bool:
+    """Suppress immediate duplicate replies in the same scope after retries/restarts."""
+    normalized = re.sub(r"\s+", " ", text).strip()
+    if not normalized:
+        return False
+    digest = hashlib.sha1(normalized.encode("utf-8")).hexdigest()[:16]
+    now = datetime.now(tz.utc)
+    previous = _recent_outbound_by_scope.get(scope_key)
+    if previous:
+        prev_digest, prev_at = previous
+        if prev_digest == digest and (now - prev_at).total_seconds() <= ttl_seconds:
+            return True
+    _recent_outbound_by_scope[scope_key] = (digest, now)
+    return False
+
+
+def _latest_scope_target() -> tuple[int, int | None] | None:
+    """Best-effort target for restart notices based on most recent session activity."""
+    rows: list[tuple[datetime, int, int | None]] = []
+    for session in session_manager.sessions.values():
+        chat_id = int(getattr(session, "chat_id", 0) or 0)
+        if not chat_id:
+            continue
+        user_hint = chat_id if chat_id > 0 else None
+        if not (_is_authorized(user_hint, chat_id) or chat_id in config.ALLOWED_CHAT_IDS):
+            continue
+        raw_last = str(getattr(session, "last_activity_at", "") or "")
+        try:
+            last_at = datetime.fromisoformat(raw_last)
+            if last_at.tzinfo is None:
+                last_at = last_at.replace(tzinfo=tz.utc)
+        except Exception:
+            last_at = datetime.min.replace(tzinfo=tz.utc)
+        rows.append((last_at, chat_id, getattr(session, "message_thread_id", None)))
+    if not rows:
+        return None
+    rows.sort(key=lambda row: row[0], reverse=True)
+    _, chat_id, message_thread_id = rows[0]
+    return chat_id, message_thread_id
 
 
 def _repo_root() -> Path:
@@ -1858,6 +1901,7 @@ async def _handle_message_inner(message: Message, override_text: str | None = No
         session = session_manager.get(chat_id, thread_id)
         progress = ProgressReporter(message)
         typing_task = asyncio.create_task(_keep_typing(message))
+        await progress.show_working()
 
         final_response: bridge.ClaudeResponse | None = None
 
@@ -2091,12 +2135,19 @@ async def _handle_message_inner(message: Message, override_text: str | None = No
                 for chunk in chunks:
                     if not chunk.strip():
                         continue
+                    plain_preview = strip_html(chunk)
+                    if _is_duplicate_outbound(scope_key, plain_preview):
+                        logger.info("Chat %s: suppressed duplicate outgoing chunk", scope_key)
+                        continue
                     try:
                         await message.answer(chunk, parse_mode="HTML")
                     except Exception:
                         plain = strip_html(chunk)
                         for plain_chunk in split_message(plain):
                             if not plain_chunk.strip():
+                                continue
+                            if _is_duplicate_outbound(scope_key, plain_chunk):
+                                logger.info("Chat %s: suppressed duplicate plain outgoing chunk", scope_key)
                                 continue
                             await message.answer(plain_chunk)
 

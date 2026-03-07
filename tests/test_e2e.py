@@ -281,6 +281,20 @@ class TestProgressReportingLifecycle:
         # Should have deleted progress
         assert mock_message.bot.delete_message.called
 
+    async def test_progress_show_working_uses_thread_and_escapes_tool_input(self, mock_message):
+        """Initial progress should appear in-thread and tool previews should remain HTML-safe."""
+        from src.progress import ProgressReporter
+
+        mock_message.message_thread_id = 77
+        reporter = ProgressReporter(mock_message, debounce_seconds=0)
+
+        await reporter.show_working()
+        kwargs = mock_message.bot.send_message.await_args_list[0].kwargs
+        assert kwargs["message_thread_id"] == 77
+        assert kwargs["text"] == "🔄 <b>Working...</b>"
+
+        assert reporter._format_tool_action("Read", "<tmp>\n/path") == "Reading: &lt;tmp&gt; /path"  # noqa: SLF001
+
 
 # ── E2E Flow 8: Session persistence across restarts ──────────────
 class TestSessionPersistenceAcrossRestarts:

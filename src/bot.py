@@ -3811,7 +3811,10 @@ async def _handle_message_inner(
                         pass
 
                 chunks: list[str] = []
-                if clean_text.strip():
+                if clean_text.strip() and _should_send_text_reply(
+                    request_voice_reply=request_voice_reply,
+                    generated_voice_path=generated_voice_path,
+                ):
                     html = markdown_to_html(clean_text)
                     chunks = split_message(html)
 
@@ -4049,6 +4052,10 @@ async def _maybe_add_local_tts_media(
     except Exception:
         logger.exception("Failed to synthesize local TTS voice reply")
         return media_refs, None
+
+
+def _should_send_text_reply(*, request_voice_reply: bool, generated_voice_path: str | None) -> bool:
+    return not (request_voice_reply and generated_voice_path is not None)
 
 
 async def _send_media_refs(message: Message, media_refs: list[str], audio_as_voice: bool) -> None:

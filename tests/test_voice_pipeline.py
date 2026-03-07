@@ -8,6 +8,7 @@ from src.bot import (
     _prefers_female_voice,
     _sanitize_voice_capability_text,
     _send_media_refs,
+    _should_send_text_reply,
     _strip_tool_directive_lines,
     _voice_reply_language_hint,
     _wants_voice_reply,
@@ -84,6 +85,15 @@ def test_sanitize_voice_capability_text_keeps_regular_response():
 def test_strip_tool_directive_lines_removes_use_tool_only_lines():
     text = "USE_TOOL: sag\nГотово\nUSE_TOOL: discord"
     assert _strip_tool_directive_lines(text) == "Готово"
+
+
+def test_should_send_text_reply_disabled_when_voice_generated():
+    assert not _should_send_text_reply(request_voice_reply=True, generated_voice_path="/tmp/speech.ogg")
+
+
+def test_should_send_text_reply_enabled_for_text_mode():
+    assert _should_send_text_reply(request_voice_reply=False, generated_voice_path="/tmp/speech.ogg")
+    assert _should_send_text_reply(request_voice_reply=True, generated_voice_path=None)
 
 
 @pytest.mark.asyncio

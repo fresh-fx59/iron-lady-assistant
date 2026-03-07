@@ -22,6 +22,14 @@ TTS_VOICE_CYRILLIC: str = os.getenv("LOCAL_TTS_VOICE_CYRILLIC", "ru")
 TTS_VOICE_LATIN: str = os.getenv("LOCAL_TTS_VOICE_LATIN", "en")
 TTS_VOICE_CYRILLIC_FEMALE: str = os.getenv("LOCAL_TTS_VOICE_CYRILLIC_FEMALE", "ru+f3")
 TTS_VOICE_LATIN_FEMALE: str = os.getenv("LOCAL_TTS_VOICE_LATIN_FEMALE", "en+f3")
+TTS_VOICE_CYRILLIC_FEMALE_CANDIDATES: tuple[str, ...] = tuple(
+    voice.strip()
+    for voice in os.getenv(
+        "LOCAL_TTS_VOICE_CYRILLIC_FEMALE_CANDIDATES",
+        "ru+f3,ru+f2,ru+f4,ru+f5",
+    ).split(",")
+    if voice.strip()
+)
 TTS_SPEED: str = os.getenv("LOCAL_TTS_SPEED_WPM", "220")
 TTS_SPEED_CYRILLIC: str = os.getenv("LOCAL_TTS_SPEED_WPM_CYRILLIC", "170")
 TTS_SPEED_LATIN: str = os.getenv("LOCAL_TTS_SPEED_WPM_LATIN", TTS_SPEED)
@@ -95,6 +103,7 @@ _URL_RE = re.compile(r"https?://\S+")
 _MARKDOWN_DECOR_RE = re.compile(r"[*_~#>]+")
 _CYRILLIC_RE = re.compile(r"[А-Яа-яЁё]")
 _LATIN_RE = re.compile(r"[A-Za-z]")
+_SCORE_RE = re.compile(r"score=([0-9]*\.?[0-9]+)")
 
 
 def is_available() -> bool:
@@ -223,6 +232,16 @@ def _intelligibility_score(expected_text: str, actual_text: str) -> float:
     return difflib.SequenceMatcher(None, expected, actual).ratio()
 
 
+def _extract_score(detail: str) -> float:
+    match = _SCORE_RE.search(detail or "")
+    if not match:
+        return 0.0
+    try:
+        return float(match.group(1))
+    except ValueError:
+        return 0.0
+
+
 async def _verify_intelligibility(
     ogg_path: Path,
     expected_text: str,
@@ -322,12 +341,14 @@ async def synthesize_voice(text: str, *, prefer_female: bool = False) -> str:
         cyrillic_text = _is_cyrillic_dominant(spoken_text)
         female_cyrillic_request = prefer_female and cyrillic_text
         if female_cyrillic_request:
-            add_attempt("espeak", TTS_VOICE_CYRILLIC_FEMALE, selected_speed)
+            for female_voice in TTS_VOICE_CYRILLIC_FEMALE_CANDIDATES or (TTS_VOICE_CYRILLIC_FEMALE,):
+                add_attempt("espeak", female_voice, selected_speed)
             try:
                 female_slower_speed = str(max(120, int(selected_speed) - 20))
             except ValueError:
                 female_slower_speed = "150"
-            add_attempt("espeak", TTS_VOICE_CYRILLIC_FEMALE, female_slower_speed)
+            for female_voice in TTS_VOICE_CYRILLIC_FEMALE_CANDIDATES or (TTS_VOICE_CYRILLIC_FEMALE,):
+                add_attempt("espeak", female_voice, female_slower_speed)
         if use_sherpa and not (female_cyrillic_request and TTS_FEMALE_STRICT):
             add_attempt("sherpa")
         # Keep Russian quality stable: avoid espeak fallback unless sherpa is unavailable or strict mode disabled.
@@ -347,6 +368,8 @@ async def synthesize_voice(text: str, *, prefer_female: bool = False) -> str:
                 add_attempt("espeak", TTS_VOICE_LATIN, TTS_SPEED_LATIN)
 
         errors: list[str] = []
+        best_female_ogg_path: Path | None = None
+        best_female_score = -1.0
         for engine, voice, speed in attempts:
             cleanup_file(str(wav_path))
             cleanup_file(str(ogg_path))
@@ -385,10 +408,27 @@ async def synthesize_voice(text: str, *, prefer_female: bool = False) -> str:
                     spoken_text,
                     min_score=min_score,
                 )
+            # For female Cyrillic requests, evaluate all female candidates and keep the best one.
+            if female_cyrillic_request and engine == "espeak":
+                score = _extract_score(detail)
+                if ok and score > best_female_score:
+                    best_female_score = score
+                    if best_female_ogg_path is not None:
+                        cleanup_file(str(best_female_ogg_path))
+                    best_female_ogg_path = tmp_dir / f"speech_best_{len(attempts)}.ogg"
+                    ogg_path.replace(best_female_ogg_path)
+                elif not ok:
+                    errors.append(f"{engine}/{voice}/{speed} rejected: {detail}")
+                continue
+
             if ok:
                 cleanup_file(str(wav_path))
                 return str(ogg_path)
             errors.append(f"{engine} rejected: {detail}")
+
+        if best_female_ogg_path is not None and best_female_ogg_path.exists():
+            cleanup_file(str(wav_path))
+            return str(best_female_ogg_path)
 
         raise RuntimeError(f"TTS synthesis failed after retries: {' | '.join(errors)[-450:]}")
     except Exception:

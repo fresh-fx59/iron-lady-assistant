@@ -52,6 +52,12 @@ def test_is_cyrillic_dominant() -> None:
     assert not tts._is_cyrillic_dominant("hello world")
 
 
+def test_extract_score_parses_value() -> None:
+    assert tts._extract_score("score=0.73") == 0.73
+    assert tts._extract_score("low intelligibility score=0.21 (<0.35)") == 0.21
+    assert tts._extract_score("disabled") == 0.0
+
+
 @pytest.mark.asyncio
 async def test_synthesize_voice_prefers_sherpa_for_cyrillic(monkeypatch):
     monkeypatch.setattr(tts, "_prepare_spoken_text", lambda _text: "Привет, Алекс")
@@ -151,3 +157,38 @@ async def test_synthesize_voice_female_strict_skips_sherpa(monkeypatch):
     assert out.endswith(".ogg")
     tts._run_tts_to_wav.assert_awaited()
     tts._run_sherpa_to_wav.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_synthesize_voice_female_tries_multiple_female_candidates(monkeypatch):
+    monkeypatch.setattr(tts, "_prepare_spoken_text", lambda _text: "Привет, Алекс")
+    monkeypatch.setattr(tts, "TTS_ENGINE", "auto")
+    monkeypatch.setattr(tts, "TTS_FEMALE_STRICT", True)
+    monkeypatch.setattr(tts, "TTS_VOICE_CYRILLIC_FEMALE_CANDIDATES", ("ru+f3", "ru+f2"))
+    monkeypatch.setattr(tts, "_sherpa_available", lambda: True)
+    monkeypatch.setattr(tts, "_run_sherpa_to_wav", AsyncMock(return_value=(0, "")))
+    monkeypatch.setattr(tts, "_verify_intelligibility", AsyncMock(return_value=(True, "score=0.45")))
+    run_tts_mock = AsyncMock(return_value=(0, ""))
+    monkeypatch.setattr(tts, "_run_tts_to_wav", run_tts_mock)
+
+    class _OkProc:
+        returncode = 0
+        async def communicate(self):
+            return b"", b""
+
+    async def _fake_create_subprocess_exec(*args, **kwargs):
+        Path(args[-1]).write_bytes(b"ogg")
+        return _OkProc()
+
+    monkeypatch.setattr(
+        tts.asyncio,
+        "create_subprocess_exec",
+        AsyncMock(side_effect=_fake_create_subprocess_exec),
+    )
+
+    out = await tts.synthesize_voice("ignored", prefer_female=True)
+
+    assert out.endswith(".ogg")
+    voices = [call.args[2] for call in run_tts_mock.await_args_list]
+    assert "ru+f3" in voices
+    assert "ru+f2" in voices

@@ -468,14 +468,18 @@ def _current_provider(scope_key: str):
     return provider_manager.get_provider(scope_key)
 
 
+def _is_codex_family_cli(cli_name: str | None) -> bool:
+    return bool(cli_name and cli_name.lower().startswith("codex"))
+
+
 def _current_model_label(session: object, provider) -> str:
-    if provider.cli == "codex":
+    if _is_codex_family_cli(provider.cli):
         return session.codex_model or provider.model or "default"
     return session.model
 
 
 def _model_options(provider) -> list[str]:
-    if provider.cli == "codex":
+    if _is_codex_family_cli(provider.cli):
         return provider.models or ["default"]
     return sorted(CLAUDE_MODELS)
 
@@ -636,7 +640,7 @@ async def cmd_model(message: Message) -> None:
             await message.answer(f"Invalid model: {requested}. Use /model to see options.")
             return
 
-        if provider.cli == "codex":
+        if _is_codex_family_cli(provider.cli):
             chosen = None if requested == "default" else requested
             session_manager.set_codex_model(chat_id, chosen, thread_id)
         else:
@@ -679,7 +683,7 @@ async def cb_model_switch(callback: CallbackQuery) -> None:
         await callback.answer("Invalid model", show_alert=True)
         return
 
-    if provider.cli == "codex":
+    if _is_codex_family_cli(provider.cli):
         chosen = None if model == "default" else model
         session_manager.set_codex_model(chat_id, chosen, thread_id)
     else:
@@ -782,7 +786,7 @@ async def cmd_status(message: Message) -> None:
     scope_key = _scope_key(chat_id, thread_id)
     session = session_manager.get(chat_id, thread_id)
     provider = provider_manager.get_provider(scope_key)
-    if provider.cli == "codex":
+    if _is_codex_family_cli(provider.cli):
         sid = session.codex_session_id or "none (new conversation)"
     else:
         sid = session.claude_session_id or "none (new conversation)"
@@ -1514,6 +1518,7 @@ async def _run_codex(
     session_id: str | None = None,
     resume_arg: str | None = None,
     subprocess_env: dict[str, str] | None = None,
+    cli_name: str = "codex",
     override_text: str | None = None,
 ) -> bridge.ClaudeResponse | None:
     """Run a single Codex CLI subprocess attempt. Returns the response or None."""
@@ -1539,6 +1544,7 @@ async def _run_codex(
         session_id=session_id,
         model=model,
         resume_arg=resume_arg,
+        cli_name=cli_name,
         working_dir=_codex_working_dir(),
         process_handle=state.process_handle,
         subprocess_env=subprocess_env,
@@ -1587,6 +1593,7 @@ async def _run_codex_with_retries(
     session_id: str | None = None,
     resume_arg: str | None = None,
     subprocess_env: dict[str, str] | None = None,
+    cli_name: str = "codex",
     override_text: str | None = None,
 ) -> bridge.ClaudeResponse | None:
     retries_left = max(0, config.CODEX_TRANSIENT_MAX_RETRIES)
@@ -1604,6 +1611,7 @@ async def _run_codex_with_retries(
             next_session_id,
             resume_arg,
             subprocess_env,
+            cli_name,
             override_text=override_text,
         )
         if not response:
@@ -1764,12 +1772,12 @@ async def _handle_message_inner(message: Message, override_text: str | None = No
                 step_id="interactive_turn",
                 provider_cli=provider.cli,
                 model=_current_model_label(session, provider),
-                session_id=session.codex_session_id if provider.cli == "codex" else session.claude_session_id,
+                session_id=session.codex_session_id if _is_codex_family_cli(provider.cli) else session.claude_session_id,
                 input_text=raw_prompt,
                 resume_reason="manual_continue" if override_text else "restart",
             )
 
-            if provider.cli == "codex":
+            if _is_codex_family_cli(provider.cli):
                 codex_model = _codex_model_arg(session, provider)
                 final_response = await _run_codex_with_retries(
                     message,
@@ -1780,6 +1788,7 @@ async def _handle_message_inner(message: Message, override_text: str | None = No
                     session.codex_session_id,
                     provider.resume_arg,
                     env,
+                    provider.cli,
                     override_text=override_text,
                 )
             else:
@@ -1819,7 +1828,7 @@ async def _handle_message_inner(message: Message, override_text: str | None = No
                     )
                     provider = next_provider
                     env = provider_manager.subprocess_env(next_provider)
-                    if next_provider.cli == "codex":
+                    if _is_codex_family_cli(next_provider.cli):
                         codex_model = _codex_model_arg(session, next_provider)
                         final_response = await _run_codex_with_retries(
                             message,
@@ -1830,6 +1839,7 @@ async def _handle_message_inner(message: Message, override_text: str | None = No
                             session.codex_session_id,
                             next_provider.resume_arg,
                             env,
+                            next_provider.cli,
                             override_text=override_text,
                         )
                     else:
@@ -1858,7 +1868,7 @@ async def _handle_message_inner(message: Message, override_text: str | None = No
                     override_text or message.text or "",
                     selected_tool,
                 )
-                if provider.cli == "codex":
+                if _is_codex_family_cli(provider.cli):
                     codex_model = _codex_model_arg(session, provider)
                     retry_response = await _run_codex_with_retries(
                         message,
@@ -1869,6 +1879,7 @@ async def _handle_message_inner(message: Message, override_text: str | None = No
                         session.codex_session_id,
                         provider.resume_arg,
                         env,
+                        provider.cli,
                         override_text=forced_prompt,
                     )
                 else:
@@ -1980,14 +1991,14 @@ async def _handle_message_inner(message: Message, override_text: str | None = No
         # Update session ID if we got one back
         if (
             final_response
-            and provider.cli != "codex"
+            and not _is_codex_family_cli(provider.cli)
             and final_response.session_id
             and final_response.session_id != session.claude_session_id
         ):
             session_manager.update_session_id(chat_id, final_response.session_id, thread_id)
         if (
             final_response
-            and provider.cli == "codex"
+            and _is_codex_family_cli(provider.cli)
             and final_response.session_id
             and final_response.session_id != session.codex_session_id
         ):

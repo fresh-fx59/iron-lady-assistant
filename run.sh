@@ -122,6 +122,10 @@ if ! command -v codex &>/dev/null; then
     warn "Codex CLI not found in PATH. Install it first (e.g. npm install -g @openai/codex)."
 fi
 
+if ! command -v codex2 &>/dev/null; then
+    warn "Codex2 CLI not found in PATH. Install/configure it if you plan to use the codex2 provider."
+fi
+
 # ── Check .env exists ────────────────────────────────────────
 if [ ! -f .env ]; then
     error "No .env file found!"

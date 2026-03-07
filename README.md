@@ -1,8 +1,8 @@
-# Telegram Claude Bot
+# Telegram Persona Assistant
 
-Chat with Claude AI directly from Telegram. Send a message, get a response — it's that simple.
+Chat with your assistant directly from Telegram. The bot supports multiple providers and CLIs, including Claude, Codex, and Codex2.
 
-The bot runs [Claude Code](https://docs.anthropic.com/en/docs/claude-code) under the hood, so you get the full power of Claude as a conversational assistant right in your Telegram chat.
+The runtime can switch providers per chat, preserve session state, and fall back between configured backends from `providers.json`.
 
 ## What You Need
 
@@ -11,20 +11,41 @@ Before starting, make sure you have:
 1. **A Linux server** (or any machine that stays online) — a $5/month VPS works fine
 2. **Python 3.10+** — pre-installed on most Linux systems
 3. **Node.js 18+** — needed to install Claude Code CLI
-4. **An Anthropic API key** — sign up at [console.anthropic.com](https://console.anthropic.com/)
+4. **At least one provider CLI configured**:
+   - Claude: [Claude Code](https://docs.anthropic.com/en/docs/claude-code)
+   - Codex: `codex`
+   - Codex2: `codex2`
 
 ## Setup (5 minutes)
 
-### 1. Install Claude Code CLI
+### 1. Install provider CLIs
+
+Install the CLIs you plan to use.
+
+Claude:
 
 ```bash
 npm install -g @anthropic-ai/claude-code
 ```
 
-Then authenticate it with your Anthropic API key:
+Codex:
 
 ```bash
-claude  # follow the prompts to log in
+npm install -g @openai/codex
+```
+
+Codex2:
+
+```bash
+# install/configure the codex2 CLI so `codex2` is available in PATH
+```
+
+Then authenticate the providers you installed:
+
+```bash
+claude   # follow the prompts to log in
+codex    # optional
+codex2   # optional
 ```
 
 ### 2. Clone this repo
@@ -73,7 +94,23 @@ Open Telegram, find your bot by its username, and start chatting.
 | `/tools` | Show available tools |
 | `/cancel` | Cancel the current request |
 
-Just send any text message and the bot will respond using Claude.
+Just send any text message and the bot will respond using the currently selected provider.
+
+## Codex Instance Helper
+
+If you want a separate Codex home directory and shell alias, use [`create_codex_instance.sh`](/home/claude-developer/iron-lady-assistant/create_codex_instance.sh):
+
+```bash
+./create_codex_instance.sh codex3
+source ~/.bashrc
+codex3
+```
+
+What it does:
+- Creates `~/.<instance_name>`
+- Symlinks your `~/.gitconfig`
+- Symlinks your `~/.ssh`
+- Adds a Bash alias like `alias codex3='HOME=$HOME/.codex3 codex'`
 
 ## Running in the Background
 
@@ -144,6 +181,10 @@ Tracked metrics include: message counts, response times, API costs, and active s
 - Run `npm install -g @anthropic-ai/claude-code`
 - Make sure Node.js 18+ is installed
 
+**"Provider CLI 'codex' or 'codex2' is not installed"**
+- Install or configure the missing CLI so it is available on `PATH`
+- Switch providers with `/provider` only after the CLI is installed
+
 **"TELEGRAM_BOT_TOKEN is not set"**
 - Run `bash setup.sh` or edit `.env` with your token from @BotFather
 
@@ -161,6 +202,7 @@ Tracked metrics include: message counts, response times, API costs, and active s
 
 ```
 ├── setup.sh              # Interactive setup wizard
+├── create_codex_instance.sh # Create isolated Codex HOME + shell alias
 ├── run.sh                # Start the bot (crash protection + auto-installs deps)
 ├── .env.example          # Configuration template
 ├── requirements.txt      # Python dependencies

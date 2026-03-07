@@ -456,12 +456,13 @@ async def stream_codex_message(
     session_id: str | None = None,
     model: str | None = None,
     resume_arg: str | None = None,
+    cli_name: str = "codex",
     working_dir: str | None = None,
     process_handle: dict | None = None,
     subprocess_env: dict[str, str] | None = None,
 ) -> AsyncGenerator[StreamEvent, None]:
     """Stream Codex CLI responses as events with idle timeout."""
-    cmd = ["codex", "exec"]
+    cmd = [cli_name, "exec"]
     # Codex CLI resume changed across versions:
     # - older: `codex exec --resume <id> ...`
     # - newer: `codex exec resume <id> ...`
@@ -507,7 +508,7 @@ async def stream_codex_message(
         yield StreamEvent(
             event_type=StreamEventType.RESULT,
             response=ClaudeResponse(
-                text="Codex CLI is not installed or not in PATH on the server.",
+                text=f"Provider CLI '{cli_name}' is not installed or not in PATH on the server.",
                 session_id=codex_session_id,
                 is_error=True,
                 cost_usd=0,
@@ -535,8 +536,8 @@ async def stream_codex_message(
                 proc.kill()
                 await proc.wait()
                 elapsed = time.monotonic() - start
-                metrics.CLAUDE_REQUESTS_TOTAL.labels(model=model or "codex", status="timeout").inc()
-                metrics.CLAUDE_RESPONSE_DURATION.labels(model=model or "codex").observe(elapsed)
+                metrics.CLAUDE_REQUESTS_TOTAL.labels(model=model or cli_name, status="timeout").inc()
+                metrics.CLAUDE_RESPONSE_DURATION.labels(model=model or cli_name).observe(elapsed)
                 yield StreamEvent(
                     event_type=StreamEventType.RESULT,
                     response=ClaudeResponse(
@@ -611,8 +612,8 @@ async def stream_codex_message(
             logger.warning("Codex stderr: %s", stderr.strip()[:500])
 
         if error_text:
-            metrics.CLAUDE_REQUESTS_TOTAL.labels(model=model or "codex", status="error").inc()
-            metrics.CLAUDE_RESPONSE_DURATION.labels(model=model or "codex").observe(elapsed)
+            metrics.CLAUDE_REQUESTS_TOTAL.labels(model=model or cli_name, status="error").inc()
+            metrics.CLAUDE_RESPONSE_DURATION.labels(model=model or cli_name).observe(elapsed)
             yield StreamEvent(
                 event_type=StreamEventType.RESULT,
                 response=ClaudeResponse(
@@ -627,8 +628,8 @@ async def stream_codex_message(
             return
 
         if last_message:
-            metrics.CLAUDE_REQUESTS_TOTAL.labels(model=model or "codex", status="success").inc()
-            metrics.CLAUDE_RESPONSE_DURATION.labels(model=model or "codex").observe(elapsed)
+            metrics.CLAUDE_REQUESTS_TOTAL.labels(model=model or cli_name, status="success").inc()
+            metrics.CLAUDE_RESPONSE_DURATION.labels(model=model or cli_name).observe(elapsed)
             yield StreamEvent(
                 event_type=StreamEventType.RESULT,
                 response=ClaudeResponse(
@@ -644,8 +645,8 @@ async def stream_codex_message(
 
         # If we got here, no usable result
         if proc.returncode != 0 and stderr.strip():
-            metrics.CLAUDE_REQUESTS_TOTAL.labels(model=model or "codex", status="error").inc()
-            metrics.CLAUDE_RESPONSE_DURATION.labels(model=model or "codex").observe(elapsed)
+            metrics.CLAUDE_REQUESTS_TOTAL.labels(model=model or cli_name, status="error").inc()
+            metrics.CLAUDE_RESPONSE_DURATION.labels(model=model or cli_name).observe(elapsed)
             yield StreamEvent(
                 event_type=StreamEventType.RESULT,
                 response=ClaudeResponse(
@@ -659,8 +660,8 @@ async def stream_codex_message(
             )
             return
 
-        metrics.CLAUDE_REQUESTS_TOTAL.labels(model=model or "codex", status="error").inc()
-        metrics.CLAUDE_RESPONSE_DURATION.labels(model=model or "codex").observe(elapsed)
+        metrics.CLAUDE_REQUESTS_TOTAL.labels(model=model or cli_name, status="error").inc()
+        metrics.CLAUDE_RESPONSE_DURATION.labels(model=model or cli_name).observe(elapsed)
         yield StreamEvent(
             event_type=StreamEventType.RESULT,
             response=ClaudeResponse(

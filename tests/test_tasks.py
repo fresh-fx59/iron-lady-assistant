@@ -289,3 +289,43 @@ async def test_execute_task_fails_when_transient_codex_retry_exhausted(monkeypat
     assert attempts["count"] == 2
     assert task.status == TaskStatus.FAILED
     assert task.error == "Codex process exited without producing a result."
+
+
+@pytest.mark.asyncio
+async def test_execute_task_treats_codex2_as_codex_family(monkeypatch) -> None:
+    bot = AsyncMock()
+    manager = TaskManager(bot)
+    task = BackgroundTask(
+        id="task-codex2-retry",
+        chat_id=123,
+        message_thread_id=None,
+        user_id=123,
+        prompt="x",
+        model="gpt-5-codex",
+        session_id="sess-1",
+        provider_cli="codex2",
+        status=TaskStatus.RUNNING,
+        created_at=datetime.now(),
+    )
+
+    captured: dict[str, str] = {}
+
+    async def fake_stream_codex_message(**kwargs):
+        captured["cli_name"] = kwargs["cli_name"]
+        yield bridge.StreamEvent(
+            event_type=bridge.StreamEventType.RESULT,
+            response=bridge.ClaudeResponse(
+                text="ok",
+                session_id="sess-2",
+                is_error=False,
+                cost_usd=0.0,
+            ),
+        )
+
+    monkeypatch.setattr("src.tasks.bridge.stream_codex_message", fake_stream_codex_message)
+
+    await manager._execute_task(task)  # noqa: SLF001
+
+    assert captured["cli_name"] == "codex2"
+    assert task.status == TaskStatus.COMPLETED
+    assert task.response == "ok"

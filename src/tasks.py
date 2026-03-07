@@ -299,7 +299,7 @@ class TaskManager:
 
     @classmethod
     def _is_retryable_provider_error(cls, provider_cli: str, error_text: str | None) -> bool:
-        if provider_cli != "codex":
+        if not provider_cli.startswith("codex"):
             return False
         text = (error_text or "").strip().lower()
         if not text:
@@ -386,12 +386,13 @@ class TaskManager:
         task: BackgroundTask,
     ) -> tuple[bridge.ClaudeResponse | None, ToolTimeoutRecord | None]:
         process_handle: dict = {}
-        if task.provider_cli == "codex":
+        if task.provider_cli.startswith("codex"):
             stream = bridge.stream_codex_message(
                 prompt=task.prompt,
                 session_id=task.session_id,
                 model=task.model,
                 resume_arg=task.resume_arg,
+                cli_name=task.provider_cli,
                 working_dir=config.CLAUDE_WORKING_DIR,
                 process_handle=process_handle,
             )

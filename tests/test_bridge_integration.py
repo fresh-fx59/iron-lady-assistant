@@ -503,6 +503,27 @@ class TestCodexCommandLineArgs:
             resume_idx = args.index("--resume")
             assert args[resume_idx + 1] == "sess-123"
 
+    async def test_codex2_uses_requested_cli_binary(self):
+        lines = [
+            b'{"type":"item.completed","item":{"type":"assistant_message","text":"hello"}}\n'
+        ]
+
+        with patch('asyncio.create_subprocess_exec') as mock_subproc:
+            proc = AsyncMock()
+            proc.returncode = 0
+            proc.stdout = AsyncMock()
+            proc.stdout.readline = AsyncMock(side_effect=lines + [b""])
+            proc.stderr = AsyncMock()
+            proc.stderr.read = AsyncMock(return_value=b"")
+            proc.wait = AsyncMock(return_value=0)
+            mock_subproc.return_value = proc
+
+            async for _ in stream_codex_message("hello", cli_name="codex2"):
+                break
+
+            args, _ = mock_subproc.call_args
+            assert args[0] == "codex2"
+
 
 # ── Contract 8: Cancellation support ──────────────────────────────
 @pytest.mark.asyncio

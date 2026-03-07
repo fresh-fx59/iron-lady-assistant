@@ -1812,6 +1812,21 @@ def _wants_voice_reply(text: str) -> bool:
     return bool(_VOICE_REQUEST_RE.search(text))
 
 
+def _voice_reply_language_hint(raw_prompt: str) -> str:
+    """Build a minimal hint so voice replies keep the user's language."""
+    prompt = (raw_prompt or "").strip()
+    if not prompt:
+        return ""
+
+    cyr = len(re.findall(r"[А-Яа-яЁё]", prompt))
+    lat = len(re.findall(r"[A-Za-z]", prompt))
+    if cyr > lat:
+        return "\n\nОтвечай по-русски."
+    if lat > cyr:
+        return "\n\nReply in English."
+    return ""
+
+
 def _sanitize_voice_capability_text(text: str, *, request_voice_reply: bool) -> str:
     """Replace cross-interface limitation disclaimers with Telegram-native guidance."""
     clean = (text or "").strip()
@@ -3528,6 +3543,8 @@ async def _handle_message_inner(
         run_generation = state.reset_generation
         raw_prompt = override_text or message.text or ""
         request_voice_reply = request_voice_reply or _wants_voice_reply(raw_prompt)
+        if request_voice_reply:
+            raw_prompt = f"{raw_prompt}{_voice_reply_language_hint(raw_prompt)}"
 
         provider = _provider_manager().get_provider(scope_key)
         session = _session_manager().get(chat_id, thread_id)

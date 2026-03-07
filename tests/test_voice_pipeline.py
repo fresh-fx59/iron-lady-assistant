@@ -7,6 +7,7 @@ from src.bot import (
     _maybe_add_local_tts_media,
     _sanitize_voice_capability_text,
     _send_media_refs,
+    _voice_reply_language_hint,
     _wants_voice_reply,
 )
 
@@ -43,6 +44,16 @@ def test_wants_voice_reply_detects_english_prompt():
 
 def test_wants_voice_reply_ignores_regular_text():
     assert not _wants_voice_reply("send text answer")
+
+
+def test_voice_reply_language_hint_prefers_russian_for_cyrillic_prompt():
+    hint = _voice_reply_language_hint("Расскажи коротко про Иран")
+    assert hint == "\n\nОтвечай по-русски."
+
+
+def test_voice_reply_language_hint_prefers_english_for_latin_prompt():
+    hint = _voice_reply_language_hint("Give me a short update")
+    assert hint == "\n\nReply in English."
 
 
 def test_sanitize_voice_capability_text_rewrites_interface_limitation_for_voice_request():

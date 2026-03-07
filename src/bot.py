@@ -98,6 +98,7 @@ _AUDIO_AS_VOICE_TAG_RE = re.compile(r"\[\[\s*audio_as_voice\s*\]\]", re.IGNORECA
 # requiring the directive to start the line.
 _MEDIA_LINE_RE = re.compile(r"^\s*(?:[^\w\s]+\s*)?MEDIA:\s*(.+?)\s*$", re.IGNORECASE)
 _LOCAL_PATH_LINE_RE = re.compile(r"^\s*([~/.][^\s]*)\s*$")
+_USE_TOOL_LINE_RE = re.compile(r"^\s*USE_TOOL:\s*[A-Za-z0-9_.-]+\s*$", re.IGNORECASE | re.MULTILINE)
 _VOICE_REQUEST_RE = re.compile(
     r"(?:\bvoice(?:\s*note)?\b|\bvoice\s*reply\b|войс|голос(?:ом|овое|овой)?|аудиосообщени[ея])",
     re.IGNORECASE,
@@ -1845,6 +1846,11 @@ def _sanitize_voice_capability_text(text: str, *, request_voice_reply: bool) -> 
     if request_voice_reply and _VOICE_INTERFACE_LIMITATION_RE.search(clean):
         return "Пришли текст для озвучки, и я отправлю его голосовой заметкой в Telegram."
     return clean
+
+
+def _strip_tool_directive_lines(text: str) -> str:
+    stripped = _USE_TOOL_LINE_RE.sub("", text or "")
+    return "\n".join(line for line in (ln.strip() for ln in stripped.splitlines()) if line).strip()
 
 
 def _default_timezone_name() -> str:
@@ -3776,7 +3782,12 @@ async def _handle_message_inner(
                 await progress.finish()
             else:
                 health_invariants.record_provider_result(success=True)
-                clean_text, media_refs, audio_as_voice = _extract_media_directives(final_response.text or "")
+                raw_response_text = final_response.text or ""
+                requested_tools = ToolRegistry.extract_requested_tools(raw_response_text)
+                clean_text, media_refs, audio_as_voice = _extract_media_directives(raw_response_text)
+                clean_text = _strip_tool_directive_lines(clean_text)
+                if request_voice_reply and requested_tools and not clean_text.strip() and not media_refs:
+                    clean_text = "Готово. Отправляю тестовое голосовое сообщение."
                 clean_text = _sanitize_voice_capability_text(
                     clean_text,
                     request_voice_reply=request_voice_reply,

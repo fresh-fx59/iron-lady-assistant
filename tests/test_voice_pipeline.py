@@ -8,6 +8,7 @@ from src.bot import (
     _prefers_female_voice,
     _sanitize_voice_capability_text,
     _send_media_refs,
+    _strip_tool_directive_lines,
     _voice_reply_language_hint,
     _wants_voice_reply,
 )
@@ -78,6 +79,11 @@ def test_sanitize_voice_capability_text_keeps_regular_response():
     text = "Готово. Сейчас отправляю голосовое сообщение."
     sanitized = _sanitize_voice_capability_text(text, request_voice_reply=True)
     assert sanitized == text
+
+
+def test_strip_tool_directive_lines_removes_use_tool_only_lines():
+    text = "USE_TOOL: sag\nГотово\nUSE_TOOL: discord"
+    assert _strip_tool_directive_lines(text) == "Готово"
 
 
 @pytest.mark.asyncio

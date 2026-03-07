@@ -118,3 +118,36 @@ async def test_synthesize_voice_retries_when_intelligibility_low(monkeypatch):
     assert out.endswith(".ogg")
     tts._run_sherpa_to_wav.assert_awaited_once()
     tts._run_tts_to_wav.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_synthesize_voice_female_strict_skips_sherpa(monkeypatch):
+    monkeypatch.setattr(tts, "_prepare_spoken_text", lambda _text: "Привет, Алекс")
+    monkeypatch.setattr(tts, "TTS_ENGINE", "auto")
+    monkeypatch.setattr(tts, "TTS_FEMALE_STRICT", True)
+    monkeypatch.setattr(tts, "_sherpa_available", lambda: True)
+    monkeypatch.setattr(tts, "_run_sherpa_to_wav", AsyncMock(return_value=(0, "")))
+    monkeypatch.setattr(tts, "_run_tts_to_wav", AsyncMock(return_value=(0, "")))
+    monkeypatch.setattr(tts, "_verify_intelligibility", AsyncMock(return_value=(True, "ok")))
+
+    class _OkProc:
+        returncode = 0
+
+        async def communicate(self):
+            return b"", b""
+
+    async def _fake_create_subprocess_exec(*args, **kwargs):
+        Path(args[-1]).write_bytes(b"ogg")
+        return _OkProc()
+
+    monkeypatch.setattr(
+        tts.asyncio,
+        "create_subprocess_exec",
+        AsyncMock(side_effect=_fake_create_subprocess_exec),
+    )
+
+    out = await tts.synthesize_voice("ignored", prefer_female=True)
+
+    assert out.endswith(".ogg")
+    tts._run_tts_to_wav.assert_awaited()
+    tts._run_sherpa_to_wav.assert_not_awaited()

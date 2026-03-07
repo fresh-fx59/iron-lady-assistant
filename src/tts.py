@@ -80,6 +80,9 @@ TTS_VERIFY_SHERPA: bool = (
 TTS_STRICT_CYRILLIC_QUALITY: bool = (
     os.getenv("LOCAL_TTS_STRICT_CYRILLIC_QUALITY", "1").strip().lower() not in {"0", "false", "no"}
 )
+TTS_FEMALE_STRICT: bool = (
+    os.getenv("LOCAL_TTS_FEMALE_STRICT", "1").strip().lower() not in {"0", "false", "no"}
+)
 
 _CODE_BLOCK_RE = re.compile(r"```.*?```", re.DOTALL)
 _INLINE_CODE_RE = re.compile(r"`[^`]+`")
@@ -313,14 +316,15 @@ async def synthesize_voice(text: str, *, prefer_female: bool = False) -> str:
                 attempts.append(key)
 
         cyrillic_text = _is_cyrillic_dominant(spoken_text)
-        if prefer_female and cyrillic_text:
+        female_cyrillic_request = prefer_female and cyrillic_text
+        if female_cyrillic_request:
             add_attempt("espeak", TTS_VOICE_CYRILLIC_FEMALE, selected_speed)
             try:
                 female_slower_speed = str(max(120, int(selected_speed) - 20))
             except ValueError:
                 female_slower_speed = "150"
             add_attempt("espeak", TTS_VOICE_CYRILLIC_FEMALE, female_slower_speed)
-        if use_sherpa:
+        if use_sherpa and not (female_cyrillic_request and TTS_FEMALE_STRICT):
             add_attempt("sherpa")
         # Keep Russian quality stable: avoid espeak fallback unless sherpa is unavailable or strict mode disabled.
         allow_espeak_attempts = prefer_female or not (

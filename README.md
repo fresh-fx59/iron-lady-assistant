@@ -114,11 +114,25 @@ What it does:
 - Symlinks your `~/.gitconfig`
 - Symlinks your `~/.ssh`
 - Installs a wrapper executable like `/usr/local/bin/codex3` that runs `codex` with `HOME=~/.codex3`
+- Keeps Codex/OpenAI login isolated by default because each instance has its own `HOME`
+- Shares `gh` auth only if you explicitly pass `--share-gh-config`
 
 Then authenticate that separate instance once:
 
 ```bash
 HOME="$HOME/.codex3" codex login
+```
+
+If you also want that instance to reuse your normal `gh` login:
+
+```bash
+./create_codex_instance.sh codex3 /usr/local/bin/codex3 --share-gh-config
+```
+
+If you do not pass `--share-gh-config`, GitHub CLI stays separate too:
+
+```bash
+HOME="$HOME/.codex3" gh auth login
 ```
 
 ## Running in the Background

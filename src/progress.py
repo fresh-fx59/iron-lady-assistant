@@ -61,6 +61,7 @@ class ProgressReporter:
         self._heartbeat_index: int = 0
         self._audio_progress_task: asyncio.Task | None = None
         self._audio_progress_started_at: float | None = None
+        self._stale_message_ids: set[int] = set()
 
     async def report_tool(self, tool_name: str, tool_input: str | None) -> None:
         """Report a tool action being performed.
@@ -99,13 +100,7 @@ class ProgressReporter:
             return
         text = "🔄 <b>Working...</b>"
         try:
-            msg = await self._bot.send_message(
-                chat_id=self._chat_id,
-                message_thread_id=self._message_thread_id,
-                text=text,
-                parse_mode="HTML",
-            )
-            self._progress_message_id = msg.message_id
+            self._progress_message_id = await self._send_progress_message(text)
             self._last_update_text = text
             self._start_heartbeat()
         except TelegramAPIError as e:
@@ -158,13 +153,7 @@ class ProgressReporter:
 
         if self._progress_message_id is None:
             try:
-                msg = await self._bot.send_message(
-                    chat_id=self._chat_id,
-                    message_thread_id=self._message_thread_id,
-                    text=text,
-                    parse_mode="HTML",
-                )
-                self._progress_message_id = msg.message_id
+                self._progress_message_id = await self._send_progress_message(text)
             except TelegramAPIError as e:
                 logger.warning("Failed to send audio progress message: %s", e)
             return
@@ -178,6 +167,8 @@ class ProgressReporter:
             )
         except TelegramAPIError as e:
             if "message is not modified" not in str(e).lower():
+                if await self._fallback_after_edit_failure(text, e):
+                    return
                 logger.warning("Failed to update audio progress message: %s", e)
 
     async def _audio_progress_loop(self) -> None:
@@ -187,6 +178,33 @@ class ProgressReporter:
                 await self._render_audio_progress()
         except asyncio.CancelledError:
             pass
+
+    async def _send_progress_message(self, text: str) -> int:
+        msg = await self._bot.send_message(
+            chat_id=self._chat_id,
+            message_thread_id=self._message_thread_id,
+            text=text,
+            parse_mode="HTML",
+        )
+        return msg.message_id
+
+    async def _fallback_after_edit_failure(self, text: str, error: TelegramAPIError) -> bool:
+        if not self._should_replace_message_after_edit_error(error):
+            return False
+
+        try:
+            new_message_id = await self._send_progress_message(text)
+        except TelegramAPIError:
+            return False
+
+        if self._progress_message_id is not None:
+            self._stale_message_ids.add(self._progress_message_id)
+        self._progress_message_id = new_message_id
+        return True
+
+    def _should_replace_message_after_edit_error(self, error: TelegramAPIError) -> bool:
+        message = str(error).lower()
+        return "flood control" in message or "too many requests" in message or "retry after" in message
 
     def _format_tool_action(self, tool_name: str, tool_input: str | None) -> str:
         """Format a tool action into a human-readable line."""
@@ -257,13 +275,7 @@ class ProgressReporter:
             if self._progress_message_id is None:
                 # Send new message
                 try:
-                    msg = await self._bot.send_message(
-                        chat_id=self._chat_id,
-                        message_thread_id=self._message_thread_id,
-                        text=text,
-                        parse_mode="HTML",
-                    )
-                    self._progress_message_id = msg.message_id
+                    self._progress_message_id = await self._send_progress_message(text)
                 except TelegramAPIError as e:
                     logger.warning("Failed to send progress message: %s", e)
             else:
@@ -278,6 +290,9 @@ class ProgressReporter:
                 except TelegramAPIError as e:
                     # MessageNotModified is harmless, other errors log warning
                     if "message is not modified" not in str(e).lower():
+                        if await self._fallback_after_edit_failure(text, e):
+                            self._start_heartbeat()
+                            return
                         logger.warning("Failed to update progress message: %s", e)
 
             # Start heartbeat animation after the update
@@ -376,6 +391,15 @@ class ProgressReporter:
             except TelegramAPIError as e:
                 # Message might have been deleted already or doesn't exist
                 logger.debug("Could not delete progress message: %s", e)
+        for stale_id in list(self._stale_message_ids):
+            try:
+                await self._bot.delete_message(
+                    chat_id=self._chat_id,
+                    message_id=stale_id,
+                )
+            except TelegramAPIError:
+                pass
+        self._stale_message_ids.clear()
 
     async def show_cancelled(self) -> None:
         """Update the progress message to show cancellation before deletion."""

@@ -100,7 +100,7 @@ Open Telegram, find your bot by its username, and start chatting.
 
 Just send any text message and the bot will respond using the currently selected provider.
 
-For audio or voice-note replies, the bot switches the live progress message into audio-conversion mode during TTS generation, shows elapsed time while converting, and keeps a final conversion-time message in chat after the audio is sent.
+For audio or voice-note replies, the bot switches the live progress message into audio-conversion mode during TTS generation, shows elapsed time while converting, falls back to a fresh progress message if Telegram rate-limits edits, and keeps a final conversion-time message in chat after the audio is sent.
 
 ## Codex Instance Helper
 

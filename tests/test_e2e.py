@@ -6,9 +6,10 @@ These are the highest-level behavioral contracts.
 
 import asyncio
 import json
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from aiogram.exceptions import TelegramAPIError
 
 from src.bot import handle_message, cmd_start, cmd_new, cmd_model, cmd_status
 from src.sessions import SessionManager
@@ -355,6 +356,29 @@ class TestProgressReportingLifecycle:
         texts = [call.kwargs["text"] for call in mock_message.bot.edit_message_text.await_args_list]
         assert any("Converting audio reply" in text for text in texts)
         assert any("Elapsed:" in text for text in texts)
+
+        await reporter.finish()
+
+    async def test_progress_falls_back_to_new_message_when_edit_is_rate_limited(self, mock_message):
+        """Flood-controlled edits should fall back to a fresh progress message."""
+        from src.progress import ProgressReporter
+
+        mock_message.bot.send_message.side_effect = [
+            MagicMock(message_id=123),
+            MagicMock(message_id=456),
+        ]
+        mock_message.bot.edit_message_text.side_effect = TelegramAPIError(
+            AsyncMock(),
+            "Telegram server says - Flood control exceeded on method 'EditMessageText' in chat -1. Retry in 9 seconds."
+        )
+
+        reporter = ProgressReporter(mock_message, debounce_seconds=0)
+
+        await reporter.show_working()
+        await reporter.report_tool("Read", "/tmp/file.txt")
+        await asyncio.sleep(0.05)
+
+        assert mock_message.bot.send_message.await_count == 2
 
         await reporter.finish()
 

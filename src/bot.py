@@ -2566,17 +2566,16 @@ async def _send_audio_with_progress(message: Message, media_input, *, as_voice: 
             except asyncio.CancelledError:
                 pass
         if progress_message_id is not None:
-            try:
-                await message.bot.edit_message_text(
-                    chat_id=message.chat.id,
-                    message_id=progress_message_id,
-                    text=_format_audio_conversion_complete(elapsed_seconds)
-                    if completed
-                    else _format_audio_conversion_failed(elapsed_seconds),
-                    parse_mode="HTML",
-                )
-            except TelegramAPIError as e:
-                logger.debug("Could not finalize audio conversion progress message: %s", e)
+            final_text = (
+                _format_audio_conversion_complete(elapsed_seconds)
+                if completed
+                else _format_audio_conversion_failed(elapsed_seconds)
+            )
+            await _finalize_audio_conversion_progress(
+                message,
+                progress_message_id,
+                final_text,
+            )
 
 
 def _format_audio_conversion_progress(elapsed_seconds: float) -> str:
@@ -2622,10 +2621,41 @@ async def _update_audio_conversion_progress(
                     text=_format_audio_conversion_progress(monotonic() - started_at),
                     parse_mode="HTML",
                 )
+            except TelegramRetryAfter as e:
+                logger.debug("Audio conversion progress rate-limited, retry in %ss", e.retry_after)
+                await asyncio.sleep(max(0, e.retry_after))
             except TelegramAPIError as e:
                 if "message is not modified" not in str(e).lower():
                     logger.debug("Audio conversion progress update failed: %s", e)
                     return
+    except asyncio.CancelledError:
+        return
+
+
+async def _finalize_audio_conversion_progress(
+    message: Message,
+    progress_message_id: int,
+    text: str,
+) -> None:
+    try:
+        while True:
+            try:
+                await message.bot.edit_message_text(
+                    chat_id=message.chat.id,
+                    message_id=progress_message_id,
+                    text=text,
+                    parse_mode="HTML",
+                )
+                return
+            except TelegramRetryAfter as e:
+                logger.debug(
+                    "Audio conversion finalization rate-limited, retry in %ss",
+                    e.retry_after,
+                )
+                await asyncio.sleep(max(0, e.retry_after))
+            except TelegramAPIError as e:
+                logger.debug("Could not finalize audio conversion progress message: %s", e)
+                return
     except asyncio.CancelledError:
         return
 

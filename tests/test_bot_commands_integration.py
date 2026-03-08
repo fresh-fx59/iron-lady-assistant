@@ -8,7 +8,7 @@ import asyncio
 from unittest.mock import AsyncMock, patch
 
 import pytest
-from aiogram.exceptions import TelegramAPIError
+from aiogram.exceptions import TelegramAPIError, TelegramRetryAfter
 
 from src.bot import (
     cmd_start,
@@ -785,8 +785,38 @@ class TestVoiceHandling:
         assert mock_message.bot.send_message.await_count >= 1
         send_texts = [call.kwargs["text"] for call in mock_message.bot.send_message.await_args_list]
         assert any("Transcribing voice message" in text for text in send_texts)
+        assert mock_message.bot.send_chat_action.await_count >= 1
         assert mock_message.bot.edit_message_text.await_count >= 1
         assert mock_message.bot.delete_message.await_count >= 1
+        handle_inner.assert_awaited_once()
+
+    async def test_handle_voice_retries_transcription_progress_after_retry_after(
+        self,
+        mock_message,
+        monkeypatch,
+    ):
+        mock_message.voice = AsyncMock()
+        mock_message.voice.file_id = "voice-file"
+        mock_message.voice.duration = 7
+        mock_message.bot.get_file = AsyncMock(return_value=type("File", (), {"file_path": "voice/path.oga"})())
+        mock_message.bot.download_file = AsyncMock()
+        mock_message.bot.send_message.side_effect = [
+            TelegramRetryAfter(AsyncMock(), "retry later", 0),
+            type("SentMessage", (), {"message_id": 321})(),
+        ]
+
+        async def slow_transcribe(_path):
+            await asyncio.sleep(0.02)
+            return "hello world"
+
+        monkeypatch.setattr("src.bot.transcribe.is_available", lambda: True)
+        monkeypatch.setattr("src.bot.transcribe.transcribe", slow_transcribe)
+        handle_inner = AsyncMock()
+        monkeypatch.setattr("src.bot._handle_message_inner", handle_inner)
+
+        await handle_voice(mock_message)
+
+        assert mock_message.bot.send_message.await_count >= 2
         handle_inner.assert_awaited_once()
 
     async def test_handle_voice_does_not_send_duplicate_generic_error_on_delivery_failure(
@@ -886,6 +916,62 @@ class TestAudioProgress:
             parse_mode="HTML",
         )
         assert started_actions == ["typing"]
+
+    async def test_send_media_reply_retries_progress_update_after_retry_after(
+        self,
+        mock_message,
+        monkeypatch,
+    ):
+        async def fake_keep_chat_action(message, action):
+            try:
+                await asyncio.sleep(3600)
+            except asyncio.CancelledError:
+                return
+
+        monkeypatch.setattr("src.bot._keep_chat_action", fake_keep_chat_action)
+        monkeypatch.setattr("src.bot._AUDIO_PROGRESS_UPDATE_INTERVAL", 0.01)
+
+        async def slow_answer_audio(*args, **kwargs):
+            await asyncio.sleep(0.03)
+
+        mock_message.answer_audio.side_effect = slow_answer_audio
+        mock_message.bot.edit_message_text.side_effect = [
+            TelegramRetryAfter(AsyncMock(), "retry later", 0),
+            None,
+            None,
+        ]
+
+        await _send_media_reply(mock_message, "/tmp/reply.wav", audio_as_voice=False)
+
+        assert mock_message.bot.edit_message_text.await_count >= 2
+        edit_texts = [call.kwargs["text"] for call in mock_message.bot.edit_message_text.await_args_list]
+        assert any("Elapsed:" in text for text in edit_texts)
+        assert "Audio reply sent" in edit_texts[-1]
+
+    async def test_send_media_reply_retries_finalization_after_retry_after(
+        self,
+        mock_message,
+        monkeypatch,
+    ):
+        async def fake_keep_chat_action(message, action):
+            try:
+                await asyncio.sleep(3600)
+            except asyncio.CancelledError:
+                return
+
+        monkeypatch.setattr("src.bot._keep_chat_action", fake_keep_chat_action)
+        monkeypatch.setattr("src.bot._AUDIO_PROGRESS_UPDATE_INTERVAL", 1.0)
+        mock_message.bot.edit_message_text.side_effect = [
+            TelegramRetryAfter(AsyncMock(), "retry later", 0),
+            None,
+        ]
+
+        await _send_media_reply(mock_message, "/tmp/reply.wav", audio_as_voice=False)
+
+        assert mock_message.bot.edit_message_text.await_count == 2
+        final_text = mock_message.bot.edit_message_text.await_args_list[-1].kwargs["text"]
+        assert "Audio reply sent" in final_text
+        assert "Conversion time:" in final_text
 
 
 # ── Contract 8: Chat state management ───────────────────────────

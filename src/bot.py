@@ -92,6 +92,7 @@ _EMPTY_RESPONSE_FALLBACK_TEXT = (
     "Please resend your last message."
 )
 _AUDIO_PROGRESS_UPDATE_INTERVAL = 1.0
+_VOICE_TRANSCRIPTION_PROGRESS_INTERVAL = 1.0
 # Backward-compatible state paths retained for tests/fixtures importing these symbols.
 _STEP_PLAN_STATE_PATH = config.MEMORY_DIR / "step_plan_state.json"
 _SCOPE_SNAPSHOT_PATH = config.MEMORY_DIR / "scope_snapshot.json"
@@ -1882,7 +1883,24 @@ async def handle_voice(message: Message) -> None:
 
     file = await message.bot.get_file(message.voice.file_id)
     tmp = tempfile.NamedTemporaryFile(suffix=".oga", delete=False)
+    transcription_started_at = monotonic()
+    transcription_status_message_id: int | None = None
+    transcription_status_task: asyncio.Task | None = None
+    transcription_typing_task = asyncio.create_task(_keep_chat_action(message, ChatAction.TYPING))
     try:
+        await asyncio.sleep(0)
+        transcription_status_message_id = await _send_voice_transcription_progress_message(
+            message,
+            monotonic() - transcription_started_at,
+        )
+        if transcription_status_message_id is not None:
+            transcription_status_task = asyncio.create_task(
+                _update_voice_transcription_progress(
+                    message,
+                    transcription_status_message_id,
+                    transcription_started_at,
+                )
+            )
         await message.bot.download_file(file.file_path, tmp.name)
         text = await transcribe.transcribe(tmp.name)
         logger.info("Chat %d: transcribed voice (%ds) → %d chars",
@@ -1892,16 +1910,42 @@ async def handle_voice(message: Message) -> None:
         await message.answer("Failed to transcribe voice message.")
         return
     finally:
+        transcription_typing_task.cancel()
+        try:
+            await transcription_typing_task
+        except asyncio.CancelledError:
+            pass
+        if transcription_status_task is not None:
+            transcription_status_task.cancel()
+            try:
+                await transcription_status_task
+            except asyncio.CancelledError:
+                pass
+        if transcription_status_message_id is not None:
+            try:
+                await message.bot.delete_message(
+                    chat_id=message.chat.id,
+                    message_id=transcription_status_message_id,
+                )
+            except TelegramAPIError:
+                pass
         os.unlink(tmp.name)
 
     override = f"[Voice message] {text}"
     try:
         await _handle_message_inner(message, override_text=override)
+    except TelegramAPIError:
+        logger.exception("Voice response delivery failed after transcription")
+        metrics.MESSAGES_TOTAL.labels(status="error").inc()
+        _record_error(_scope_key_from_message(message))
     except Exception:
         logger.exception("Unhandled exception in handle_voice")
         metrics.MESSAGES_TOTAL.labels(status="error").inc()
         _record_error(_scope_key_from_message(message))
-        await message.answer("An internal error occurred while processing your voice message.")
+        try:
+            await message.answer("An internal error occurred while processing your voice message.")
+        except TelegramAPIError:
+            logger.exception("Voice fallback error delivery failed")
 
 
 @router.message(F.text)
@@ -2444,6 +2488,13 @@ def _format_audio_conversion_progress(elapsed_seconds: float) -> str:
     )
 
 
+def _format_voice_transcription_progress(elapsed_seconds: float) -> str:
+    return (
+        "🎤 <b>Transcribing voice message...</b>\n"
+        f"Elapsed: <code>{elapsed_seconds:.1f}s</code>"
+    )
+
+
 def _format_audio_conversion_complete(elapsed_seconds: float) -> str:
     return (
         "✅ <b>Audio reply sent</b>\n"
@@ -2476,6 +2527,46 @@ async def _update_audio_conversion_progress(
             except TelegramAPIError as e:
                 if "message is not modified" not in str(e).lower():
                     logger.debug("Audio conversion progress update failed: %s", e)
+                    return
+    except asyncio.CancelledError:
+        return
+
+
+async def _send_voice_transcription_progress_message(
+    message: Message,
+    elapsed_seconds: float,
+) -> int | None:
+    try:
+        progress_message = await message.bot.send_message(
+            chat_id=message.chat.id,
+            message_thread_id=_thread_id(message),
+            text=_format_voice_transcription_progress(elapsed_seconds),
+            parse_mode="HTML",
+        )
+        return progress_message.message_id
+    except TelegramAPIError as e:
+        logger.debug("Voice transcription progress message failed: %s", e)
+        return None
+
+
+async def _update_voice_transcription_progress(
+    message: Message,
+    progress_message_id: int,
+    started_at: float,
+) -> None:
+    try:
+        while True:
+            await asyncio.sleep(_VOICE_TRANSCRIPTION_PROGRESS_INTERVAL)
+            try:
+                await message.bot.edit_message_text(
+                    chat_id=message.chat.id,
+                    message_id=progress_message_id,
+                    text=_format_voice_transcription_progress(monotonic() - started_at),
+                    parse_mode="HTML",
+                )
+            except TelegramAPIError as e:
+                if "message is not modified" not in str(e).lower():
+                    logger.debug("Voice transcription progress update failed: %s", e)
                     return
     except asyncio.CancelledError:
         return

@@ -8,6 +8,7 @@ import asyncio
 from unittest.mock import AsyncMock, patch
 
 import pytest
+from aiogram.exceptions import TelegramAPIError
 
 from src.bot import (
     cmd_start,
@@ -23,6 +24,7 @@ from src.bot import (
     cmd_schedule_list,
     cmd_schedule_cancel,
     handle_message,
+    handle_voice,
     _ChatState,
     _get_state,
     _command_args,
@@ -753,6 +755,64 @@ class TestMessageHandling:
         assert run_mock.await_count == 2
         all_answers = [call.args[0] for call in mock_message.answer.await_args_list if call.args]
         assert any("Steered answer" in text for text in all_answers)
+
+
+@pytest.mark.asyncio
+class TestVoiceHandling:
+    async def test_handle_voice_shows_transcription_progress_before_message_processing(
+        self,
+        mock_message,
+        monkeypatch,
+    ):
+        mock_message.voice = AsyncMock()
+        mock_message.voice.file_id = "voice-file"
+        mock_message.voice.duration = 7
+        mock_message.bot.get_file = AsyncMock(return_value=type("File", (), {"file_path": "voice/path.oga"})())
+        mock_message.bot.download_file = AsyncMock()
+
+        async def slow_transcribe(_path):
+            await asyncio.sleep(0.03)
+            return "hello world"
+
+        monkeypatch.setattr("src.bot.transcribe.is_available", lambda: True)
+        monkeypatch.setattr("src.bot.transcribe.transcribe", slow_transcribe)
+        monkeypatch.setattr("src.bot._VOICE_TRANSCRIPTION_PROGRESS_INTERVAL", 0.01)
+        handle_inner = AsyncMock()
+        monkeypatch.setattr("src.bot._handle_message_inner", handle_inner)
+
+        await handle_voice(mock_message)
+
+        assert mock_message.bot.send_message.await_count >= 1
+        send_texts = [call.kwargs["text"] for call in mock_message.bot.send_message.await_args_list]
+        assert any("Transcribing voice message" in text for text in send_texts)
+        assert mock_message.bot.edit_message_text.await_count >= 1
+        assert mock_message.bot.delete_message.await_count >= 1
+        handle_inner.assert_awaited_once()
+
+    async def test_handle_voice_does_not_send_duplicate_generic_error_on_delivery_failure(
+        self,
+        mock_message,
+        monkeypatch,
+    ):
+        mock_message.voice = AsyncMock()
+        mock_message.voice.file_id = "voice-file"
+        mock_message.voice.duration = 7
+        mock_message.bot.get_file = AsyncMock(return_value=type("File", (), {"file_path": "voice/path.oga"})())
+        mock_message.bot.download_file = AsyncMock()
+
+        monkeypatch.setattr("src.bot.transcribe.is_available", lambda: True)
+        monkeypatch.setattr("src.bot.transcribe.transcribe", AsyncMock(return_value="hello world"))
+        monkeypatch.setattr(
+            "src.bot._handle_message_inner",
+            AsyncMock(side_effect=TelegramAPIError(AsyncMock(), "Server disconnected")),
+        )
+
+        await handle_voice(mock_message)
+
+        assert not any(
+            call.args and "An internal error occurred while processing your voice message." in call.args[0]
+            for call in mock_message.answer.await_args_list
+        )
 
 
 @pytest.mark.asyncio

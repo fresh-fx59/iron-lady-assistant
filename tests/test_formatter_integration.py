@@ -157,10 +157,29 @@ class TestMessageSplitting:
         assert result == [text]
 
     def test_split_at_paragraph_boundary(self):
-        """Should prefer splitting at double newline if possible."""
-        # First chunk + "\n\n" + second chunk
+        """Should keep paragraphs together when the full text fits."""
         paragraph1 = "a" * 2000
         paragraph2 = "b" * 2000
+        text = f"{paragraph1}\n\n{paragraph2}"
+
+        result = split_message(text)
+
+        assert result == [text]
+
+    def test_split_at_line_boundary(self):
+        """Should keep line-broken text together when it still fits."""
+        text = ""
+        for i in range(4):
+            text += "a" * 1000 + "\n"
+
+        result = split_message(text)
+
+        assert result == [text]
+
+    def test_split_at_paragraph_boundary_when_over_limit(self):
+        """Should prefer paragraph boundaries once splitting is required."""
+        paragraph1 = "a" * 2500
+        paragraph2 = "b" * 2500
         text = f"{paragraph1}\n\n{paragraph2}"
 
         result = split_message(text)
@@ -169,23 +188,10 @@ class TestMessageSplitting:
         assert result[0] == paragraph1
         assert result[1] == paragraph2
 
-    def test_split_at_line_boundary(self):
-        """Should fall back to single newline if no paragraph break."""
-        # Build text where no double newline exists near limit
-        text = ""
-        for i in range(4):
-            text += "a" * 1000 + "\n"
-
-        result = split_message(text)
-
-        assert len(result) == 4
-        for r in result:
-            assert len(r) <= 4096
-
     def test_split_at_space_boundary(self):
         """Should fall back to space if no line break."""
         # Continuous text that exceeds limit
-        text = "word " * 500  # Each "word " is 5 chars
+        text = "word " * 1200  # Each "word " is 5 chars
 
         result = split_message(text)
 
@@ -205,8 +211,8 @@ class TestMessageSplitting:
         assert len(result[2]) == 10000 - 8192
 
     def test_split_strips_leading_newline(self):
-        """Split chunks should not start with newline from separator."""
-        text = "a" * 4000 + "\n\nb" * 4000
+        """Split chunks should not start with separator fragments."""
+        text = ("a" * 4000) + "\n\n" + ("b" * 4000)
 
         result = split_message(text)
 

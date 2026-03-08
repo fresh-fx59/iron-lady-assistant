@@ -99,41 +99,51 @@ def split_message(text: str) -> list[str]:
     """Split text into chunks that fit Telegram's message limit."""
     if text == "":
         return [""]
-    if re.search(r"<[^>]+>", text) and len(text) <= MAX_MESSAGE_LENGTH:
+    if len(text) <= MAX_MESSAGE_LENGTH:
         return [text]
+
+    def _pack_units(units: list[str], separator: str) -> list[str]:
+        chunks: list[str] = []
+        current = ""
+        for unit in units:
+            if not unit:
+                continue
+            candidate = unit if not current else f"{current}{separator}{unit}"
+            if len(candidate) <= MAX_MESSAGE_LENGTH:
+                current = candidate
+                continue
+            if current:
+                chunks.append(current)
+                current = ""
+            if len(unit) <= MAX_MESSAGE_LENGTH:
+                current = unit
+                continue
+            oversized_parts = _split_oversized(unit)
+            if oversized_parts:
+                chunks.extend(oversized_parts[:-1])
+                current = oversized_parts[-1]
+        if current:
+            chunks.append(current)
+        return chunks
 
     def _split_oversized(chunk: str) -> list[str]:
         if len(chunk) <= MAX_MESSAGE_LENGTH:
             return [chunk]
 
-        out: list[str] = []
-        remaining = chunk
-        while remaining:
-            if len(remaining) <= MAX_MESSAGE_LENGTH:
-                out.append(remaining)
-                break
-            split_at = remaining.rfind(" ", 0, MAX_MESSAGE_LENGTH + 1)
-            if split_at <= 0:
-                split_at = MAX_MESSAGE_LENGTH
-            out.append(remaining[:split_at])
-            remaining = remaining[split_at:].lstrip(" ")
-        return out
+        if "\n\n" in chunk:
+            return _pack_units(chunk.split("\n\n"), "\n\n")
+        if "\n" in chunk:
+            return _pack_units(chunk.split("\n"), "\n")
+        if " " in chunk:
+            return _pack_units(chunk.split(" "), " ")
 
-    if "\n\n" in text:
-        units = text.split("\n\n")
-    elif "\n" in text:
-        units = text.split("\n")
-    else:
-        units = [text]
+        return [
+            chunk[index:index + MAX_MESSAGE_LENGTH]
+            for index in range(0, len(chunk), MAX_MESSAGE_LENGTH)
+        ]
 
-    chunks: list[str] = []
-    for unit in units:
-        for piece in _split_oversized(unit):
-            trimmed = piece.strip()
-            if trimmed:
-                chunks.append(trimmed)
-
-    return chunks or [""]
+    chunks = _split_oversized(text)
+    return [chunk for chunk in chunks if chunk] or [""]
 
 
 def strip_html(text: str) -> str:

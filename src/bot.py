@@ -21,7 +21,7 @@ from aiogram.filters import Command, CommandObject, CommandStart
 from aiogram.types import Message, CallbackQuery, ErrorEvent, FSInputFile
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from aiogram.enums import ChatAction
-from aiogram.exceptions import TelegramAPIError
+from aiogram.exceptions import TelegramAPIError, TelegramRetryAfter
 
 from . import bridge, config, metrics, transcribe
 from .core.context_plugins import ContextPluginRegistry
@@ -87,6 +87,7 @@ _USE_TOOL_LINE_RE = re.compile(r"^\s*USE_TOOL:\s*[A-Za-z0-9_.-]+\s*$", re.IGNORE
 _VOICE_COMPATIBLE_EXTENSIONS = {".ogg", ".opus", ".mp3", ".m4a"}
 _AUDIO_EXTENSIONS = _VOICE_COMPATIBLE_EXTENSIONS | {".wav", ".aac", ".flac"}
 _IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png"}
+_INCOMING_MEDIA_DIR = config.MEMORY_DIR / "incoming_media"
 _EMPTY_RESPONSE_FALLBACK_TEXT = (
     "I received an empty response from the provider. "
     "Please resend your last message."
@@ -377,6 +378,46 @@ def _truncate_output(text: str, max_len: int = 2000) -> str:
 
 def _as_text(value: object) -> str:
     return value if isinstance(value, str) else ""
+
+
+def _message_base_text(message: Message, override_text: str | None = None) -> str:
+    if override_text is not None:
+        return _as_text(override_text).strip()
+    return (_as_text(getattr(message, "text", None)) or _as_text(getattr(message, "caption", None))).strip()
+
+
+async def _download_photo_attachment(message: Message) -> str | None:
+    photos = getattr(message, "photo", None) or []
+    if not photos:
+        return None
+    try:
+        largest = photos[-1]
+        tg_file = await message.bot.get_file(largest.file_id)
+        suffix = Path(tg_file.file_path or "").suffix.lower() or ".jpg"
+        if suffix not in _IMAGE_EXTENSIONS:
+            suffix = ".jpg"
+        _INCOMING_MEDIA_DIR.mkdir(parents=True, exist_ok=True)
+        target_path = _INCOMING_MEDIA_DIR / f"{message.chat.id}_{message.message_id}_{uuid4().hex[:8]}{suffix}"
+        await message.bot.download_file(tg_file.file_path, destination=target_path)
+        return str(target_path)
+    except Exception:
+        logger.exception("Failed to download photo attachment for message %s", message.message_id)
+        return None
+
+
+async def _compose_incoming_prompt(message: Message, override_text: str | None = None) -> str:
+    base_text = _message_base_text(message, override_text)
+    image_path = await _download_photo_attachment(message)
+    if not image_path:
+        return base_text
+    attachment_block = (
+        "User attached an image.\n"
+        f"Local image path: {image_path}\n"
+        "Inspect this image when answering."
+    )
+    if base_text:
+        return f"{base_text}\n\n{attachment_block}"
+    return attachment_block
 
 
 def _inject_tool_request(prompt_text: str, tool_name: str) -> str:
@@ -1886,10 +1927,15 @@ async def handle_voice(message: Message) -> None:
     transcription_started_at = monotonic()
     transcription_status_message_id: int | None = None
     transcription_status_task: asyncio.Task | None = None
+    transcription_status_retry_task: asyncio.Task | None = None
+    await _send_chat_action_once(message, ChatAction.TYPING)
     transcription_typing_task = asyncio.create_task(_keep_chat_action(message, ChatAction.TYPING))
     try:
         await asyncio.sleep(0)
-        transcription_status_message_id = await _send_voice_transcription_progress_message(
+        (
+            transcription_status_message_id,
+            transcription_retry_after,
+        ) = await _send_voice_transcription_progress_message(
             message,
             monotonic() - transcription_started_at,
         )
@@ -1899,6 +1945,14 @@ async def handle_voice(message: Message) -> None:
                     message,
                     transcription_status_message_id,
                     transcription_started_at,
+                )
+            )
+        elif transcription_retry_after is not None:
+            transcription_status_retry_task = asyncio.create_task(
+                _retry_voice_transcription_progress_message(
+                    message,
+                    transcription_started_at,
+                    transcription_retry_after,
                 )
             )
         await message.bot.download_file(file.file_path, tmp.name)
@@ -1919,6 +1973,12 @@ async def handle_voice(message: Message) -> None:
             transcription_status_task.cancel()
             try:
                 await transcription_status_task
+            except asyncio.CancelledError:
+                pass
+        if transcription_status_retry_task is not None:
+            transcription_status_retry_task.cancel()
+            try:
+                await transcription_status_retry_task
             except asyncio.CancelledError:
                 pass
         if transcription_status_message_id is not None:
@@ -1967,9 +2027,33 @@ async def handle_message(message: Message) -> None:
         )
 
 
+@router.message(F.photo)
+async def handle_photo_message(message: Message) -> None:
+    try:
+        await _handle_message_inner(message)
+    except Exception:
+        logger.exception("Unhandled exception in handle_photo_message")
+        metrics.MESSAGES_TOTAL.labels(status="error").inc()
+        scope_key = _scope_key_from_message(message)
+        _record_error(scope_key)
+        reply_markup = _build_rollback_suggestion_markup(
+            scope_key,
+            message.from_user and message.from_user.id,
+        )
+        await message.answer(
+            "An internal error occurred while processing your request.",
+            reply_markup=reply_markup,
+        )
+
+
 @router.channel_post(F.text)
 async def handle_channel_post(message: Message) -> None:
     await handle_message(message)
+
+
+@router.channel_post(F.photo)
+async def handle_channel_photo(message: Message) -> None:
+    await handle_photo_message(message)
 
 
 @router.message(F.forum_topic_created)
@@ -1995,7 +2079,7 @@ async def _handle_message_inner(message: Message, override_text: str | None = No
     chat_id = message.chat.id
     thread_id = _thread_id(message)
     scope_key = _scope_key(chat_id, thread_id)
-    raw_prompt = _as_text(override_text) or _as_text(getattr(message, "text", None))
+    raw_prompt = await _compose_incoming_prompt(message, override_text)
     state = _get_state(scope_key)
 
     if state.lock.locked():
@@ -2414,6 +2498,20 @@ async def _keep_chat_action(message: Message, action: ChatAction) -> None:
         return
 
 
+async def _send_chat_action_once(message: Message, action: ChatAction) -> None:
+    try:
+        if _thread_id(message) is not None:
+            await message.bot.send_chat_action(
+                chat_id=message.chat.id,
+                message_thread_id=_thread_id(message),
+                action=action,
+            )
+        else:
+            await message.bot.send_chat_action(chat_id=message.chat.id, action=action)
+    except TelegramAPIError as e:
+        logger.debug("Single chat action failed (transient): %s", e)
+
+
 async def _send_media_reply(message: Message, media_ref: str, *, audio_as_voice: bool) -> None:
     media_input = _resolve_media_input(media_ref)
     if audio_as_voice and _is_voice_compatible_media(media_ref):
@@ -2535,7 +2633,7 @@ async def _update_audio_conversion_progress(
 async def _send_voice_transcription_progress_message(
     message: Message,
     elapsed_seconds: float,
-) -> int | None:
+) -> tuple[int | None, int | None]:
     try:
         progress_message = await message.bot.send_message(
             chat_id=message.chat.id,
@@ -2543,10 +2641,13 @@ async def _send_voice_transcription_progress_message(
             text=_format_voice_transcription_progress(elapsed_seconds),
             parse_mode="HTML",
         )
-        return progress_message.message_id
+        return progress_message.message_id, None
+    except TelegramRetryAfter as e:
+        logger.debug("Voice transcription progress rate-limited, retry in %ss", e.retry_after)
+        return None, e.retry_after
     except TelegramAPIError as e:
         logger.debug("Voice transcription progress message failed: %s", e)
-        return None
+        return None, None
 
 
 async def _update_voice_transcription_progress(
@@ -2568,5 +2669,29 @@ async def _update_voice_transcription_progress(
                 if "message is not modified" not in str(e).lower():
                     logger.debug("Voice transcription progress update failed: %s", e)
                     return
+    except asyncio.CancelledError:
+        return
+
+
+async def _retry_voice_transcription_progress_message(
+    message: Message,
+    started_at: float,
+    retry_after: int,
+) -> None:
+    try:
+        await asyncio.sleep(max(0, retry_after))
+        progress_message_id, next_retry_after = await _send_voice_transcription_progress_message(
+            message,
+            monotonic() - started_at,
+        )
+        if progress_message_id is not None:
+            await _update_voice_transcription_progress(message, progress_message_id, started_at)
+            return
+        if next_retry_after is not None:
+            await _retry_voice_transcription_progress_message(
+                message,
+                started_at,
+                next_retry_after,
+            )
     except asyncio.CancelledError:
         return

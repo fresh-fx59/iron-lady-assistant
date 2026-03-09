@@ -73,6 +73,26 @@ That's it. Your bot is running.
 
 If you need server-side Android app automation (for Ozon or other apps), use the reusable package in [`mobile-automation/`](/home/claude-developer/iron-lady-assistant/mobile-automation/README.md) and the runbook in [`docs/mobile-automation-mvp.md`](/home/claude-developer/iron-lady-assistant/docs/mobile-automation-mvp.md).
 
+## Ozon Browser Automation
+
+For browser-based Ozon buying and order tracking, this repo now includes a dedicated wrapper around Vercel Labs' open-source `agent-browser` CLI:
+
+```bash
+cd /home/claude-developer/iron-lady-assistant
+npm install
+npx agent-browser install
+python3 -m src.ozon_browser login --headed
+python3 -m src.ozon_browser orders
+python3 -m src.ozon_browser prepare-buy "детский шампунь Johnson's" --max-price 700 --checkout
+python3 -m src.ozon_browser place-order --confirm
+```
+
+Notes:
+- Browser state is kept under `~/.local/state/iron-lady-assistant/ozon-browser/`
+- `login --headed` is the intended one-time step for manual auth or challenge solving
+- If local Linux browser launch fails because of missing shared libraries, keep using the same wrapper but switch to a remote `agent-browser` provider such as `--provider browseruse`, `--provider kernel`, or `--provider browserbase`
+- The final purchase step is intentionally separate and requires `--confirm`
+
 ### Alternative: Manual Setup
 
 If you prefer to configure things yourself:
@@ -195,7 +215,7 @@ All settings are in the `.env` file. Edit it anytime and restart the bot.
 
 The bot exposes Prometheus metrics at `http://localhost:9101/metrics` — useful if you run Grafana or similar.
 
-Tracked metrics include: message counts, response times, API costs, and active sessions.
+Tracked metrics include message counts, response times, API costs, active sessions, and monitor-only F18 cost intelligence telemetry (taxonomy counters, tool-mix buckets, message-size buckets, and per-mode/provider/model cost and duration histograms).
 
 ## Troubleshooting
 

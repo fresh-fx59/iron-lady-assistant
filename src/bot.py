@@ -707,6 +707,14 @@ def _current_model_label(session: object, provider) -> str:
     return session.model
 
 
+def _step_plan_active_flag() -> bool:
+    try:
+        payload = json.loads(_STEP_PLAN_STATE_PATH.read_text(encoding="utf-8"))
+    except Exception:
+        return False
+    return bool(payload.get("active"))
+
+
 def _provider_session_id(session: object, provider) -> str | None:
     if _is_codex_family_cli(getattr(provider, "cli", None)):
         return getattr(session, "codex_session_id", None)
@@ -1752,6 +1760,7 @@ async def _run_claude(
     progress: ProgressReporter,
     subprocess_env: dict[str, str] | None = None,
     override_text: str | None = None,
+    observed_tools: list[str] | None = None,
 ) -> bridge.ClaudeResponse | None:
     """Run a single Claude subprocess attempt. Returns the response or None."""
     state.process_handle = {}
@@ -1803,11 +1812,15 @@ async def _run_claude(
         match event.event_type:
             case bridge.StreamEventType.TOOL_USE:
                 if event.tool_name:
+                    if observed_tools is not None:
+                        observed_tools.append(event.tool_name)
                     await progress.report_tool(event.tool_name, event.tool_input)
             case bridge.StreamEventType.RESULT:
                 return event.response
             case "TOOL_USE":
                 if getattr(event, "tool_name", None):
+                    if observed_tools is not None:
+                        observed_tools.append(event.tool_name)
                     await progress.report_tool(event.tool_name, getattr(event, "tool_input", None))
             case "RESULT":
                 return event.response
@@ -1826,6 +1839,7 @@ async def _run_codex(
     subprocess_env: dict[str, str] | None = None,
     cli_name: str = "codex",
     override_text: str | None = None,
+    observed_tools: list[str] | None = None,
 ) -> bridge.ClaudeResponse | None:
     """Run a single Codex CLI subprocess attempt. Returns the response or None."""
     state.process_handle = {}
@@ -1878,11 +1892,15 @@ async def _run_codex(
         match event.event_type:
             case bridge.StreamEventType.TOOL_USE:
                 if event.tool_name:
+                    if observed_tools is not None:
+                        observed_tools.append(event.tool_name)
                     await progress.report_tool(event.tool_name, event.tool_input)
             case bridge.StreamEventType.RESULT:
                 return event.response
             case "TOOL_USE":
                 if getattr(event, "tool_name", None):
+                    if observed_tools is not None:
+                        observed_tools.append(event.tool_name)
                     await progress.report_tool(event.tool_name, getattr(event, "tool_input", None))
             case "RESULT":
                 return event.response
@@ -1901,6 +1919,7 @@ async def _run_codex_with_retries(
     subprocess_env: dict[str, str] | None = None,
     cli_name: str = "codex",
     override_text: str | None = None,
+    observed_tools: list[str] | None = None,
 ) -> bridge.ClaudeResponse | None:
     retries_left = max(0, config.CODEX_TRANSIENT_MAX_RETRIES)
     attempt = 0
@@ -1919,6 +1938,7 @@ async def _run_codex_with_retries(
             subprocess_env,
             cli_name,
             override_text=override_text,
+            observed_tools=observed_tools,
         )
         if not response:
             return None
@@ -2183,6 +2203,14 @@ async def _handle_message_inner(message: Message, override_text: str | None = No
 
         final_response: bridge.ClaudeResponse | None = None
         provider = provider_manager.get_provider(scope_key)
+        observed_tools: list[str] = []
+        provider_attempts = 0
+        steering_events_applied = 0
+        final_provider_name = provider.name
+        final_model_name = _current_model_label(session, provider)
+        step_plan_active = _step_plan_active_flag() or bool(_STEP_PLAN_AUTO_TRIGGER_RE.search(raw_prompt))
+        response_has_user_content = False
+        output_size_out = 0
 
         try:
             if provider.cli != "claude" and _find_provider_cli(provider.cli) is None:
@@ -2224,6 +2252,7 @@ async def _handle_message_inner(message: Message, override_text: str | None = No
                 )
 
                 if _is_codex_family_cli(provider.cli):
+                    provider_attempts += 1
                     codex_model = _codex_model_arg(session, provider)
                     final_response = await _run_codex_with_retries(
                         message,
@@ -2236,12 +2265,17 @@ async def _handle_message_inner(message: Message, override_text: str | None = No
                         env,
                         provider.cli,
                         override_text=effective_prompt,
+                        observed_tools=observed_tools,
                     )
                 else:
+                    provider_attempts += 1
                     final_response = await _run_claude(
                         message, state, session, progress, env,
                         override_text=effective_prompt,
+                        observed_tools=observed_tools,
                     )
+                final_provider_name = provider.name
+                final_model_name = _current_model_label(session, provider)
 
                 # ── Fallback on provider errors ───────────────────────
                 error_text_l = (final_response.text or "").strip().lower() if final_response else ""
@@ -2282,6 +2316,7 @@ async def _handle_message_inner(message: Message, override_text: str | None = No
                             session=session,
                         )
                         if _is_codex_family_cli(next_provider.cli):
+                            provider_attempts += 1
                             codex_model = _codex_model_arg(session, next_provider)
                             final_response = await _run_codex_with_retries(
                                 message,
@@ -2294,12 +2329,17 @@ async def _handle_message_inner(message: Message, override_text: str | None = No
                                 env,
                                 next_provider.cli,
                                 override_text=effective_prompt,
+                                observed_tools=observed_tools,
                             )
                         else:
+                            provider_attempts += 1
                             final_response = await _run_claude(
                                 message, state, session, progress, env,
                                 override_text=effective_prompt,
+                                observed_tools=observed_tools,
                             )
+                        final_provider_name = next_provider.name
+                        final_model_name = _current_model_label(session, next_provider)
 
                 requested_tools = ToolRegistry.extract_requested_tools(
                     final_response.text if final_response else ""
@@ -2319,6 +2359,7 @@ async def _handle_message_inner(message: Message, override_text: str | None = No
                     await progress.report_tool("tool_selector", selected_tool)
                     forced_prompt = _inject_tool_request(effective_prompt, selected_tool)
                     if _is_codex_family_cli(provider.cli):
+                        provider_attempts += 1
                         codex_model = _codex_model_arg(session, provider)
                         retry_response = await _run_codex_with_retries(
                             message,
@@ -2331,8 +2372,10 @@ async def _handle_message_inner(message: Message, override_text: str | None = No
                             env,
                             provider.cli,
                             override_text=forced_prompt,
+                            observed_tools=observed_tools,
                         )
                     else:
+                        provider_attempts += 1
                         retry_response = await _run_claude(
                             message,
                             state,
@@ -2340,6 +2383,7 @@ async def _handle_message_inner(message: Message, override_text: str | None = No
                             progress,
                             env,
                             override_text=forced_prompt,
+                            observed_tools=observed_tools,
                         )
                     if retry_response:
                         final_response = retry_response
@@ -2378,6 +2422,7 @@ async def _handle_message_inner(message: Message, override_text: str | None = No
                     break
 
                 pending_apply_ids = [event.event_id for event in unapplied]
+                steering_events_applied += len(unapplied)
                 await progress.report_tool("steering", f"{len(unapplied)} pending update(s)")
                 turn_prompt = _build_steering_patch(raw_prompt, unapplied)
                 logger.info(
@@ -2421,6 +2466,8 @@ async def _handle_message_inner(message: Message, override_text: str | None = No
                 raw_response_text = final_response.text or ""
                 clean_text, media_refs, audio_as_voice = _extract_media_directives(raw_response_text)
                 clean_text = _strip_tool_directive_lines(clean_text)
+                response_has_user_content = bool(clean_text.strip() or media_refs)
+                output_size_out = len(clean_text)
                 for media_ref in media_refs:
                     try:
                         await _send_media_reply(
@@ -2507,6 +2554,29 @@ async def _handle_message_inner(message: Message, override_text: str | None = No
             if state.cancel_requested:
                 status = "cancelled"
             metrics.MESSAGES_TOTAL.labels(status=status).inc()
+        metrics.observe_cost_intelligence_turn(
+            scope_key=scope_key,
+            provider=final_provider_name,
+            model=final_model_name,
+            mode="foreground",
+            cost_usd=float(final_response.cost_usd) if final_response else 0.0,
+            num_turns=int(final_response.num_turns) if final_response else 0,
+            duration_ms=float(final_response.duration_ms) if final_response else 0.0,
+            is_error=bool(final_response.is_error) if final_response else True,
+            is_cancelled=state.cancel_requested,
+            is_empty_response=(
+                not response_has_user_content
+                if (final_response and not final_response.is_error and not state.cancel_requested)
+                else not bool((final_response.text or "").strip()) if final_response else True
+            ),
+            tool_timeout=bool(final_response.idle_timeout) if final_response else False,
+            tool_names=observed_tools,
+            message_size_in=len(raw_prompt),
+            message_size_out=output_size_out,
+            step_plan_active=step_plan_active,
+            steering_event_count=steering_events_applied,
+            attempts=max(1, provider_attempts),
+        )
 
 
 @router.errors()

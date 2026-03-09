@@ -713,7 +713,7 @@ class TestMessageHandling:
     async def test_midflight_steering_triggers_continuation(self, mock_message):
         """Unapplied steering should cause another continuation turn before final reply."""
         from src import bridge
-        from src.bot import steering_ledger_store
+        from src.bot import provider_manager, steering_ledger_store
         from src.features.state_store import SteeringEvent
 
         response1 = bridge.ClaudeResponse(
@@ -733,8 +733,20 @@ class TestMessageHandling:
             num_turns=0,
         )
 
-        async def fake_run_claude(message, state, session, progress, env, override_text=None):
-            if override_text is None:
+        provider_manager.set_provider("123456789:main", "claude")
+        calls = {"count": 0}
+
+        async def fake_run_claude(
+            message,
+            state,
+            session,
+            progress,
+            env,
+            override_text=None,
+            observed_tools=None,
+        ):
+            calls["count"] += 1
+            if calls["count"] == 1:
                 steering_ledger_store.append(
                     scope_key="123456789:main",
                     event=SteeringEvent(

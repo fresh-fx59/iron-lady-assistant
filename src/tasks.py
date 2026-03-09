@@ -1,6 +1,7 @@
 import asyncio
 import inspect
 import logging
+import re
 import uuid
 from dataclasses import dataclass
 from datetime import datetime
@@ -11,8 +12,10 @@ from typing import AsyncIterator, Final, Protocol, Sequence
 from aiogram import Bot
 
 from . import bridge, config, metrics
+from .sessions import make_scope_key
 
 logger = logging.getLogger(__name__)
+_STEP_PLAN_HINT_RE = re.compile(r"\bcontinue\b.*\bplan\b", re.IGNORECASE)
 
 
 class TaskStatus(str, Enum):
@@ -324,10 +327,11 @@ class TaskManager:
     async def _collect_result_event(
         self,
         stream: AsyncIterator[bridge.StreamEvent],
-    ) -> tuple[bridge.ClaudeResponse | None, ToolTimeoutRecord | None]:
+    ) -> tuple[bridge.ClaudeResponse | None, ToolTimeoutRecord | None, list[str]]:
         """Consume provider stream until RESULT or tool-specific timeout."""
         iterator = stream.__aiter__()
         active_tool: ToolExecutionState | None = None
+        observed_tools: list[str] = []
 
         while True:
             timeout_s = self._TASK_TIMEOUT
@@ -344,13 +348,13 @@ class TaskManager:
                         category=active_tool.category,
                         timeout_seconds=active_tool.timeout_seconds,
                         recovery_action=recovery_action,
-                    )
+                    ), observed_tools
                 timeout_s = min(timeout_s, remaining)
 
             try:
                 event = await asyncio.wait_for(iterator.__anext__(), timeout=timeout_s)
             except StopAsyncIteration:
-                return None, None
+                return None, None, observed_tools
             except asyncio.TimeoutError:
                 if active_tool:
                     recovery_action = "reset_session" if self._is_stateful_tool(
@@ -362,10 +366,12 @@ class TaskManager:
                         category=active_tool.category,
                         timeout_seconds=active_tool.timeout_seconds,
                         recovery_action=recovery_action,
-                    )
+                    ), observed_tools
                 raise
 
             if event.event_type == bridge.StreamEventType.TOOL_USE:
+                if event.tool_name:
+                    observed_tools.append(event.tool_name)
                 category = self._tool_category(event.tool_name)
                 active_tool = ToolExecutionState(
                     name=event.tool_name or "unknown_tool",
@@ -377,14 +383,14 @@ class TaskManager:
                 continue
 
             if event.event_type == bridge.StreamEventType.RESULT:
-                return event.response, None
+                return event.response, None, observed_tools
 
-        return None
+        return None, None, observed_tools
 
     async def _run_provider_attempt(
         self,
         task: BackgroundTask,
-    ) -> tuple[bridge.ClaudeResponse | None, ToolTimeoutRecord | None]:
+    ) -> tuple[bridge.ClaudeResponse | None, ToolTimeoutRecord | None, list[str]]:
         process_handle: dict = {}
         if task.provider_cli.startswith("codex"):
             stream = bridge.stream_codex_message(
@@ -406,13 +412,13 @@ class TaskManager:
             )
 
         try:
-            response, tool_timeout = await asyncio.wait_for(
+            response, tool_timeout, observed_tools = await asyncio.wait_for(
                 self._collect_result_event(stream),
                 timeout=self._TASK_TIMEOUT,
             )
             if tool_timeout:
                 await self._terminate_process(process_handle)
-            return response, tool_timeout
+            return response, tool_timeout, observed_tools
         except Exception:
             await self._terminate_process(process_handle)
             raise
@@ -429,9 +435,13 @@ class TaskManager:
             tool_timeout: ToolTimeoutRecord | None = None
             retries_left = self._TOOL_TIMEOUT_POLICY.retryable_timeout_retries
             transient_error_retries_left = self._TRANSIENT_ERROR_RETRIES
+            observed_tools: list[str] = []
+            provider_attempts = 0
 
             while True:
-                response, tool_timeout = await self._run_provider_attempt(task)
+                response, tool_timeout, attempt_tools = await self._run_provider_attempt(task)
+                provider_attempts += 1
+                observed_tools.extend(attempt_tools)
                 if not tool_timeout:
                     if (
                         response
@@ -540,6 +550,25 @@ class TaskManager:
             await self._notify_failure(task)
 
         finally:
+            metrics.observe_cost_intelligence_turn(
+                scope_key=make_scope_key(task.chat_id, task.message_thread_id),
+                provider=task.provider_cli,
+                model=task.model,
+                mode="background",
+                cost_usd=float(task.cost_usd),
+                num_turns=int(task.num_turns),
+                duration_ms=float(task.duration_ms),
+                is_error=task.status == TaskStatus.FAILED,
+                is_cancelled=task.status == TaskStatus.CANCELLED,
+                is_empty_response=not bool((task.response or "").strip()),
+                tool_timeout=bool(task.error and "TOOL_TIMEOUT" in task.error),
+                tool_names=observed_tools if "observed_tools" in locals() else [],
+                message_size_in=len(task.prompt or ""),
+                message_size_out=len(task.response or task.error or ""),
+                step_plan_active=bool(_STEP_PLAN_HINT_RE.search(task.prompt or "")),
+                steering_event_count=0,
+                attempts=max(1, provider_attempts if "provider_attempts" in locals() else 1),
+            )
             if typing_task:
                 typing_task.cancel()
                 try:

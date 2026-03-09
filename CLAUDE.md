@@ -1,6 +1,6 @@
 # Claude Code as Telegram Assistant
 
-**Current version: `0.21.4`** — defined in `src/config.py` as `VERSION`.
+**Current version: `0.21.5`** — defined in `src/config.py` as `VERSION`.
 
 Telegram bot that bridges messages to Claude Code's `--print` mode via subprocess, providing a conversational AI assistant through Telegram.
 
@@ -272,6 +272,13 @@ The bot exposes metrics on port `9101` (configurable via `METRICS_PORT`).
 | `telegrambot_claude_response_duration_seconds` | Histogram | `model` | Claude response latency |
 | `telegrambot_claude_cost_usd_total` | Counter | `model` | Cumulative API cost in USD |
 | `telegrambot_claude_turns_total` | Counter | `model` | Cumulative agentic turns |
+| `telegrambot_cost_intel_turn_cost_usd` | Histogram | `provider`, `model`, `mode`, `status` | F18 monitor-only per-turn cost distribution |
+| `telegrambot_cost_intel_turn_duration_ms` | Histogram | `provider`, `model`, `mode`, `status` | F18 monitor-only per-turn duration distribution |
+| `telegrambot_cost_intel_tool_count` | Histogram | `provider`, `model`, `mode`, `tool_mix` | Tool activity distribution for cost diagnostics |
+| `telegrambot_cost_intel_message_size_bucket_total` | Counter | `provider`, `model`, `mode`, `direction`, `bucket` | Coarse input/output message size buckets |
+| `telegrambot_cost_intel_step_plan_active_total` | Counter | `provider`, `model`, `mode` | Turns observed while step-plan mode was active |
+| `telegrambot_cost_intel_steering_event_count` | Histogram | `provider`, `model`, `mode` | Steering events per turn (F17 correlation) |
+| `telegrambot_cost_intel_taxonomy_total` | Counter | `category`, `provider`, `model`, `mode` | Taxonomy counts (`high_cost_success`, `cost_with_error`, `cost_with_empty`, `retry_amplified_cost`, `tool_driven_cost_inflation`, `scope_hotspot`) |
 | `telegrambot_active_sessions` | Gauge | — | Active chat sessions |
 | `telegrambot_bg_tasks_active` | Gauge | — | Total active background tasks (queued + running) |
 | `telegrambot_bg_tasks_queued` | Gauge | — | Queued background tasks |

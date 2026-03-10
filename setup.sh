@@ -209,7 +209,7 @@ ExecStart=$SCRIPT_DIR/run.sh
 Restart=always
 RestartSec=5
 EnvironmentFile=$SCRIPT_DIR/.env
-Environment=PATH=$HOME/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+Environment=PATH=$HOME/.npm-$SERVICE_USER/bin:$HOME/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 
 # Hardening
 NoNewPrivileges=true
@@ -238,7 +238,7 @@ ExecStart=$SCRIPT_DIR/venv/bin/python3 -m src.scheduler_daemon
 Restart=always
 RestartSec=5
 EnvironmentFile=$SCRIPT_DIR/.env
-Environment=PATH=$HOME/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+Environment=PATH=$HOME/.npm-$SERVICE_USER/bin:$HOME/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 
 NoNewPrivileges=true
 ProtectSystem=strict

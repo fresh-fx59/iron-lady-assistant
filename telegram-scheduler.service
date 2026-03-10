@@ -11,7 +11,7 @@ ExecStart=/home/claude-developer/iron-lady-assistant/venv/bin/python3 -m src.sch
 Restart=always
 RestartSec=5
 EnvironmentFile=/home/claude-developer/iron-lady-assistant/.env
-Environment=PATH=/home/claude-developer/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+Environment=PATH=/home/claude-developer/.npm-claude-developer/bin:/home/claude-developer/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 
 NoNewPrivileges=true
 ProtectSystem=strict

@@ -1,8 +1,10 @@
 import asyncio
+import getpass
 import json
 import logging
 import os
 import re
+from pathlib import Path
 import time
 from asyncio import LimitOverrunError
 from dataclasses import dataclass
@@ -124,6 +126,23 @@ def _default_subprocess_env() -> dict[str, str]:
     """
     env = os.environ.copy()
     env.pop("CLAUDECODE", None)
+    existing_parts = [part for part in env.get("PATH", "").split(os.pathsep) if part]
+    user = getpass.getuser()
+    home = Path.home()
+    candidate_parts = [
+        str(home / f".npm-{user}" / "bin"),
+        str(home / ".local" / "bin"),
+        "/usr/local/bin",
+        "/usr/bin",
+        "/bin",
+    ]
+    merged_parts: list[str] = []
+    for part in candidate_parts + existing_parts:
+        if not part or part in merged_parts:
+            continue
+        if part.startswith("/usr/") or part == "/bin" or Path(part).is_dir():
+            merged_parts.append(part)
+    env["PATH"] = os.pathsep.join(merged_parts)
     return env
 
 

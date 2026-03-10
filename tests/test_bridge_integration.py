@@ -5,6 +5,7 @@ These are the core integration contracts that must be preserved.
 """
 
 import asyncio
+import os
 import json
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -182,6 +183,26 @@ class TestSubprocessEnvironment:
             os.environ.pop("CLAUDECODE", None)
         else:
             os.environ["CLAUDECODE"] = original
+
+    def test_adds_user_npm_bin_to_path(self, monkeypatch, tmp_path):
+        """Should include the per-user npm bin path for Codex-style CLIs."""
+        from src.bridge import _subprocess_env
+
+        npm_bin = tmp_path / ".npm-tester" / "bin"
+        npm_bin.mkdir(parents=True)
+        local_bin = tmp_path / ".local" / "bin"
+        local_bin.mkdir(parents=True)
+
+        monkeypatch.setenv("PATH", "/usr/bin")
+        monkeypatch.setattr("src.bridge.getpass.getuser", lambda: "tester")
+        monkeypatch.setattr("src.bridge.Path.home", lambda: tmp_path)
+
+        env = _subprocess_env()
+        parts = env["PATH"].split(os.pathsep)
+
+        assert str(npm_bin) in parts
+        assert str(local_bin) in parts
+        assert "/usr/bin" in parts
 
 
 # ── Contract 5: Stream event parsing ──────────────────────────────

@@ -260,6 +260,7 @@ Optional monitoring topic:
 The daemon will execute due schedules in the background and mirror submit/start/finish events to that Telegram topic.
 Scheduled jobs also preserve the provider runtime they were created with, so a task created from a `codex*` thread will continue running through that same Codex CLI when the standalone daemon picks it up.
 `setup.sh` can also generate and install both `telegram-bot.service` and `telegram-scheduler.service` when you choose the external scheduler option.
+The bundled systemd units include the per-user npm bin path so `codex` CLIs installed under `~/.npm-<user>/bin` stay available after reboot.
 
 ## Troubleshooting
 

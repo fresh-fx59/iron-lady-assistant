@@ -777,6 +777,35 @@ class TestMessageHandling:
         all_answers = [call.args[0] for call in mock_message.answer.await_args_list if call.args]
         assert any("Steered answer" in text for text in all_answers)
 
+    async def test_html_send_failure_still_delivers_plain_fallback(self, mock_message):
+        """Plain fallback must not be suppressed if the HTML send never succeeded."""
+        from src import bridge
+        from src.bot import provider_manager
+
+        response = bridge.ClaudeResponse(
+            text="Hello <world>",
+            session_id="sess-1",
+            is_error=False,
+            cost_usd=0.0,
+            duration_ms=0,
+            num_turns=0,
+        )
+
+        provider_manager.set_provider("123456789:main", "claude")
+        mock_message.answer = AsyncMock(
+            side_effect=[
+                Exception("html parse failure"),
+                None,
+            ]
+        )
+
+        with patch("src.bot._run_claude", new=AsyncMock(return_value=response)):
+            await handle_message(mock_message)
+
+        assert mock_message.answer.await_count == 2
+        assert mock_message.answer.await_args_list[0].kwargs.get("parse_mode") == "HTML"
+        assert mock_message.answer.await_args_list[1].args[0] == "Hello &lt;world&gt;"
+
 
 @pytest.mark.asyncio
 class TestVoiceHandling:

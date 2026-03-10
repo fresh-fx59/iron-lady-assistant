@@ -375,20 +375,39 @@ def _should_suggest_rollback(scope_key: str) -> bool:
     return _error_counts.get(scope_key, 0) >= 3
 
 
+def _outbound_digest(text: str) -> str:
+    normalized = re.sub(r"\s+", " ", text).strip()
+    if not normalized:
+        return ""
+    return hashlib.sha1(normalized.encode("utf-8")).hexdigest()[:16]
+
+
+def _has_recent_outbound(scope_key: str, text: str, *, ttl_seconds: int = 120) -> bool:
+    """Check whether the same chunk was sent recently in this scope."""
+    digest = _outbound_digest(text)
+    if not digest:
+        return False
+    previous = _recent_outbound_by_scope.get(scope_key)
+    if not previous:
+        return False
+    prev_digest, prev_at = previous
+    now = datetime.now(tz.utc)
+    return prev_digest == digest and (now - prev_at).total_seconds() <= ttl_seconds
+
+
+def _remember_outbound(scope_key: str, text: str) -> None:
+    digest = _outbound_digest(text)
+    if not digest:
+        return
+    _recent_outbound_by_scope[scope_key] = (digest, datetime.now(tz.utc))
+
+
 def _is_duplicate_outbound(scope_key: str, text: str, *, ttl_seconds: int = 120) -> bool:
     """Suppress immediate duplicate replies in the same scope after retries/restarts."""
     normalized = re.sub(r"\s+", " ", text).strip()
     if not normalized:
         return False
-    digest = hashlib.sha1(normalized.encode("utf-8")).hexdigest()[:16]
-    now = datetime.now(tz.utc)
-    previous = _recent_outbound_by_scope.get(scope_key)
-    if previous:
-        prev_digest, prev_at = previous
-        if prev_digest == digest and (now - prev_at).total_seconds() <= ttl_seconds:
-            return True
-    _recent_outbound_by_scope[scope_key] = (digest, now)
-    return False
+    return _has_recent_outbound(scope_key, normalized, ttl_seconds=ttl_seconds)
 
 
 def _latest_scope_target() -> tuple[int, int | None] | None:
@@ -2577,20 +2596,22 @@ async def _handle_message_inner(message: Message, override_text: str | None = No
                     if not chunk.strip():
                         continue
                     plain_preview = strip_html(chunk)
-                    if _is_duplicate_outbound(scope_key, plain_preview):
+                    if _has_recent_outbound(scope_key, plain_preview):
                         logger.info("Chat %s: suppressed duplicate outgoing chunk", scope_key)
                         continue
                     try:
                         await message.answer(chunk, parse_mode="HTML")
+                        _remember_outbound(scope_key, plain_preview)
                     except Exception:
                         plain = strip_html(chunk)
                         for plain_chunk in split_message(plain):
                             if not plain_chunk.strip():
                                 continue
-                            if _is_duplicate_outbound(scope_key, plain_chunk):
+                            if _has_recent_outbound(scope_key, plain_chunk):
                                 logger.info("Chat %s: suppressed duplicate plain outgoing chunk", scope_key)
                                 continue
                             await message.answer(plain_chunk)
+                            _remember_outbound(scope_key, plain_chunk)
 
                 await progress.finish()
                 _clear_errors(scope_key)

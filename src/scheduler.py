@@ -30,6 +30,14 @@ class ScheduledTask:
     weekly_day: int | None
     model: str
     session_id: str | None
+    state: str
+    misfire_policy: str
+    current_run_id: str | None
+    current_background_task_id: str | None
+    current_planned_for: datetime | None
+    current_submitted_at: datetime | None
+    current_started_at: datetime | None
+    current_status: str | None
     next_run_at: datetime
     created_at: datetime
 
@@ -84,6 +92,14 @@ class ScheduleManager:
                     weekly_day INTEGER,
                     model TEXT NOT NULL,
                     session_id TEXT,
+                    state TEXT NOT NULL DEFAULT 'active',
+                    misfire_policy TEXT NOT NULL DEFAULT 'catch_up_one',
+                    current_run_id TEXT,
+                    current_background_task_id TEXT,
+                    current_planned_for TEXT,
+                    current_submitted_at TEXT,
+                    current_started_at TEXT,
+                    current_status TEXT,
                     next_run_at TEXT NOT NULL,
                     created_at TEXT NOT NULL
                 )
@@ -94,6 +110,14 @@ class ScheduleManager:
             self._ensure_column(con, "timezone_name", "TEXT")
             self._ensure_column(con, "weekly_day", "INTEGER")
             self._ensure_column(con, "message_thread_id", "INTEGER")
+            self._ensure_column(con, "state", "TEXT NOT NULL DEFAULT 'active'")
+            self._ensure_column(con, "misfire_policy", "TEXT NOT NULL DEFAULT 'catch_up_one'")
+            self._ensure_column(con, "current_run_id", "TEXT")
+            self._ensure_column(con, "current_background_task_id", "TEXT")
+            self._ensure_column(con, "current_planned_for", "TEXT")
+            self._ensure_column(con, "current_submitted_at", "TEXT")
+            self._ensure_column(con, "current_started_at", "TEXT")
+            self._ensure_column(con, "current_status", "TEXT")
             con.execute(
                 """
                 CREATE TABLE IF NOT EXISTS scheduled_task_runs (
@@ -124,6 +148,10 @@ class ScheduleManager:
                 "CREATE INDEX IF NOT EXISTS idx_scheduled_task_runs_task_id "
                 "ON scheduled_task_runs(background_task_id)"
             )
+            con.execute(
+                "CREATE INDEX IF NOT EXISTS idx_scheduled_tasks_due "
+                "ON scheduled_tasks(state, current_run_id, next_run_at)"
+            )
 
     @staticmethod
     def _ensure_column(con: sqlite3.Connection, name: str, definition: str) -> None:
@@ -133,6 +161,7 @@ class ScheduleManager:
 
     async def start(self) -> None:
         if self._worker_task is None:
+            await asyncio.to_thread(self._recover_stale_runs, datetime.now(timezone.utc).isoformat())
             self._worker_task = asyncio.create_task(self._worker_loop(), name="schedule_worker")
 
     async def stop(self) -> None:
@@ -298,6 +327,14 @@ class ScheduleManager:
         rows = await asyncio.to_thread(self._list_rows, chat_id, message_thread_id)
         return [self._row_to_scheduled_task(row) for row in rows]
 
+    async def find_schedule_id_for_chat(
+        self,
+        chat_id: int,
+        short_id: str,
+        message_thread_id: int | None = None,
+    ) -> str | None:
+        return await asyncio.to_thread(self._find_schedule_id_row, chat_id, short_id, message_thread_id)
+
     def _list_rows(self, chat_id: int, message_thread_id: int | None) -> list[sqlite3.Row]:
         with self._connect() as con:
             if message_thread_id is None:
@@ -305,8 +342,10 @@ class ScheduleManager:
                     """
                     SELECT id, chat_id, message_thread_id, user_id, prompt, interval_minutes, model, session_id, next_run_at, created_at
                            , schedule_type, daily_time, timezone_name, weekly_day
+                           , state, misfire_policy, current_run_id, current_background_task_id
+                           , current_planned_for, current_submitted_at, current_started_at, current_status
                     FROM scheduled_tasks
-                    WHERE chat_id = ? AND message_thread_id IS NULL
+                    WHERE chat_id = ? AND message_thread_id IS NULL AND state = 'active'
                     ORDER BY next_run_at ASC
                     """,
                     (chat_id,),
@@ -316,21 +355,63 @@ class ScheduleManager:
                     """
                     SELECT id, chat_id, message_thread_id, user_id, prompt, interval_minutes, model, session_id, next_run_at, created_at
                            , schedule_type, daily_time, timezone_name, weekly_day
+                           , state, misfire_policy, current_run_id, current_background_task_id
+                           , current_planned_for, current_submitted_at, current_started_at, current_status
                     FROM scheduled_tasks
-                    WHERE chat_id = ? AND message_thread_id = ?
+                    WHERE chat_id = ? AND message_thread_id = ? AND state = 'active'
                     ORDER BY next_run_at ASC
                     """,
                     (chat_id, message_thread_id),
                 )
             return list(cur.fetchall())
 
-    async def cancel(self, task_id: str) -> bool:
-        deleted = await asyncio.to_thread(self._delete_schedule, task_id)
-        return deleted > 0
-
-    def _delete_schedule(self, task_id: str) -> int:
+    def _find_schedule_id_row(self, chat_id: int, short_id: str, message_thread_id: int | None) -> str | None:
         with self._connect() as con:
-            cur = con.execute("DELETE FROM scheduled_tasks WHERE id = ?", (task_id,))
+            if message_thread_id is None:
+                cur = con.execute(
+                    """
+                    SELECT id
+                    FROM scheduled_tasks
+                    WHERE chat_id = ? AND message_thread_id IS NULL AND id LIKE ?
+                    ORDER BY created_at DESC
+                    LIMIT 1
+                    """,
+                    (chat_id, f"{short_id}%"),
+                )
+            else:
+                cur = con.execute(
+                    """
+                    SELECT id
+                    FROM scheduled_tasks
+                    WHERE chat_id = ? AND message_thread_id = ? AND id LIKE ?
+                    ORDER BY created_at DESC
+                    LIMIT 1
+                    """,
+                    (chat_id, message_thread_id, f"{short_id}%"),
+                )
+            row = cur.fetchone()
+            return row["id"] if row else None
+
+    async def cancel(self, task_id: str) -> bool:
+        updated = await asyncio.to_thread(self._cancel_schedule, task_id)
+        return updated > 0
+
+    def _cancel_schedule(self, task_id: str) -> int:
+        with self._connect() as con:
+            cur = con.execute(
+                """
+                UPDATE scheduled_tasks
+                SET state = 'cancelled',
+                    current_run_id = NULL,
+                    current_background_task_id = NULL,
+                    current_planned_for = NULL,
+                    current_submitted_at = NULL,
+                    current_started_at = NULL,
+                    current_status = NULL
+                WHERE id = ? AND state = 'active'
+                """,
+                (task_id,),
+            )
             return cur.rowcount
 
     async def _worker_loop(self) -> None:
@@ -339,13 +420,16 @@ class ScheduleManager:
             await asyncio.sleep(self._POLL_SECONDS)
 
     async def _run_due_once(self) -> None:
-        due_rows = await asyncio.to_thread(self._fetch_due_rows, datetime.now(timezone.utc).isoformat())
-        for row in due_rows:
-            schedule = self._row_to_scheduled_task(row)
-            planned_for = schedule.next_run_at
-            submitted_at = datetime.now(timezone.utc)
-            run_id = str(uuid.uuid4())
+        claimed_runs = await asyncio.to_thread(self._claim_due_runs, datetime.now(timezone.utc))
+        for schedule, run_id, planned_for, submitted_at in claimed_runs:
+            background_task_id = str(uuid.uuid4())
             try:
+                await asyncio.to_thread(
+                    self._mark_run_submitted,
+                    schedule.id,
+                    run_id,
+                    background_task_id,
+                )
                 background_task_id = await self._task_manager.submit(
                     chat_id=schedule.chat_id,
                     message_thread_id=schedule.message_thread_id,
@@ -353,38 +437,60 @@ class ScheduleManager:
                     prompt=schedule.prompt,
                     model=schedule.model,
                     session_id=schedule.session_id,
-                )
-                await asyncio.to_thread(
-                    self._insert_run,
-                    run_id,
-                    schedule.id,
-                    schedule.chat_id,
-                    schedule.message_thread_id,
-                    background_task_id,
-                    planned_for.isoformat(),
-                    submitted_at.isoformat(),
-                    "submitted",
-                    None,
-                    None,
+                    task_id=background_task_id,
                 )
             except Exception:
                 logger.exception("Failed to submit scheduled task %s", schedule.id)
                 await asyncio.to_thread(
-                    self._insert_run,
-                    run_id,
+                    self._mark_run_submission_failed,
                     schedule.id,
-                    schedule.chat_id,
-                    schedule.message_thread_id,
-                    None,
-                    planned_for.isoformat(),
+                    run_id,
                     submitted_at.isoformat(),
-                    "submission_failed",
                     "Failed to submit background task",
-                    None,
                 )
-            finally:
-                next_run = self._next_run_for_schedule(schedule, datetime.now(timezone.utc))
-                await asyncio.to_thread(self._update_next_run, schedule.id, next_run.isoformat())
+
+    def _recover_stale_runs(self, recovered_at: str) -> None:
+        with self._connect() as con:
+            rows = list(
+                con.execute(
+                    """
+                    SELECT current_run_id
+                    FROM scheduled_tasks
+                    WHERE state = 'active' AND current_run_id IS NOT NULL
+                    """
+                )
+            )
+            for row in rows:
+                run_id = row["current_run_id"]
+                con.execute(
+                    """
+                    UPDATE scheduled_task_runs
+                    SET status = 'failed_recovered',
+                        completed_at = COALESCE(completed_at, ?),
+                        error_text = COALESCE(error_text, 'Scheduler restarted before task completion')
+                    WHERE id = ? AND completed_at IS NULL
+                    """,
+                    (recovered_at, run_id),
+                )
+            con.execute(
+                """
+                UPDATE scheduled_tasks
+                SET current_run_id = NULL,
+                    current_background_task_id = NULL,
+                    current_planned_for = NULL,
+                    current_submitted_at = NULL,
+                    current_started_at = NULL,
+                    current_status = NULL
+                WHERE state = 'active' AND current_run_id IS NOT NULL
+                """
+            )
+
+    async def on_task_started(self, task: BackgroundTask) -> None:
+        await asyncio.to_thread(
+            self._mark_run_started,
+            task.id,
+            task.started_at.isoformat() if task.started_at else None,
+        )
 
     async def on_task_finished(self, task: BackgroundTask) -> None:
         await asyncio.to_thread(
@@ -413,20 +519,80 @@ class ScheduleManager:
         rows = await asyncio.to_thread(self._latest_run_rows_by_schedule, schedule_ids)
         return {row["schedule_id"]: self._row_to_schedule_run(row) for row in rows}
 
-    def _fetch_due_rows(self, now_iso: str) -> list[sqlite3.Row]:
+    def _claim_due_runs(
+        self,
+        now_utc: datetime,
+        limit: int = 20,
+    ) -> list[tuple[ScheduledTask, str, datetime, datetime]]:
         with self._connect() as con:
             cur = con.execute(
                 """
                 SELECT id, chat_id, message_thread_id, user_id, prompt, interval_minutes, model, session_id, next_run_at, created_at
                        , schedule_type, daily_time, timezone_name, weekly_day
+                       , state, misfire_policy, current_run_id, current_background_task_id
+                       , current_planned_for, current_submitted_at, current_started_at, current_status
                 FROM scheduled_tasks
-                WHERE next_run_at <= ?
+                WHERE state = 'active' AND current_run_id IS NULL AND next_run_at <= ?
                 ORDER BY next_run_at ASC
-                LIMIT 20
+                LIMIT ?
                 """,
-                (now_iso,),
+                (now_utc.isoformat(), limit),
             )
-            return list(cur.fetchall())
+            rows = list(cur.fetchall())
+            claimed: list[tuple[ScheduledTask, str, datetime, datetime]] = []
+            for row in rows:
+                schedule = self._row_to_scheduled_task(row)
+                run_id = str(uuid.uuid4())
+                planned_for = schedule.next_run_at
+                submitted_at = now_utc
+                next_run = self._next_run_for_schedule(schedule, now_utc)
+                run_inserted = con.execute(
+                    """
+                    INSERT INTO scheduled_task_runs
+                    (id, schedule_id, chat_id, message_thread_id, background_task_id, planned_for, submitted_at, status, error_text, response_preview)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        run_id,
+                        schedule.id,
+                        schedule.chat_id,
+                        schedule.message_thread_id,
+                        None,
+                        planned_for.isoformat(),
+                        submitted_at.isoformat(),
+                        "queued",
+                        None,
+                        None,
+                    ),
+                )
+                if run_inserted.rowcount != 1:
+                    continue
+                updated = con.execute(
+                    """
+                    UPDATE scheduled_tasks
+                    SET current_run_id = ?,
+                        current_background_task_id = NULL,
+                        current_planned_for = ?,
+                        current_submitted_at = ?,
+                        current_started_at = NULL,
+                        current_status = 'queued',
+                        next_run_at = ?
+                    WHERE id = ? AND state = 'active' AND current_run_id IS NULL AND next_run_at = ?
+                    """,
+                    (
+                        run_id,
+                        planned_for.isoformat(),
+                        submitted_at.isoformat(),
+                        next_run.isoformat(),
+                        schedule.id,
+                        planned_for.isoformat(),
+                    ),
+                )
+                if updated.rowcount != 1:
+                    con.execute("DELETE FROM scheduled_task_runs WHERE id = ?", (run_id,))
+                    continue
+                claimed.append((schedule, run_id, planned_for, submitted_at))
+            return claimed
 
     def _update_next_run(self, task_id: str, next_run_at: str) -> None:
         with self._connect() as con:
@@ -469,6 +635,81 @@ class ScheduleManager:
                 ),
             )
 
+    def _mark_run_submitted(
+        self,
+        schedule_id: str,
+        run_id: str,
+        background_task_id: str,
+    ) -> None:
+        with self._connect() as con:
+            con.execute(
+                """
+                UPDATE scheduled_task_runs
+                SET background_task_id = ?, status = 'submitted'
+                WHERE id = ?
+                """,
+                (background_task_id, run_id),
+            )
+            con.execute(
+                """
+                UPDATE scheduled_tasks
+                SET current_background_task_id = ?, current_status = 'submitted'
+                WHERE id = ? AND current_run_id = ?
+                """,
+                (background_task_id, schedule_id, run_id),
+            )
+
+    def _mark_run_submission_failed(
+        self,
+        schedule_id: str,
+        run_id: str,
+        completed_at: str,
+        error_text: str,
+    ) -> None:
+        with self._connect() as con:
+            con.execute(
+                """
+                UPDATE scheduled_task_runs
+                SET background_task_id = NULL, status = 'submission_failed', completed_at = ?, error_text = ?
+                WHERE id = ?
+                """,
+                (completed_at, error_text, run_id),
+            )
+            con.execute(
+                """
+                UPDATE scheduled_tasks
+                SET current_run_id = NULL,
+                    current_background_task_id = NULL,
+                    current_planned_for = NULL,
+                    current_submitted_at = NULL,
+                    current_started_at = NULL,
+                    current_status = NULL
+                WHERE id = ? AND current_run_id = ?
+                """,
+                (schedule_id, run_id),
+            )
+
+    def _mark_run_started(self, background_task_id: str, started_at: str | None) -> None:
+        with self._connect() as con:
+            cur = con.execute(
+                """
+                UPDATE scheduled_task_runs
+                SET status = 'running', started_at = COALESCE(?, started_at)
+                WHERE background_task_id = ?
+                """,
+                (started_at, background_task_id),
+            )
+            if cur.rowcount:
+                con.execute(
+                    """
+                    UPDATE scheduled_tasks
+                    SET current_started_at = COALESCE(?, current_started_at),
+                        current_status = 'running'
+                    WHERE current_background_task_id = ?
+                    """,
+                    (started_at, background_task_id),
+                )
+
     def _update_run_for_background_task(
         self,
         background_task_id: str,
@@ -486,6 +727,19 @@ class ScheduleManager:
                 WHERE background_task_id = ?
                 """,
                 (status, started_at, completed_at, error_text, response_preview, background_task_id),
+            )
+            con.execute(
+                """
+                UPDATE scheduled_tasks
+                SET current_run_id = NULL,
+                    current_background_task_id = NULL,
+                    current_planned_for = NULL,
+                    current_submitted_at = NULL,
+                    current_started_at = NULL,
+                    current_status = NULL
+                WHERE current_background_task_id = ?
+                """,
+                (background_task_id,),
             )
 
     def _list_run_rows(
@@ -550,6 +804,14 @@ class ScheduleManager:
             weekly_day=row["weekly_day"],
             model=row["model"],
             session_id=row["session_id"],
+            state=row["state"] or "active",
+            misfire_policy=row["misfire_policy"] or "catch_up_one",
+            current_run_id=row["current_run_id"],
+            current_background_task_id=row["current_background_task_id"],
+            current_planned_for=datetime.fromisoformat(row["current_planned_for"]) if row["current_planned_for"] else None,
+            current_submitted_at=datetime.fromisoformat(row["current_submitted_at"]) if row["current_submitted_at"] else None,
+            current_started_at=datetime.fromisoformat(row["current_started_at"]) if row["current_started_at"] else None,
+            current_status=row["current_status"],
             next_run_at=datetime.fromisoformat(row["next_run_at"]),
             created_at=datetime.fromisoformat(row["created_at"]),
         )

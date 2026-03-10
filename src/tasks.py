@@ -52,6 +52,9 @@ class BackgroundTask:
 
 
 class TaskObserver(Protocol):
+    async def on_task_started(self, task: BackgroundTask) -> None:
+        """Called when a task starts execution."""
+
     async def on_task_finished(self, task: BackgroundTask) -> None:
         """Called when a task reaches terminal status."""
 
@@ -156,10 +159,11 @@ class TaskManager:
         live_feedback: bool = False,
         feedback_title: str | None = None,
         process_handle: dict | None = None,
+        task_id: str | None = None,
     ) -> str:
         """Submit a task for background execution. Returns task ID."""
         task = BackgroundTask(
-            id=str(uuid.uuid4()),
+            id=task_id or str(uuid.uuid4()),
             chat_id=chat_id,
             message_thread_id=message_thread_id,
             user_id=user_id,
@@ -244,6 +248,7 @@ class TaskManager:
         self._running_tasks.add(task.id)
         task.status = TaskStatus.RUNNING
         task.started_at = datetime.now()
+        await self._notify_task_started(task)
 
         metrics.BG_TASKS_QUEUED.set(len(self._queue))
         metrics.BG_TASKS_RUNNING.set(len(self._running_tasks))
@@ -637,6 +642,16 @@ class TaskManager:
                 await observer.on_task_finished(task)
             except Exception:
                 logger.exception("Task observer failed for task %s", task.id)
+
+    async def _notify_task_started(self, task: BackgroundTask) -> None:
+        for observer in self._observers:
+            callback = getattr(observer, "on_task_started", None)
+            if callback is None:
+                continue
+            try:
+                await callback(task)
+            except Exception:
+                logger.exception("Task observer start hook failed for task %s", task.id)
 
     async def _notify_completion(self, task: BackgroundTask) -> None:
         """Send notification when a task completes."""

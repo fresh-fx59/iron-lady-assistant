@@ -6,6 +6,7 @@ and message handling. These are observable user-facing behaviors.
 
 import asyncio
 import logging
+from datetime import datetime, timezone
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -639,6 +640,44 @@ class TestScheduleCommands:
             await cmd_schedule_list(mock_message)
         assert "no recurring schedules" in mock_message.answer.call_args[0][0].lower()
 
+    async def test_schedule_list_shows_active_run(self, mock_message):
+        mock_message.text = "/schedule_list"
+        schedule = type(
+            "ScheduleLike",
+            (),
+            {
+                "id": "abcd1234-1234",
+                "schedule_type": "interval",
+                "daily_time": None,
+                "timezone_name": None,
+                "weekly_day": None,
+                "interval_minutes": 15,
+                "next_run_at": datetime(2026, 3, 10, 12, 0, tzinfo=timezone.utc),
+                "current_status": "running",
+                "current_planned_for": datetime(2026, 3, 10, 11, 45, tzinfo=timezone.utc),
+                "current_submitted_at": datetime(2026, 3, 10, 11, 45, tzinfo=timezone.utc),
+                "current_started_at": datetime(2026, 3, 10, 11, 46, tzinfo=timezone.utc),
+                "prompt": "check backlog and summarize status",
+            },
+        )()
+        latest_run = type(
+            "RunLike",
+            (),
+            {
+                "status": "completed",
+                "planned_for": datetime(2026, 3, 10, 11, 30, tzinfo=timezone.utc),
+                "started_at": datetime(2026, 3, 10, 11, 31, tzinfo=timezone.utc),
+            },
+        )()
+        with patch("src.bot.schedule_manager") as sched_mock:
+            sched_mock.list_for_chat = AsyncMock(return_value=[schedule])
+            sched_mock.latest_runs_by_schedule = AsyncMock(return_value={"abcd1234-1234": latest_run})
+            await cmd_schedule_list(mock_message)
+
+        answer_text = mock_message.answer.call_args[0][0].lower()
+        assert "active: running" in answer_text
+        assert "last: completed" in answer_text
+
     async def test_schedule_daily_invalid_time(self, mock_message):
         mock_message.text = "/schedule_daily 9:00 check backlog"
         with patch("src.bot.schedule_manager") as sched_mock:
@@ -686,6 +725,31 @@ class TestScheduleCommands:
             sched_mock.list_runs_for_chat = AsyncMock(return_value=[])
             await cmd_schedule_history(mock_message)
         assert "no scheduled job history" in mock_message.answer.call_args[0][0].lower()
+
+    async def test_schedule_history_resolves_inactive_schedule_by_short_id(self, mock_message):
+        mock_message.text = "/schedule_history deadbeef"
+        run = type(
+            "RunLike",
+            (),
+            {
+                "schedule_id": "deadbeef-1234",
+                "status": "failed_recovered",
+                "planned_for": datetime(2026, 3, 10, 11, 30, tzinfo=timezone.utc),
+                "started_at": None,
+                "completed_at": datetime(2026, 3, 10, 11, 31, tzinfo=timezone.utc),
+                "background_task_id": None,
+                "error_text": "Scheduler restarted before task completion",
+                "response_preview": None,
+            },
+        )()
+        with patch("src.bot.schedule_manager") as sched_mock:
+            sched_mock.find_schedule_id_for_chat = AsyncMock(return_value="deadbeef-1234")
+            sched_mock.list_runs_for_chat = AsyncMock(return_value=[run])
+            await cmd_schedule_history(mock_message)
+
+        answer_text = mock_message.answer.call_args[0][0].lower()
+        assert "failed after restart" in answer_text
+        sched_mock.find_schedule_id_for_chat.assert_called_once()
 
 
 # ── Contract 7: Message handling ─────────────────────────────────

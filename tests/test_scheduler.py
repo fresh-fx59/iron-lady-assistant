@@ -96,7 +96,10 @@ async def test_due_schedule_submits_background_task(tmp_path) -> None:
     runs = await manager.list_runs_for_chat(10)
     assert len(runs) == 1
     assert runs[0].status == "submitted"
-    assert runs[0].background_task_id == "task-id"
+    assert runs[0].background_task_id == stub.submissions[0]["task_id"]
+    schedule = (await manager.list_for_chat(10))[0]
+    assert schedule.current_status == "submitted"
+    assert schedule.current_background_task_id == stub.submissions[0]["task_id"]
 
 
 @pytest.mark.asyncio
@@ -140,12 +143,13 @@ async def test_schedule_run_updated_when_background_task_finishes(tmp_path) -> N
 
     await manager._run_due_once()  # noqa: SLF001
     run = (await manager.list_runs_for_chat(42))[0]
+    background_task_id = stub.submissions[0]["task_id"]
 
     finished_task = type(
         "FinishedTask",
         (),
         {
-            "id": "task-id",
+            "id": background_task_id,
             "status": type("TaskStatusValue", (), {"value": "completed"})(),
             "started_at": datetime.now(timezone.utc),
             "completed_at": datetime.now(timezone.utc),
@@ -159,6 +163,9 @@ async def test_schedule_run_updated_when_background_task_finishes(tmp_path) -> N
     assert updated_run.id == run.id
     assert updated_run.status == "completed"
     assert updated_run.response_preview == "report delivered"
+    schedule = (await manager.list_for_chat(42))[0]
+    assert schedule.current_status is None
+    assert schedule.current_run_id is None
 
 
 @pytest.mark.asyncio
@@ -181,3 +188,89 @@ async def test_create_weekly_schedule(tmp_path) -> None:
     assert items[0].schedule_type == "weekly"
     assert items[0].weekly_day == 0
     assert items[0].daily_time == "09:30"
+
+
+@pytest.mark.asyncio
+async def test_schedule_run_marked_running_when_background_task_starts(tmp_path) -> None:
+    stub = _StubTaskManager()
+    manager = ScheduleManager(stub, tmp_path / "schedules.db")
+    sid = await manager.create_every(
+        chat_id=11,
+        user_id=22,
+        prompt="scheduled prompt",
+        interval_minutes=1,
+        model="opus",
+    )
+    past = (datetime.now(timezone.utc) - timedelta(minutes=1)).isoformat()
+    await asyncio.to_thread(manager._update_next_run, sid, past)  # noqa: SLF001
+
+    await manager._run_due_once()  # noqa: SLF001
+    started_at = datetime.now(timezone.utc)
+    background_task_id = stub.submissions[0]["task_id"]
+    started_task = type(
+        "StartedTask",
+        (),
+        {
+            "id": background_task_id,
+            "started_at": started_at,
+        },
+    )()
+    await manager.on_task_started(started_task)
+
+    run = (await manager.list_runs_for_chat(11, schedule_id=sid))[0]
+    assert run.status == "running"
+    assert run.started_at == started_at
+    schedule = (await manager.list_for_chat(11))[0]
+    assert schedule.current_status == "running"
+    assert schedule.current_started_at == started_at
+
+
+@pytest.mark.asyncio
+async def test_active_schedule_does_not_submit_overlap(tmp_path) -> None:
+    stub = _StubTaskManager()
+    manager = ScheduleManager(stub, tmp_path / "schedules.db")
+    sid = await manager.create_every(
+        chat_id=12,
+        user_id=34,
+        prompt="scheduled prompt",
+        interval_minutes=1,
+        model="opus",
+    )
+    past = (datetime.now(timezone.utc) - timedelta(minutes=1)).isoformat()
+    await asyncio.to_thread(manager._update_next_run, sid, past)  # noqa: SLF001
+
+    await manager._run_due_once()  # noqa: SLF001
+    await asyncio.to_thread(manager._update_next_run, sid, past)  # noqa: SLF001
+
+    await manager._run_due_once()  # noqa: SLF001
+
+    assert len(stub.submissions) == 1
+    runs = await manager.list_runs_for_chat(12, schedule_id=sid)
+    assert len(runs) == 1
+
+
+@pytest.mark.asyncio
+async def test_start_recovers_stale_active_run(tmp_path) -> None:
+    stub = _StubTaskManager()
+    db_path = tmp_path / "schedules.db"
+    manager = ScheduleManager(stub, db_path)
+    sid = await manager.create_every(
+        chat_id=13,
+        user_id=35,
+        prompt="scheduled prompt",
+        interval_minutes=1,
+        model="opus",
+    )
+    past = (datetime.now(timezone.utc) - timedelta(minutes=1)).isoformat()
+    await asyncio.to_thread(manager._update_next_run, sid, past)  # noqa: SLF001
+    await manager._run_due_once()  # noqa: SLF001
+
+    restarted_manager = ScheduleManager(_StubTaskManager(), db_path)
+    await restarted_manager.start()
+    await restarted_manager.stop()
+
+    run = (await restarted_manager.list_runs_for_chat(13, schedule_id=sid))[0]
+    assert run.status == "failed_recovered"
+    schedule = (await restarted_manager.list_for_chat(13))[0]
+    assert schedule.current_run_id is None
+    assert schedule.current_status is None

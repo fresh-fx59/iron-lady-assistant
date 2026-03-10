@@ -167,6 +167,8 @@ def _format_schedule_label(item) -> str:  # noqa: ANN001
 def _format_schedule_run_status(run) -> str:  # noqa: ANN001
     if run.status == "submission_failed":
         return "submission failed"
+    if run.status == "failed_recovered":
+        return "failed after restart"
     if run.status == "submitted":
         return "queued"
     return run.status.replace("_", " ")
@@ -178,6 +180,20 @@ def _format_schedule_run_summary(run) -> str:  # noqa: ANN001
     if run.started_at:
         started_local = run.started_at.astimezone().strftime("%Y-%m-%d %H:%M")
         return f"{status_label}; planned {planned_local}; started {started_local}"
+    return f"{status_label}; planned {planned_local}"
+
+
+def _format_active_schedule_summary(item) -> str:  # noqa: ANN001
+    if not item.current_status or not item.current_planned_for:
+        return "idle"
+    planned_local = item.current_planned_for.astimezone().strftime("%Y-%m-%d %H:%M")
+    status_label = _format_schedule_run_status(type("RunLike", (), {"status": item.current_status})())
+    if item.current_started_at:
+        started_local = item.current_started_at.astimezone().strftime("%Y-%m-%d %H:%M")
+        return f"{status_label}; planned {planned_local}; started {started_local}"
+    if item.current_submitted_at:
+        submitted_local = item.current_submitted_at.astimezone().strftime("%Y-%m-%d %H:%M")
+        return f"{status_label}; planned {planned_local}; submitted {submitted_local}"
     return f"{status_label}; planned {planned_local}"
 
 
@@ -1637,6 +1653,8 @@ async def cmd_schedule_list(message: Message) -> None:
         schedule_label = _format_schedule_label(item)
         lines.append(f"⏱ <code>{item.id[:8]}</code> — {schedule_label}")
         lines.append(f"   next: {next_run_local}")
+        if item.current_status:
+            lines.append(f"   active: {_format_active_schedule_summary(item)}")
         latest_run = latest_runs.get(item.id)
         if latest_run:
             lines.append(f"   last: {_format_schedule_run_summary(latest_run)}")
@@ -1659,12 +1677,14 @@ async def cmd_schedule_history(message: Message, command: CommandObject | None =
     short_id = _command_args(message, command).strip()
     schedule_id: str | None = None
     if short_id:
-        schedules = await schedule_manager.list_for_chat(message.chat.id, _thread_id(message))
-        target = next((s for s in schedules if s.id.startswith(short_id)), None)
-        if not target:
+        schedule_id = await schedule_manager.find_schedule_id_for_chat(
+            message.chat.id,
+            short_id,
+            _thread_id(message),
+        )
+        if not schedule_id:
             await message.answer("Schedule not found.")
             return
-        schedule_id = target.id
 
     runs = await schedule_manager.list_runs_for_chat(
         message.chat.id,

@@ -78,3 +78,44 @@ def test_ensure_worklog_git_hook_configures_hooks_path(monkeypatch, tmppath) -> 
     assert calls
     assert calls[0][0][:6] == ["git", "-C", str(repo_root), "config", "--local", "core.hooksPath"]
     assert calls[0][0][6] == str(hooks_dir)
+
+
+@pytest.mark.asyncio
+async def test_initialize_runtime_skips_embedded_scheduler_when_disabled(monkeypatch, tmp_path) -> None:
+    bot = AsyncMock()
+    task_manager = AsyncMock()
+    schedule_manager = AsyncMock()
+    task_manager.start = AsyncMock()
+    task_manager.add_observer = AsyncMock()
+    schedule_manager.start = AsyncMock()
+
+    monkeypatch.setattr(main, "EMBEDDED_SCHEDULER_ENABLED", False)
+    monkeypatch.setattr(main, "MEMORY_DIR", tmp_path)
+    monkeypatch.setattr(
+        main,
+        "TaskManager",
+        None,
+        raising=False,
+    )
+
+    class TaskManagerStub:
+        def __new__(cls, *args, **kwargs):
+            return task_manager
+
+    class ScheduleManagerStub:
+        def __new__(cls, *args, **kwargs):
+            return schedule_manager
+
+    import src.tasks as tasks_module
+    import src.scheduler as scheduler_module
+
+    monkeypatch.setattr(tasks_module, "TaskManager", TaskManagerStub)
+    monkeypatch.setattr(scheduler_module, "ScheduleManager", ScheduleManagerStub)
+
+    tm, sm = await main.initialize_runtime(bot)
+
+    assert tm is task_manager
+    assert sm is schedule_manager
+    task_manager.start.assert_awaited_once()
+    task_manager.add_observer.assert_not_called()
+    schedule_manager.start.assert_not_called()

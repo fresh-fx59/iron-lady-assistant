@@ -1,0 +1,22 @@
+[Unit]
+Description=Iron Lady Assistant Scheduler Daemon
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=claude-developer
+WorkingDirectory=/home/claude-developer/iron-lady-assistant
+ExecStart=/home/claude-developer/iron-lady-assistant/venv/bin/python3 -m src.scheduler_daemon
+Restart=always
+RestartSec=5
+EnvironmentFile=/home/claude-developer/iron-lady-assistant/.env
+Environment=PATH=/home/claude-developer/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=/home/claude-developer
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

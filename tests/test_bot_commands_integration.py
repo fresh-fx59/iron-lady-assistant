@@ -633,6 +633,18 @@ class TestScheduleCommands:
         assert "created" in mock_message.answer.call_args[0][0].lower()
         sched_mock.create_every.assert_called_once()
 
+    async def test_schedule_every_uses_active_provider_backend(self, mock_message):
+        mock_message.text = "/schedule_every 15 check backlog"
+        provider = type("ProviderLike", (), {"cli": "codex2", "resume_arg": "resume", "model": "gpt-5-codex", "models": ["gpt-5-codex"]})()
+        with patch("src.bot.schedule_manager") as sched_mock, patch("src.bot._current_provider", return_value=provider):
+            sched_mock.create_every = AsyncMock(return_value="abcd1234-1234")
+            await cmd_schedule_every(mock_message)
+
+        kwargs = sched_mock.create_every.await_args.kwargs
+        assert kwargs["provider_cli"] == "codex2"
+        assert kwargs["resume_arg"] == "resume"
+        assert kwargs["model"] == "gpt-5-codex"
+
     async def test_schedule_list_shows_empty(self, mock_message):
         mock_message.text = "/schedule_list"
         with patch("src.bot.schedule_manager") as sched_mock:

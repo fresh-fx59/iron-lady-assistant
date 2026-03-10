@@ -1,5 +1,6 @@
 import asyncio
 from datetime import datetime, timedelta, timezone
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -93,6 +94,10 @@ async def test_due_schedule_submits_background_task(tmp_path) -> None:
     assert len(stub.submissions) == 1
     assert stub.submissions[0]["chat_id"] == 10
     assert stub.submissions[0]["model"] == "opus"
+    assert stub.submissions[0]["provider_cli"] == "claude"
+    assert stub.submissions[0]["resume_arg"] is None
+    assert stub.submissions[0]["live_feedback"] is True
+    assert "Scheduled run started" in stub.submissions[0]["feedback_title"]
     runs = await manager.list_runs_for_chat(10)
     assert len(runs) == 1
     assert runs[0].status == "submitted"
@@ -100,6 +105,89 @@ async def test_due_schedule_submits_background_task(tmp_path) -> None:
     schedule = (await manager.list_for_chat(10))[0]
     assert schedule.current_status == "submitted"
     assert schedule.current_background_task_id == stub.submissions[0]["task_id"]
+
+
+@pytest.mark.asyncio
+async def test_due_schedule_preserves_provider_runtime(tmp_path) -> None:
+    stub = _StubTaskManager()
+    manager = ScheduleManager(stub, tmp_path / "schedules.db")
+    sid = await manager.create_every(
+        chat_id=10,
+        user_id=20,
+        prompt="scheduled prompt",
+        interval_minutes=1,
+        model="gpt-5-codex",
+        session_id="sess-1",
+        provider_cli="codex2",
+        resume_arg="resume",
+    )
+
+    past = (datetime.now(timezone.utc) - timedelta(minutes=1)).isoformat()
+    await asyncio.to_thread(manager._update_next_run, sid, past)  # noqa: SLF001
+
+    await manager._run_due_once()  # noqa: SLF001
+    assert stub.submissions[0]["provider_cli"] == "codex2"
+    assert stub.submissions[0]["resume_arg"] == "resume"
+    assert stub.submissions[0]["model"] == "gpt-5-codex"
+
+
+@pytest.mark.asyncio
+async def test_scheduler_notifications_post_to_configured_topic(tmp_path) -> None:
+    stub = _StubTaskManager()
+    notifier = AsyncMock()
+    manager = ScheduleManager(
+        stub,
+        tmp_path / "schedules.db",
+        notification_bot=notifier,
+        notification_chat_id=-100123,
+        notification_thread_id=77,
+    )
+    sid = await manager.create_every(
+        chat_id=10,
+        user_id=20,
+        prompt="scheduled prompt",
+        interval_minutes=1,
+        model="opus",
+    )
+    past = (datetime.now(timezone.utc) - timedelta(minutes=1)).isoformat()
+    await asyncio.to_thread(manager._update_next_run, sid, past)  # noqa: SLF001
+
+    await manager._run_due_once()  # noqa: SLF001
+    started_at = datetime.now(timezone.utc)
+    background_task_id = stub.submissions[0]["task_id"]
+    started_task = type(
+        "StartedTask",
+        (),
+        {
+            "id": background_task_id,
+            "started_at": started_at,
+        },
+    )()
+    await manager.on_task_started(started_task)
+
+    finished_task = type(
+        "FinishedTask",
+        (),
+        {
+            "id": background_task_id,
+            "status": type("TaskStatusValue", (), {"value": "completed"})(),
+            "started_at": started_at,
+            "completed_at": datetime.now(timezone.utc),
+            "error": None,
+            "response": "report delivered",
+        },
+    )()
+    await manager.on_task_finished(finished_task)
+
+    assert notifier.send_message.await_count == 3
+    first = notifier.send_message.await_args_list[0].kwargs
+    assert first["chat_id"] == -100123
+    assert first["message_thread_id"] == 77
+    assert "Scheduled run submitted" in first["text"]
+    assert "topic 77" not in first["text"]
+    third = notifier.send_message.await_args_list[2].kwargs
+    assert "Scheduled run completed" in third["text"]
+    assert "report delivered" in third["text"]
 
 
 @pytest.mark.asyncio

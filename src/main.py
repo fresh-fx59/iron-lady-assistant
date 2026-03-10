@@ -20,6 +20,7 @@ from .config import (
     TELEGRAM_BACKOFF_MAX_SECONDS,
     TELEGRAM_BACKOFF_FACTOR,
     TELEGRAM_BACKOFF_JITTER,
+    EMBEDDED_SCHEDULER_ENABLED,
 )
 from . import bot as bot_module
 from .bot import router, provider_manager, task_manager, schedule_manager
@@ -161,6 +162,22 @@ async def send_ready_notification(bot: Bot) -> None:
         logging.warning("Could not send ready notification: %s", e)
 
 
+async def initialize_runtime(bot: Bot) -> tuple[object, object]:
+    global task_manager, schedule_manager
+    from .tasks import TaskManager
+    from .scheduler import ScheduleManager
+
+    task_manager = TaskManager(bot)
+    schedule_manager = ScheduleManager(task_manager, MEMORY_DIR / "schedules.db")
+    await task_manager.start()
+    if EMBEDDED_SCHEDULER_ENABLED:
+        task_manager.add_observer(schedule_manager)
+        await schedule_manager.start()
+    else:
+        logging.info("Embedded scheduler worker disabled; expecting external scheduler daemon")
+    return task_manager, schedule_manager
+
+
 async def main() -> None:
     logging.basicConfig(
         level=logging.INFO,
@@ -178,15 +195,7 @@ async def main() -> None:
     dp.include_router(router)
     dp.startup.register(send_ready_notification)
 
-    # Initialize task manager
-    global task_manager, schedule_manager
-    from .tasks import TaskManager
-    from .scheduler import ScheduleManager
-    task_manager = TaskManager(bot)
-    schedule_manager = ScheduleManager(task_manager, MEMORY_DIR / "schedules.db")
-    task_manager.add_observer(schedule_manager)
-    await task_manager.start()
-    await schedule_manager.start()
+    await initialize_runtime(bot)
 
     await bot.set_my_commands([
         BotCommand(command="start", description="Welcome message"),

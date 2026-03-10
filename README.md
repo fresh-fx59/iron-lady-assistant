@@ -217,6 +217,50 @@ The bot exposes Prometheus metrics at `http://localhost:9101/metrics` — useful
 
 Tracked metrics include message counts, response times, API costs, active sessions, and monitor-only F18 cost intelligence telemetry (taxonomy counters, tool-mix buckets, message-size buckets, and per-mode/provider/model cost and duration histograms).
 
+### F18 Attention Validator (Monitor-Only)
+
+Use the validator to detect when cost observability needs operator attention:
+
+```bash
+./scripts/validate_cost_observability.py --format text
+```
+
+It checks:
+- Prometheus scrape health for `telegram_bot_metrics`
+- Presence of key bot series (`telegrambot_messages_total`)
+- Cost-with-error ratio, retry-amplified-cost frequency, and steering-event pressure
+
+Suggested background schedule:
+
+```cron
+*/15 * * * * /home/claude-developer/iron-lady-assistant/scripts/validate_cost_observability.py --format json >> /home/claude-developer/iron-lady-assistant/work-dir/cost_observability_validator.log 2>&1
+```
+
+### External Scheduler Daemon
+
+Recurring schedules can run outside the polling bot process:
+
+- set `EMBEDDED_SCHEDULER_ENABLED=0` in `.env`
+- install `telegram-scheduler.service`
+- run `python3 -m src.scheduler_daemon`
+
+For reboot persistence with systemd:
+
+```bash
+sudo install -m 0644 telegram-scheduler.service /etc/systemd/system/telegram-scheduler.service
+sudo systemctl daemon-reload
+sudo systemctl enable --now telegram-scheduler.service
+```
+
+Optional monitoring topic:
+
+- set `SCHEDULER_NOTIFY_CHAT_ID`
+- set `SCHEDULER_NOTIFY_THREAD_ID`
+
+The daemon will execute due schedules in the background and mirror submit/start/finish events to that Telegram topic.
+Scheduled jobs also preserve the provider runtime they were created with, so a task created from a `codex*` thread will continue running through that same Codex CLI when the standalone daemon picks it up.
+`setup.sh` can also generate and install both `telegram-bot.service` and `telegram-scheduler.service` when you choose the external scheduler option.
+
 ## Troubleshooting
 
 **Bot doesn't respond to messages**
@@ -255,6 +299,7 @@ Tracked metrics include message counts, response times, API costs, active sessio
 ├── .env.example          # Configuration template
 ├── requirements.txt      # Python dependencies
 ├── telegram-bot.service  # systemd service file
+├── telegram-scheduler.service # Standalone scheduler daemon service
 ├── providers.json        # LLM provider fallback configuration
 ├── .deploy/              # Runtime state (gitignored)
 │   ├── good_commit       # Last known-good git commit hash
@@ -275,6 +320,7 @@ Tracked metrics include message counts, response times, API costs, active sessio
     ├── memory.py         # Persistent memory (YAML profile + SQLite episodes)
     ├── tools.py          # Backward-compatible shim to tools plugin
     ├── scheduler.py      # Persistent recurring schedule runner
+    ├── scheduler_daemon.py # Standalone scheduler runtime
     ├── self_modify.py    # Stage/validate/promote/rollback helpers for sandboxed self-modification
     ├── progress.py       # Live progress updates
     ├── formatter.py      # Markdown-to-HTML conversion

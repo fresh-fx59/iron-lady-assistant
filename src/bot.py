@@ -816,6 +816,22 @@ def _codex_task_model(session: object, provider) -> str:
     return "gpt-5-codex"
 
 
+def _scheduled_task_backend(session: object, provider) -> tuple[str, str | None, str, str | None]:
+    if _is_codex_family_cli(getattr(provider, "cli", None)):
+        return (
+            _codex_task_model(session, provider),
+            _provider_session_id(session, provider),
+            provider.cli,
+            getattr(provider, "resume_arg", None),
+        )
+    return (
+        session.model,
+        getattr(session, "claude_session_id", None),
+        getattr(provider, "cli", "claude"),
+        getattr(provider, "resume_arg", None),
+    )
+
+
 def _codex_working_dir() -> str:
     """Run Codex from user home so it can access files under that tree."""
     return str(Path.home())
@@ -1612,6 +1628,8 @@ async def cmd_schedule_every(message: Message, command: CommandObject | None = N
     chat_id = message.chat.id
     thread_id = _thread_id(message)
     session = session_manager.get(chat_id, thread_id)
+    provider = _current_provider(_scope_key(chat_id, thread_id))
+    task_model, session_id, provider_cli, resume_arg = _scheduled_task_backend(session, provider)
     full_prompt = _build_augmented_prompt(task_text)
 
     schedule_id = await schedule_manager.create_every(
@@ -1620,8 +1638,10 @@ async def cmd_schedule_every(message: Message, command: CommandObject | None = N
         user_id=_actor_id(message),
         prompt=full_prompt,
         interval_minutes=interval_minutes,
-        model=session.model,
-        session_id=session.claude_session_id,
+        model=task_model,
+        session_id=session_id,
+        provider_cli=provider_cli,
+        resume_arg=resume_arg,
     )
     await message.answer(
         "✅ Recurring schedule created\n"
@@ -1752,6 +1772,8 @@ async def cmd_schedule_weekly(message: Message, command: CommandObject | None = 
     chat_id = message.chat.id
     thread_id = _thread_id(message)
     session = session_manager.get(chat_id, thread_id)
+    provider = _current_provider(_scope_key(chat_id, thread_id))
+    task_model, session_id, provider_cli, resume_arg = _scheduled_task_backend(session, provider)
     full_prompt = _build_augmented_prompt(task_text)
 
     try:
@@ -1763,8 +1785,10 @@ async def cmd_schedule_weekly(message: Message, command: CommandObject | None = 
             weekly_day=weekday,
             daily_time=daily_time,
             timezone_name=timezone_name,
-            model=session.model,
-            session_id=session.claude_session_id,
+            model=task_model,
+            session_id=session_id,
+            provider_cli=provider_cli,
+            resume_arg=resume_arg,
         )
     except Exception as exc:
         await message.answer(f"Could not create weekly schedule: {exc}")
@@ -1813,6 +1837,8 @@ async def cmd_schedule_daily(message: Message, command: CommandObject | None = N
     chat_id = message.chat.id
     thread_id = _thread_id(message)
     session = session_manager.get(chat_id, thread_id)
+    provider = _current_provider(_scope_key(chat_id, thread_id))
+    task_model, session_id, provider_cli, resume_arg = _scheduled_task_backend(session, provider)
     full_prompt = _build_augmented_prompt(task_text)
 
     try:
@@ -1823,8 +1849,10 @@ async def cmd_schedule_daily(message: Message, command: CommandObject | None = N
             prompt=full_prompt,
             daily_time=daily_time,
             timezone_name=timezone_name,
-            model=session.model,
-            session_id=session.claude_session_id,
+            model=task_model,
+            session_id=session_id,
+            provider_cli=provider_cli,
+            resume_arg=resume_arg,
         )
     except Exception as exc:
         await message.answer(f"Could not create daily schedule: {exc}")

@@ -3,13 +3,17 @@
 from __future__ import annotations
 
 import asyncio
+import html
 import logging
 import sqlite3
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from typing import Any
 from zoneinfo import ZoneInfo
+
+from aiogram import Bot
 
 from .tasks import BackgroundTask, TaskManager
 
@@ -30,6 +34,8 @@ class ScheduledTask:
     weekly_day: int | None
     model: str
     session_id: str | None
+    provider_cli: str
+    resume_arg: str | None
     state: str
     misfire_policy: str
     current_run_id: str | None
@@ -63,10 +69,20 @@ class ScheduleManager:
 
     _POLL_SECONDS = 5
 
-    def __init__(self, task_manager: TaskManager, db_path: Path) -> None:
+    def __init__(
+        self,
+        task_manager: TaskManager,
+        db_path: Path,
+        notification_bot: Bot | None = None,
+        notification_chat_id: int | None = None,
+        notification_thread_id: int | None = None,
+    ) -> None:
         self._task_manager = task_manager
         self._db_path = db_path
         self._worker_task: asyncio.Task | None = None
+        self._notification_bot = notification_bot
+        self._notification_chat_id = notification_chat_id
+        self._notification_thread_id = notification_thread_id
         self._init_db()
 
     def _connect(self) -> sqlite3.Connection:
@@ -92,6 +108,8 @@ class ScheduleManager:
                     weekly_day INTEGER,
                     model TEXT NOT NULL,
                     session_id TEXT,
+                    provider_cli TEXT NOT NULL DEFAULT 'claude',
+                    resume_arg TEXT,
                     state TEXT NOT NULL DEFAULT 'active',
                     misfire_policy TEXT NOT NULL DEFAULT 'catch_up_one',
                     current_run_id TEXT,
@@ -110,6 +128,8 @@ class ScheduleManager:
             self._ensure_column(con, "timezone_name", "TEXT")
             self._ensure_column(con, "weekly_day", "INTEGER")
             self._ensure_column(con, "message_thread_id", "INTEGER")
+            self._ensure_column(con, "provider_cli", "TEXT NOT NULL DEFAULT 'claude'")
+            self._ensure_column(con, "resume_arg", "TEXT")
             self._ensure_column(con, "state", "TEXT NOT NULL DEFAULT 'active'")
             self._ensure_column(con, "misfire_policy", "TEXT NOT NULL DEFAULT 'catch_up_one'")
             self._ensure_column(con, "current_run_id", "TEXT")
@@ -181,6 +201,8 @@ class ScheduleManager:
         interval_minutes: int,
         model: str,
         session_id: str | None = None,
+        provider_cli: str = "claude",
+        resume_arg: str | None = None,
         message_thread_id: int | None = None,
     ) -> str:
         task_id = str(uuid.uuid4())
@@ -200,6 +222,8 @@ class ScheduleManager:
             None,
             model,
             session_id,
+            provider_cli,
+            resume_arg,
             next_run.isoformat(),
             now.isoformat(),
         )
@@ -214,6 +238,8 @@ class ScheduleManager:
         timezone_name: str,
         model: str,
         session_id: str | None = None,
+        provider_cli: str = "claude",
+        resume_arg: str | None = None,
         message_thread_id: int | None = None,
     ) -> str:
         task_id = str(uuid.uuid4())
@@ -233,6 +259,8 @@ class ScheduleManager:
             None,
             model,
             session_id,
+            provider_cli,
+            resume_arg,
             next_run.isoformat(),
             now.isoformat(),
         )
@@ -248,6 +276,8 @@ class ScheduleManager:
         timezone_name: str,
         model: str,
         session_id: str | None = None,
+        provider_cli: str = "claude",
+        resume_arg: str | None = None,
         message_thread_id: int | None = None,
     ) -> str:
         task_id = str(uuid.uuid4())
@@ -272,6 +302,8 @@ class ScheduleManager:
             weekly_day,
             model,
             session_id,
+            provider_cli,
+            resume_arg,
             next_run.isoformat(),
             now.isoformat(),
         )
@@ -291,6 +323,8 @@ class ScheduleManager:
         weekly_day: int | None,
         model: str,
         session_id: str | None,
+        provider_cli: str,
+        resume_arg: str | None,
         next_run_at: str,
         created_at: str,
     ) -> None:
@@ -298,8 +332,8 @@ class ScheduleManager:
             con.execute(
                 """
                 INSERT INTO scheduled_tasks
-                (id, chat_id, message_thread_id, user_id, prompt, interval_minutes, schedule_type, daily_time, timezone_name, weekly_day, model, session_id, next_run_at, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                (id, chat_id, message_thread_id, user_id, prompt, interval_minutes, schedule_type, daily_time, timezone_name, weekly_day, model, session_id, provider_cli, resume_arg, next_run_at, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     task_id,
@@ -314,6 +348,8 @@ class ScheduleManager:
                     weekly_day,
                     model,
                     session_id,
+                    provider_cli,
+                    resume_arg,
                     next_run_at,
                     created_at,
                 ),
@@ -340,7 +376,7 @@ class ScheduleManager:
             if message_thread_id is None:
                 cur = con.execute(
                     """
-                    SELECT id, chat_id, message_thread_id, user_id, prompt, interval_minutes, model, session_id, next_run_at, created_at
+                    SELECT id, chat_id, message_thread_id, user_id, prompt, interval_minutes, model, session_id, provider_cli, resume_arg, next_run_at, created_at
                            , schedule_type, daily_time, timezone_name, weekly_day
                            , state, misfire_policy, current_run_id, current_background_task_id
                            , current_planned_for, current_submitted_at, current_started_at, current_status
@@ -353,7 +389,7 @@ class ScheduleManager:
             else:
                 cur = con.execute(
                     """
-                    SELECT id, chat_id, message_thread_id, user_id, prompt, interval_minutes, model, session_id, next_run_at, created_at
+                    SELECT id, chat_id, message_thread_id, user_id, prompt, interval_minutes, model, session_id, provider_cli, resume_arg, next_run_at, created_at
                            , schedule_type, daily_time, timezone_name, weekly_day
                            , state, misfire_policy, current_run_id, current_background_task_id
                            , current_planned_for, current_submitted_at, current_started_at, current_status
@@ -437,7 +473,20 @@ class ScheduleManager:
                     prompt=schedule.prompt,
                     model=schedule.model,
                     session_id=schedule.session_id,
+                    provider_cli=schedule.provider_cli,
+                    resume_arg=schedule.resume_arg,
+                    live_feedback=True,
+                    feedback_title=self._build_schedule_feedback_title(schedule, planned_for),
                     task_id=background_task_id,
+                )
+                await self._notify_schedule_event(
+                    (
+                        "🕒 <b>Scheduled run submitted</b>\n"
+                        f"<b>Schedule:</b> <code>{schedule.id[:8]}</code>\n"
+                        f"<b>Planned:</b> {planned_for.astimezone().strftime('%Y-%m-%d %H:%M:%S')}\n"
+                        f"<b>Target:</b> {self._format_schedule_target(schedule.chat_id, schedule.message_thread_id)}\n"
+                        f"<b>Prompt:</b> {html.escape(self._preview_text(schedule.prompt, 160) or '')}"
+                    )
                 )
             except Exception:
                 logger.exception("Failed to submit scheduled task %s", schedule.id)
@@ -447,6 +496,14 @@ class ScheduleManager:
                     run_id,
                     submitted_at.isoformat(),
                     "Failed to submit background task",
+                )
+                await self._notify_schedule_event(
+                    (
+                        "❌ <b>Scheduled run submission failed</b>\n"
+                        f"<b>Schedule:</b> <code>{schedule.id[:8]}</code>\n"
+                        f"<b>Planned:</b> {planned_for.astimezone().strftime('%Y-%m-%d %H:%M:%S')}\n"
+                        f"<b>Target:</b> {self._format_schedule_target(schedule.chat_id, schedule.message_thread_id)}"
+                    )
                 )
 
     def _recover_stale_runs(self, recovered_at: str) -> None:
@@ -491,8 +548,22 @@ class ScheduleManager:
             task.id,
             task.started_at.isoformat() if task.started_at else None,
         )
+        run = await asyncio.to_thread(self._find_run_row_by_background_task_id, task.id)
+        if run:
+            planned_for = datetime.fromisoformat(run["planned_for"]).astimezone().strftime("%Y-%m-%d %H:%M:%S")
+            started_at = task.started_at.astimezone().strftime("%Y-%m-%d %H:%M:%S") if task.started_at else "unknown"
+            await self._notify_schedule_event(
+                (
+                    "▶️ <b>Scheduled run started</b>\n"
+                    f"<b>Schedule:</b> <code>{run['schedule_id'][:8]}</code>\n"
+                    f"<b>Planned:</b> {planned_for}\n"
+                    f"<b>Started:</b> {started_at}\n"
+                    f"<b>Target:</b> {self._format_schedule_target(run['chat_id'], run['message_thread_id'])}"
+                )
+            )
 
     async def on_task_finished(self, task: BackgroundTask) -> None:
+        run = await asyncio.to_thread(self._find_run_row_by_background_task_id, task.id)
         await asyncio.to_thread(
             self._update_run_for_background_task,
             task.id,
@@ -502,6 +573,21 @@ class ScheduleManager:
             task.error,
             self._preview_text(task.response),
         )
+        if run:
+            status_value = getattr(task.status, "value", str(task.status))
+            finished_at = task.completed_at.astimezone().strftime("%Y-%m-%d %H:%M:%S") if task.completed_at else "unknown"
+            detail = task.error or self._preview_text(task.response, 220) or "No detail"
+            planned_for = datetime.fromisoformat(run["planned_for"]).astimezone().strftime("%Y-%m-%d %H:%M:%S")
+            await self._notify_schedule_event(
+                (
+                    f"{self._status_emoji(status_value)} <b>Scheduled run {html.escape(status_value)}</b>\n"
+                    f"<b>Schedule:</b> <code>{run['schedule_id'][:8]}</code>\n"
+                    f"<b>Planned:</b> {planned_for}\n"
+                    f"<b>Finished:</b> {finished_at}\n"
+                    f"<b>Target:</b> {self._format_schedule_target(run['chat_id'], run['message_thread_id'])}\n"
+                    f"<b>Result:</b> {html.escape(detail)}"
+                )
+            )
 
     async def list_runs_for_chat(
         self,
@@ -527,7 +613,7 @@ class ScheduleManager:
         with self._connect() as con:
             cur = con.execute(
                 """
-                SELECT id, chat_id, message_thread_id, user_id, prompt, interval_minutes, model, session_id, next_run_at, created_at
+                SELECT id, chat_id, message_thread_id, user_id, prompt, interval_minutes, model, session_id, provider_cli, resume_arg, next_run_at, created_at
                        , schedule_type, daily_time, timezone_name, weekly_day
                        , state, misfire_policy, current_run_id, current_background_task_id
                        , current_planned_for, current_submitted_at, current_started_at, current_status
@@ -789,6 +875,17 @@ class ScheduleManager:
                 latest_rows.append(row)
         return latest_rows
 
+    def _find_run_row_by_background_task_id(self, background_task_id: str) -> sqlite3.Row | None:
+        with self._connect() as con:
+            return con.execute(
+                """
+                SELECT schedule_id, chat_id, message_thread_id, planned_for
+                FROM scheduled_task_runs
+                WHERE background_task_id = ?
+                """,
+                (background_task_id,),
+            ).fetchone()
+
     @staticmethod
     def _row_to_scheduled_task(row: sqlite3.Row) -> ScheduledTask:
         return ScheduledTask(
@@ -804,6 +901,8 @@ class ScheduleManager:
             weekly_day=row["weekly_day"],
             model=row["model"],
             session_id=row["session_id"],
+            provider_cli=row["provider_cli"] or "claude",
+            resume_arg=row["resume_arg"],
             state=row["state"] or "active",
             misfire_policy=row["misfire_policy"] or "catch_up_one",
             current_run_id=row["current_run_id"],
@@ -841,6 +940,44 @@ class ScheduleManager:
         if len(compact) <= limit:
             return compact
         return compact[: limit - 3] + "..."
+
+    @staticmethod
+    def _format_schedule_target(chat_id: int, message_thread_id: int | None) -> str:
+        if message_thread_id is None:
+            return f"chat {chat_id}"
+        return f"chat {chat_id} / topic {message_thread_id}"
+
+    @staticmethod
+    def _status_emoji(status: str) -> str:
+        return {
+            "completed": "✅",
+            "failed": "❌",
+            "cancelled": "🚫",
+            "submission_failed": "❌",
+            "failed_recovered": "⚠️",
+        }.get(status, "ℹ️")
+
+    def _build_schedule_feedback_title(self, schedule: ScheduledTask, planned_for: datetime) -> str:
+        return (
+            "🕒 <b>Scheduled run started</b>\n"
+            f"<b>Schedule:</b> <code>{schedule.id[:8]}</code>\n"
+            f"<b>Planned:</b> {planned_for.astimezone().strftime('%Y-%m-%d %H:%M:%S')}"
+        )
+
+    async def _notify_schedule_event(self, text: str) -> None:
+        if self._notification_bot is None or self._notification_chat_id is None:
+            return
+        kwargs: dict[str, Any] = {
+            "chat_id": self._notification_chat_id,
+            "text": text,
+            "parse_mode": "HTML",
+        }
+        if self._notification_thread_id is not None:
+            kwargs["message_thread_id"] = self._notification_thread_id
+        try:
+            await self._notification_bot.send_message(**kwargs)
+        except Exception:
+            logger.exception("Failed to send scheduler notification")
 
     @staticmethod
     def _next_daily_run(daily_time: str, timezone_name: str, now_utc: datetime) -> datetime:

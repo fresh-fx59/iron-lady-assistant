@@ -130,6 +130,19 @@ TIMEOUT="${TIMEOUT:-300}"
 read -rp "Metrics port (press Enter for 9101): " METRICS_PORT
 METRICS_PORT="${METRICS_PORT:-9101}"
 
+read -rp "Run recurring schedules in a separate scheduler service? [y/N]: " EXTERNAL_SCHEDULER
+EXTERNAL_SCHEDULER="${EXTERNAL_SCHEDULER:-N}"
+
+SCHEDULER_NOTIFY_CHAT_ID=""
+SCHEDULER_NOTIFY_THREAD_ID=""
+if [[ "$EXTERNAL_SCHEDULER" =~ ^[Yy]$ ]]; then
+    info "The polling bot will keep /schedule_* commands, and a standalone daemon will execute due runs."
+    read -rp "Optional scheduler notification chat ID (press Enter to skip): " SCHEDULER_NOTIFY_CHAT_ID
+    SCHEDULER_NOTIFY_CHAT_ID="${SCHEDULER_NOTIFY_CHAT_ID:-}"
+    read -rp "Optional scheduler notification topic/thread ID (press Enter to skip): " SCHEDULER_NOTIFY_THREAD_ID
+    SCHEDULER_NOTIFY_THREAD_ID="${SCHEDULER_NOTIFY_THREAD_ID:-}"
+fi
+
 # ── Write .env file ──────────────────────────────────────────────────
 header "Writing configuration"
 
@@ -148,6 +161,9 @@ DEFAULT_MODEL=$DEFAULT_MODEL
 CLAUDE_WORKING_DIR=$WORKING_DIR
 MAX_RESPONSE_TIMEOUT=$TIMEOUT
 METRICS_PORT=$METRICS_PORT
+EMBEDDED_SCHEDULER_ENABLED=$([[ "$EXTERNAL_SCHEDULER" =~ ^[Yy]$ ]] && echo 0 || echo 1)
+SCHEDULER_NOTIFY_CHAT_ID=$SCHEDULER_NOTIFY_CHAT_ID
+SCHEDULER_NOTIFY_THREAD_ID=$SCHEDULER_NOTIFY_THREAD_ID
 EOF
 
 success ".env file created."
@@ -168,16 +184,18 @@ success "Dependencies installed."
 header "Auto-start on boot (optional)"
 
 echo "Would you like the bot to start automatically when your server boots?"
-echo "This uses systemd and requires sudo."
+echo "This uses systemd and requires sudo. If you enabled the external scheduler,"
+echo "setup.sh will install both the bot service and the scheduler daemon service."
 echo ""
 read -rp "Set up auto-start? [y/N]: " INSTALL_SERVICE
 
 if [[ "$INSTALL_SERVICE" =~ ^[Yy]$ ]]; then
     SERVICE_USER="$(whoami)"
-    SERVICE_FILE="$SCRIPT_DIR/telegram-bot.service"
+    BOT_SERVICE_FILE="$SCRIPT_DIR/telegram-bot.service"
+    SCHEDULER_SERVICE_FILE="$SCRIPT_DIR/telegram-scheduler.service"
 
-    # Generate a service file with correct paths
-    cat > "$SERVICE_FILE" << SVCEOF
+    # Generate a service file with correct paths.
+    cat > "$BOT_SERVICE_FILE" << SVCEOF
 [Unit]
 Description=Telegram Claude Code Bot
 After=network-online.target
@@ -203,18 +221,66 @@ PrivateTmp=true
 WantedBy=multi-user.target
 SVCEOF
 
-    sudo cp "$SERVICE_FILE" /etc/systemd/system/telegram-bot.service
+    sudo cp "$BOT_SERVICE_FILE" /etc/systemd/system/telegram-bot.service
+
+    if [[ "$EXTERNAL_SCHEDULER" =~ ^[Yy]$ ]]; then
+        cat > "$SCHEDULER_SERVICE_FILE" << SCHSVCEOF
+[Unit]
+Description=Iron Lady Assistant Scheduler Daemon
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=$SERVICE_USER
+WorkingDirectory=$SCRIPT_DIR
+ExecStart=$SCRIPT_DIR/venv/bin/python3 -m src.scheduler_daemon
+Restart=always
+RestartSec=5
+EnvironmentFile=$SCRIPT_DIR/.env
+Environment=PATH=$HOME/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=$HOME
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
+SCHSVCEOF
+
+        sudo cp "$SCHEDULER_SERVICE_FILE" /etc/systemd/system/telegram-scheduler.service
+    fi
+
     sudo systemctl daemon-reload
     sudo systemctl enable --now telegram-bot.service
+    if [[ "$EXTERNAL_SCHEDULER" =~ ^[Yy]$ ]]; then
+        sudo systemctl enable --now telegram-scheduler.service
+    fi
 
     success "Service installed and started!"
     echo ""
     echo "  Check status:  sudo systemctl status telegram-bot.service"
+    if [[ "$EXTERNAL_SCHEDULER" =~ ^[Yy]$ ]]; then
+        echo "                 sudo systemctl status telegram-scheduler.service"
+    fi
     echo "  View logs:     journalctl -u telegram-bot.service -f"
+    if [[ "$EXTERNAL_SCHEDULER" =~ ^[Yy]$ ]]; then
+        echo "                 journalctl -u telegram-scheduler.service -f"
+    fi
     echo "  Stop:          sudo systemctl stop telegram-bot.service"
+    if [[ "$EXTERNAL_SCHEDULER" =~ ^[Yy]$ ]]; then
+        echo "                 sudo systemctl stop telegram-scheduler.service"
+    fi
     echo "  Restart:       sudo systemctl restart telegram-bot.service"
+    if [[ "$EXTERNAL_SCHEDULER" =~ ^[Yy]$ ]]; then
+        echo "                 sudo systemctl restart telegram-scheduler.service"
+    fi
 else
     info "Skipped. You can run the bot manually with: ./run.sh"
+    if [[ "$EXTERNAL_SCHEDULER" =~ ^[Yy]$ ]]; then
+        info "Run the standalone scheduler manually with: venv/bin/python3 -m src.scheduler_daemon"
+    fi
 fi
 
 # ── Done! ─────────────────────────────────────────────────────────────

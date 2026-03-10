@@ -886,6 +886,7 @@ class TestVoiceHandling:
         assert "Incoming voice message: chat=123456789 thread=88 message=654" in caplog.text
         assert "voice_duration=7" in caplog.text
         assert "Entering handle_voice: chat=123456789 thread=88 message=654" in caplog.text
+        assert "Voice pipeline timings: chat=123456789 thread=88 message=654 voice_duration_s=7" in caplog.text
 
     async def test_handle_voice_retries_transcription_progress_after_retry_after(
         self,

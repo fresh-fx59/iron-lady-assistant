@@ -2078,7 +2078,9 @@ async def handle_voice(message: Message) -> None:
 
     import tempfile
 
+    file_lookup_started_at = monotonic()
     file = await message.bot.get_file(message.voice.file_id)
+    file_lookup_elapsed_ms = (monotonic() - file_lookup_started_at) * 1000
     tmp = tempfile.NamedTemporaryFile(suffix=".oga", delete=False)
     transcription_started_at = monotonic()
     transcription_status_ref: dict[str, int | None] = {"message_id": None}
@@ -2115,11 +2117,30 @@ async def handle_voice(message: Message) -> None:
                     transcription_retry_after,
                 )
             )
+        download_started_at = monotonic()
         await message.bot.download_file(file.file_path, tmp.name)
+        download_elapsed_ms = (monotonic() - download_started_at) * 1000
+        transcribe_started_at = monotonic()
         text = await transcribe.transcribe(tmp.name)
+        transcribe_elapsed_ms = (monotonic() - transcribe_started_at) * 1000
         transcription_completed = True
+        total_pre_llm_elapsed_ms = (monotonic() - transcription_started_at) * 1000
         logger.info("Chat %d: transcribed voice (%ds) → %d chars",
                      message.chat.id, message.voice.duration, len(text))
+        logger.info(
+            "Voice pipeline timings: chat=%s thread=%s message=%s voice_duration_s=%s "
+            "file_lookup_ms=%.1f download_ms=%.1f transcribe_call_ms=%.1f total_pre_llm_ms=%.1f "
+            "temp_audio=%s",
+            message.chat.id,
+            _thread_id(message),
+            message.message_id,
+            message.voice.duration,
+            file_lookup_elapsed_ms,
+            download_elapsed_ms,
+            transcribe_elapsed_ms,
+            total_pre_llm_elapsed_ms,
+            os.path.basename(tmp.name),
+        )
     except Exception:
         logger.exception("Voice transcription failed")
         transcription_failed_notified = True

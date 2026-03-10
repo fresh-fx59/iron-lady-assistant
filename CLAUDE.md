@@ -1,6 +1,6 @@
 # Claude Code as Telegram Assistant
 
-**Current version: `0.21.5`** — defined in `src/config.py` as `VERSION`.
+**Current version: `0.21.8`** — defined in `src/config.py` as `VERSION`.
 
 Telegram bot that bridges messages to Claude Code's `--print` mode via subprocess, providing a conversational AI assistant through Telegram.
 
@@ -70,6 +70,8 @@ This installs build deps (`cmake`, `g++`, `ffmpeg`), clones and builds whisper.c
 3. `whisper-cli` transcribes locally (auto-detects Russian/English)
 4. Transcribed text is prefixed with `[Voice message]` and passed to Claude/Codex
 5. If whisper.cpp is not installed, bot replies with setup instructions
+
+The bot logs transcription timing data for later analysis, including Telegram file lookup/download time, end-to-end pre-LLM transcription latency, and parsed `whisper.cpp` stage timings such as model load, mel, encode, decode, batch, and total time.
 
 ### Configuration
 

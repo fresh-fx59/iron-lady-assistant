@@ -263,8 +263,10 @@ Optional monitoring topic:
 
 - set `SCHEDULER_NOTIFY_CHAT_ID`
 - set `SCHEDULER_NOTIFY_THREAD_ID`
+- optional: set `SCHEDULER_NOTIFY_LEVEL=all|failures|off` (default: `failures`)
 
-The daemon will execute due schedules in the background and mirror submit/start/finish events to that Telegram topic.
+The daemon will execute due schedules in the background and mirror only high-signal events by default: new failures, warn/critical task results, and recoveries from prior problems.
+Routine submitted/started/success noise stays silent unless you explicitly set `SCHEDULER_NOTIFY_LEVEL=all`.
 Scheduled jobs also preserve the provider runtime they were created with, so a task created from a `codex*` thread will continue running through that same Codex CLI when the standalone daemon picks it up.
 `setup.sh` can also generate and install both `telegram-bot.service` and `telegram-scheduler.service` when you choose the external scheduler option.
 The bundled systemd units include the per-user npm bin path so `codex` CLIs installed under `~/.npm-<user>/bin` stay available after reboot.

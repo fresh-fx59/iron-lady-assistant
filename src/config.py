@@ -6,7 +6,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-VERSION: str = "0.24.0"
+VERSION: str = "0.25.0"
 
 # ── Bot token (required) ────────────────────────────────────
 BOT_TOKEN: str = os.getenv("TELEGRAM_BOT_TOKEN", "")
@@ -113,6 +113,7 @@ _raw_scheduler_notify_thread_id = os.getenv("SCHEDULER_NOTIFY_THREAD_ID", "").st
 SCHEDULER_NOTIFY_THREAD_ID: int | None = (
     int(_raw_scheduler_notify_thread_id) if _raw_scheduler_notify_thread_id else None
 )
+SCHEDULER_NOTIFY_LEVEL: str = os.getenv("SCHEDULER_NOTIFY_LEVEL", "failures").strip().lower() or "failures"
 AUTONOMY_ENABLED: bool = os.getenv("AUTONOMY_ENABLED", "1").strip().lower() not in {"0", "false", "no"}
 AUTONOMY_FAILURE_THRESHOLD: int = int(os.getenv("AUTONOMY_FAILURE_THRESHOLD", "3"))
 AUTONOMY_FAILURE_WINDOW_MINUTES: int = int(os.getenv("AUTONOMY_FAILURE_WINDOW_MINUTES", "60"))

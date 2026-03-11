@@ -26,6 +26,12 @@ class TaskStatus(str, Enum):
     CANCELLED = "cancelled"
 
 
+class TaskNotificationMode(str, Enum):
+    FULL = "full"
+    FAILURES_ONLY = "failures_only"
+    SILENT = "silent"
+
+
 @dataclass
 class BackgroundTask:
     id: str
@@ -39,6 +45,7 @@ class BackgroundTask:
     created_at: datetime
     provider_cli: str = "claude"
     resume_arg: str | None = None
+    notification_mode: TaskNotificationMode = TaskNotificationMode.FULL
     live_feedback: bool = False
     feedback_title: str | None = None
     started_at: datetime | None = None
@@ -156,6 +163,7 @@ class TaskManager:
         message_thread_id: int | None = None,
         provider_cli: str = "claude",
         resume_arg: str | None = None,
+        notification_mode: TaskNotificationMode = TaskNotificationMode.FULL,
         live_feedback: bool = False,
         feedback_title: str | None = None,
         process_handle: dict | None = None,
@@ -172,6 +180,7 @@ class TaskManager:
             session_id=session_id,
             provider_cli=provider_cli,
             resume_arg=resume_arg,
+            notification_mode=notification_mode,
             live_feedback=live_feedback,
             feedback_title=feedback_title,
             status=TaskStatus.QUEUED,
@@ -625,6 +634,8 @@ class TaskManager:
             await asyncio.sleep(5)
 
     async def _notify_started(self, task: BackgroundTask) -> None:
+        if task.notification_mode != TaskNotificationMode.FULL:
+            return
         try:
             title = task.feedback_title or "🔄 <b>Working...</b>"
             await self.bot.send_message(
@@ -655,6 +666,8 @@ class TaskManager:
 
     async def _notify_completion(self, task: BackgroundTask) -> None:
         """Send notification when a task completes."""
+        if task.notification_mode != TaskNotificationMode.FULL:
+            return
         try:
             # Build status message
             lines = [
@@ -687,6 +700,8 @@ class TaskManager:
 
     async def _notify_failure(self, task: BackgroundTask) -> None:
         """Send notification when a task fails."""
+        if task.notification_mode == TaskNotificationMode.SILENT:
+            return
         try:
             lines = [
                 f"❌ <b>Background task failed</b>",
@@ -709,6 +724,8 @@ class TaskManager:
 
     async def _notify_cancelled(self, task: BackgroundTask) -> None:
         """Send notification when a task is cancelled."""
+        if task.notification_mode == TaskNotificationMode.SILENT:
+            return
         try:
             lines = [
                 f"🚫 <b>Background task cancelled</b>",

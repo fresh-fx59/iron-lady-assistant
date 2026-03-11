@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import html
 import logging
+import re
 import sqlite3
 import uuid
 from dataclasses import dataclass
@@ -15,9 +16,10 @@ from zoneinfo import ZoneInfo
 
 from aiogram import Bot
 
-from .tasks import BackgroundTask, TaskManager
+from .tasks import BackgroundTask, TaskManager, TaskNotificationMode
 
 logger = logging.getLogger(__name__)
+_RESPONSE_STATUS_RE = re.compile(r"overall status:\s*[`']?(ok|warn|critical|error|failed)[`']?", re.IGNORECASE)
 
 
 @dataclass(frozen=True)
@@ -76,6 +78,7 @@ class ScheduleManager:
         notification_bot: Bot | None = None,
         notification_chat_id: int | None = None,
         notification_thread_id: int | None = None,
+        notify_level: str = "failures",
     ) -> None:
         self._task_manager = task_manager
         self._db_path = db_path
@@ -83,6 +86,7 @@ class ScheduleManager:
         self._notification_bot = notification_bot
         self._notification_chat_id = notification_chat_id
         self._notification_thread_id = notification_thread_id
+        self._notify_level = notify_level if notify_level in {"all", "failures", "off"} else "failures"
         self._init_db()
 
     def _connect(self) -> sqlite3.Connection:
@@ -475,11 +479,13 @@ class ScheduleManager:
                     session_id=schedule.session_id,
                     provider_cli=schedule.provider_cli,
                     resume_arg=schedule.resume_arg,
-                    live_feedback=True,
+                    notification_mode=TaskNotificationMode.SILENT,
+                    live_feedback=False,
                     feedback_title=self._build_schedule_feedback_title(schedule, planned_for),
                     task_id=background_task_id,
                 )
                 await self._notify_schedule_event(
+                    "submitted",
                     (
                         "🕒 <b>Scheduled run submitted</b>\n"
                         f"<b>Schedule:</b> <code>{schedule.id[:8]}</code>\n"
@@ -498,6 +504,7 @@ class ScheduleManager:
                     "Failed to submit background task",
                 )
                 await self._notify_schedule_event(
+                    "submission_failed",
                     (
                         "❌ <b>Scheduled run submission failed</b>\n"
                         f"<b>Schedule:</b> <code>{schedule.id[:8]}</code>\n"
@@ -553,6 +560,7 @@ class ScheduleManager:
             planned_for = datetime.fromisoformat(run["planned_for"]).astimezone().strftime("%Y-%m-%d %H:%M:%S")
             started_at = task.started_at.astimezone().strftime("%Y-%m-%d %H:%M:%S") if task.started_at else "unknown"
             await self._notify_schedule_event(
+                "started",
                 (
                     "▶️ <b>Scheduled run started</b>\n"
                     f"<b>Schedule:</b> <code>{run['schedule_id'][:8]}</code>\n"
@@ -578,7 +586,13 @@ class ScheduleManager:
             finished_at = task.completed_at.astimezone().strftime("%Y-%m-%d %H:%M:%S") if task.completed_at else "unknown"
             detail = task.error or self._preview_text(task.response, 220) or "No detail"
             planned_for = datetime.fromisoformat(run["planned_for"]).astimezone().strftime("%Y-%m-%d %H:%M:%S")
+            previous_run = await asyncio.to_thread(
+                self._find_previous_run_row,
+                run["schedule_id"],
+                run["id"],
+            )
             await self._notify_schedule_event(
+                status_value,
                 (
                     f"{self._status_emoji(status_value)} <b>Scheduled run {html.escape(status_value)}</b>\n"
                     f"<b>Schedule:</b> <code>{run['schedule_id'][:8]}</code>\n"
@@ -586,7 +600,10 @@ class ScheduleManager:
                     f"<b>Finished:</b> {finished_at}\n"
                     f"<b>Target:</b> {self._format_schedule_target(run['chat_id'], run['message_thread_id'])}\n"
                     f"<b>Result:</b> {html.escape(detail)}"
-                )
+                ),
+                previous_run=previous_run,
+                current_response=task.response,
+                current_error=task.error,
             )
 
     async def list_runs_for_chat(
@@ -879,11 +896,24 @@ class ScheduleManager:
         with self._connect() as con:
             return con.execute(
                 """
-                SELECT schedule_id, chat_id, message_thread_id, planned_for
+                SELECT id, schedule_id, chat_id, message_thread_id, planned_for
                 FROM scheduled_task_runs
                 WHERE background_task_id = ?
                 """,
                 (background_task_id,),
+            ).fetchone()
+
+    def _find_previous_run_row(self, schedule_id: str, current_run_id: str) -> sqlite3.Row | None:
+        with self._connect() as con:
+            return con.execute(
+                """
+                SELECT id, status, error_text, response_preview
+                FROM scheduled_task_runs
+                WHERE schedule_id = ? AND id != ?
+                ORDER BY submitted_at DESC
+                LIMIT 1
+                """,
+                (schedule_id, current_run_id),
             ).fetchone()
 
     @staticmethod
@@ -964,8 +994,75 @@ class ScheduleManager:
             f"<b>Planned:</b> {planned_for.astimezone().strftime('%Y-%m-%d %H:%M:%S')}"
         )
 
-    async def _notify_schedule_event(self, text: str) -> None:
+    @staticmethod
+    def _normalize_detail(value: str | None) -> str:
+        return " ".join((value or "").split())
+
+    @classmethod
+    def _response_signal(cls, response_text: str | None) -> str | None:
+        if not response_text:
+            return None
+        text = response_text.strip()
+        if text.upper().startswith("NO_ALERT"):
+            return "ok"
+        match = _RESPONSE_STATUS_RE.search(text)
+        if match:
+            status = match.group(1).lower()
+            if status == "error":
+                return "critical"
+            if status == "failed":
+                return "critical"
+            return status
+        return None
+
+    def _should_notify_event(
+        self,
+        event_kind: str,
+        previous_run: sqlite3.Row | None = None,
+        current_response: str | None = None,
+        current_error: str | None = None,
+    ) -> bool:
+        if self._notify_level == "off":
+            return False
+        if self._notify_level == "all":
+            return True
+        if event_kind in {"submitted", "started"}:
+            return False
+        if event_kind == "completed":
+            current_signal = self._response_signal(current_response)
+            previous_signal = self._response_signal(previous_run["response_preview"]) if previous_run else None
+            if current_signal in {"warn", "critical"}:
+                return (
+                    previous_run is None
+                    or previous_signal != current_signal
+                    or self._normalize_detail(previous_run["response_preview"]) != self._normalize_detail(current_response)
+                )
+            return previous_signal in {"warn", "critical"}
+        if event_kind in {"failed", "cancelled", "submission_failed", "failed_recovered"}:
+            if previous_run is None:
+                return True
+            return (
+                previous_run["status"] != event_kind
+                or self._normalize_detail(previous_run["error_text"]) != self._normalize_detail(current_error)
+            )
+        return False
+
+    async def _notify_schedule_event(
+        self,
+        event_kind: str,
+        text: str,
+        previous_run: sqlite3.Row | None = None,
+        current_response: str | None = None,
+        current_error: str | None = None,
+    ) -> None:
         if self._notification_bot is None or self._notification_chat_id is None:
+            return
+        if not self._should_notify_event(
+            event_kind,
+            previous_run=previous_run,
+            current_response=current_response,
+            current_error=current_error,
+        ):
             return
         kwargs: dict[str, Any] = {
             "chat_id": self._notification_chat_id,

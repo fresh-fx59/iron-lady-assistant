@@ -96,7 +96,8 @@ async def test_due_schedule_submits_background_task(tmp_path) -> None:
     assert stub.submissions[0]["model"] == "opus"
     assert stub.submissions[0]["provider_cli"] == "claude"
     assert stub.submissions[0]["resume_arg"] is None
-    assert stub.submissions[0]["live_feedback"] is True
+    assert stub.submissions[0]["live_feedback"] is False
+    assert stub.submissions[0]["notification_mode"] == "silent"
     assert "Scheduled run started" in stub.submissions[0]["feedback_title"]
     runs = await manager.list_runs_for_chat(10)
     assert len(runs) == 1
@@ -141,6 +142,7 @@ async def test_scheduler_notifications_post_to_configured_topic(tmp_path) -> Non
         notification_bot=notifier,
         notification_chat_id=-100123,
         notification_thread_id=77,
+        notify_level="all",
     )
     sid = await manager.create_every(
         chat_id=10,
@@ -188,6 +190,120 @@ async def test_scheduler_notifications_post_to_configured_topic(tmp_path) -> Non
     third = notifier.send_message.await_args_list[2].kwargs
     assert "Scheduled run completed" in third["text"]
     assert "report delivered" in third["text"]
+
+
+@pytest.mark.asyncio
+async def test_scheduler_failures_mode_suppresses_routine_success_notifications(tmp_path) -> None:
+    stub = _StubTaskManager()
+    notifier = AsyncMock()
+    manager = ScheduleManager(
+        stub,
+        tmp_path / "schedules.db",
+        notification_bot=notifier,
+        notification_chat_id=-100123,
+        notification_thread_id=77,
+        notify_level="failures",
+    )
+    sid = await manager.create_every(
+        chat_id=10,
+        user_id=20,
+        prompt="scheduled prompt",
+        interval_minutes=1,
+        model="opus",
+    )
+    past = (datetime.now(timezone.utc) - timedelta(minutes=1)).isoformat()
+    await asyncio.to_thread(manager._update_next_run, sid, past)  # noqa: SLF001
+
+    await manager._run_due_once()  # noqa: SLF001
+    background_task_id = stub.submissions[0]["task_id"]
+    started_at = datetime.now(timezone.utc)
+    started_task = type("StartedTask", (), {"id": background_task_id, "started_at": started_at})()
+    await manager.on_task_started(started_task)
+    finished_task = type(
+        "FinishedTask",
+        (),
+        {
+            "id": background_task_id,
+            "status": type("TaskStatusValue", (), {"value": "completed"})(),
+            "started_at": started_at,
+            "completed_at": datetime.now(timezone.utc),
+            "error": None,
+            "response": "Overall status: `ok`",
+        },
+    )()
+    await manager.on_task_finished(finished_task)
+
+    notifier.send_message.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_scheduler_failures_mode_notifies_on_warn_and_recovery(tmp_path) -> None:
+    stub = _StubTaskManager()
+    notifier = AsyncMock()
+    manager = ScheduleManager(
+        stub,
+        tmp_path / "schedules.db",
+        notification_bot=notifier,
+        notification_chat_id=-100123,
+        notification_thread_id=77,
+        notify_level="failures",
+    )
+    sid = await manager.create_every(
+        chat_id=10,
+        user_id=20,
+        prompt="scheduled prompt",
+        interval_minutes=1,
+        model="opus",
+    )
+    past = (datetime.now(timezone.utc) - timedelta(minutes=1)).isoformat()
+    await asyncio.to_thread(manager._update_next_run, sid, past)  # noqa: SLF001
+
+    await manager._run_due_once()  # noqa: SLF001
+    background_task_id = stub.submissions[0]["task_id"]
+    started_at = datetime.now(timezone.utc)
+    started_task = type("StartedTask", (), {"id": background_task_id, "started_at": started_at})()
+    await manager.on_task_started(started_task)
+    warn_task = type(
+        "FinishedTask",
+        (),
+        {
+            "id": background_task_id,
+            "status": type("TaskStatusValue", (), {"value": "completed"})(),
+            "started_at": started_at,
+            "completed_at": datetime.now(timezone.utc),
+            "error": None,
+            "response": "Overall status: `warn`",
+        },
+    )()
+    await manager.on_task_finished(warn_task)
+
+    await asyncio.to_thread(manager._update_next_run, sid, past)  # noqa: SLF001
+    await manager._run_due_once()  # noqa: SLF001
+    second_task_id = stub.submissions[1]["task_id"]
+    second_started = datetime.now(timezone.utc)
+    second_started_task = type("StartedTask", (), {"id": second_task_id, "started_at": second_started})()
+    await manager.on_task_started(second_started_task)
+    recovery_task = type(
+        "FinishedTask",
+        (),
+        {
+            "id": second_task_id,
+            "status": type("TaskStatusValue", (), {"value": "completed"})(),
+            "started_at": second_started,
+            "completed_at": datetime.now(timezone.utc),
+            "error": None,
+            "response": "Overall status: `ok`",
+        },
+    )()
+    await manager.on_task_finished(recovery_task)
+
+    assert notifier.send_message.await_count == 2
+    first = notifier.send_message.await_args_list[0].kwargs["text"]
+    second = notifier.send_message.await_args_list[1].kwargs["text"]
+    assert "Scheduled run completed" in first
+    assert "warn" in first
+    assert "Scheduled run completed" in second
+    assert "ok" in second
 
 
 @pytest.mark.asyncio

@@ -21,6 +21,7 @@ from .config import (
     TELEGRAM_BACKOFF_FACTOR,
     TELEGRAM_BACKOFF_JITTER,
     EMBEDDED_SCHEDULER_ENABLED,
+    SCHEDULER_NOTIFY_LEVEL,
 )
 from . import bot as bot_module
 from .bot import router, provider_manager, task_manager, schedule_manager
@@ -168,7 +169,11 @@ async def initialize_runtime(bot: Bot) -> tuple[object, object]:
     from .scheduler import ScheduleManager
 
     task_manager = TaskManager(bot)
-    schedule_manager = ScheduleManager(task_manager, MEMORY_DIR / "schedules.db")
+    schedule_manager = ScheduleManager(
+        task_manager,
+        MEMORY_DIR / "schedules.db",
+        notify_level=SCHEDULER_NOTIFY_LEVEL,
+    )
     await task_manager.start()
     if EMBEDDED_SCHEDULER_ENABLED:
         task_manager.add_observer(schedule_manager)

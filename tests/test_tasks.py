@@ -4,7 +4,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from src.tasks import BackgroundTask, TaskManager, TaskStatus
+from src.tasks import BackgroundTask, TaskManager, TaskNotificationMode, TaskStatus
 from src import bridge
 from src.tasks import ToolTimeoutPolicy
 
@@ -329,3 +329,40 @@ async def test_execute_task_treats_codex2_as_codex_family(monkeypatch) -> None:
     assert captured["cli_name"] == "codex2"
     assert task.status == TaskStatus.COMPLETED
     assert task.response == "ok"
+
+
+@pytest.mark.asyncio
+async def test_silent_notification_mode_suppresses_completion_and_failure_messages(monkeypatch) -> None:
+    bot = AsyncMock()
+    manager = TaskManager(bot)
+    completed = BackgroundTask(
+        id="task-silent-complete",
+        chat_id=123,
+        message_thread_id=None,
+        user_id=123,
+        prompt="x",
+        model="sonnet",
+        session_id=None,
+        status=TaskStatus.COMPLETED,
+        created_at=datetime.now(),
+        notification_mode=TaskNotificationMode.SILENT,
+        response="ok",
+    )
+    failed = BackgroundTask(
+        id="task-silent-fail",
+        chat_id=123,
+        message_thread_id=None,
+        user_id=123,
+        prompt="x",
+        model="sonnet",
+        session_id=None,
+        status=TaskStatus.FAILED,
+        created_at=datetime.now(),
+        notification_mode=TaskNotificationMode.SILENT,
+        error="boom",
+    )
+
+    await manager._notify_completion(completed)  # noqa: SLF001
+    await manager._notify_failure(failed)  # noqa: SLF001
+
+    bot.send_message.assert_not_called()

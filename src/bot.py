@@ -23,9 +23,24 @@ from aiogram.exceptions import TelegramAPIError, TelegramRetryAfter
 
 from . import bridge, config, metrics, transcribe
 from .core.context_plugins import ContextPluginRegistry
-from .sessions import ChatSession, SessionManager, make_scope_key
+from .sessions import ChatSession, SessionManager
 from .formatter import markdown_to_html, split_message, strip_html
 from .features.state_store import ResumeStateStore, SteeringEvent, SteeringLedgerStore
+from .features.prompt_helpers import (
+    as_text as _as_text_impl,
+    default_timezone_name as _default_timezone_name_impl,
+    inject_tool_request as _inject_tool_request_impl,
+    strip_markdown_code_fence as _strip_markdown_code_fence_impl,
+    truncate_label as _truncate_label_impl,
+    truncate_output as _truncate_output_impl,
+    weekday_to_int as _weekday_to_int_impl,
+)
+from .features.scope_helpers import (
+    actor_id as _actor_id_impl,
+    scope_key as _scope_key_impl,
+    scope_key_from_message as _scope_key_from_message_impl,
+    thread_id as _thread_id_impl,
+)
 from .f08_governance import F08GovernanceAdvisory
 from .media import (
     extract_media_directives,
@@ -113,18 +128,6 @@ _STEP_PLAN_AUTORESUME_FAILURE_THRESHOLD = 2
 _STEP_PLAN_AUTORESUME_BLOCK_MINUTES = 30
 _MIDFLIGHT_TOKEN_RE = re.compile(r"\w+", re.UNICODE)
 _APPLIED_CHECK_RE = re.compile(r"^\s*Applied:\s*\[(x|X)\]\s*$", re.IGNORECASE | re.MULTILINE)
-_NUMBER_WORDS = {
-    "one": "1",
-    "two": "2",
-    "three": "3",
-    "four": "4",
-    "five": "5",
-    "six": "6",
-    "seven": "7",
-    "eight": "8",
-    "nine": "9",
-    "ten": "10",
-}
 _STEERING_CONFLICT_PATTERNS = (
     (re.compile(r"\b(delete|drop|erase|wipe|destroy)\b", re.IGNORECASE), "destructive_action"),
     (re.compile(r"\b(ignore|disregard)\s+(all|everything|previous|prior)\b", re.IGNORECASE), "broad_override"),
@@ -133,11 +136,11 @@ _STEERING_CONFLICT_PATTERNS = (
 
 
 def _thread_id(message: Message) -> int | None:
-    return getattr(message, "message_thread_id", None)
+    return _thread_id_impl(message)
 
 
 def _scope_key(chat_id: int, message_thread_id: int | None = None) -> str:
-    return make_scope_key(chat_id, message_thread_id)
+    return _scope_key_impl(chat_id, message_thread_id)
 
 
 def _message_log_context(message: Message) -> dict[str, object]:
@@ -220,7 +223,7 @@ def _log_incoming_message(message: Message, route: str) -> None:
 
 
 def _scope_key_from_message(message: Message) -> str:
-    return _scope_key(message.chat.id, _thread_id(message))
+    return _scope_key_from_message_impl(message)
 
 
 def _worklog_subprocess_env(
@@ -302,9 +305,7 @@ def _is_admin(user_id: int | None) -> bool:
 
 def _actor_id(message: Message) -> int:
     """Use user ID when available; fall back to chat ID for channels."""
-    if message.from_user and message.from_user.id:
-        return message.from_user.id
-    return message.chat.id
+    return _actor_id_impl(message)
 
 
 def _topic_label_from_message(message: Message, override_text: str | None = None) -> str | None:
@@ -474,18 +475,15 @@ def _build_rollback_suggestion_markup(scope_key: str, user_id: int | None):
 
 
 def _truncate_label(text: str, max_len: int = 52) -> str:
-    return text if len(text) <= max_len else text[: max_len - 3] + "..."
+    return _truncate_label_impl(text, max_len=max_len)
 
 
 def _truncate_output(text: str, max_len: int = 2000) -> str:
-    if len(text) <= max_len:
-        return text
-    remaining = len(text) - max_len
-    return f"{text[:max_len]}\n... ({remaining} chars omitted)"
+    return _truncate_output_impl(text, max_len=max_len)
 
 
 def _as_text(value: object) -> str:
-    return value if isinstance(value, str) else ""
+    return _as_text_impl(value)
 
 
 def _message_base_text(message: Message, override_text: str | None = None) -> str:
@@ -537,8 +535,7 @@ async def _compose_incoming_prompt(message: Message, override_text: str | None =
 
 def _inject_tool_request(prompt_text: str, tool_name: str) -> str:
     """Force a tool to be activated by adding an explicit directive."""
-    base = prompt_text.rstrip()
-    return f"{base}\n\nUSE_TOOL: {tool_name}\n"
+    return _inject_tool_request_impl(prompt_text, tool_name)
 
 
 def _command_args(message: Message, command: CommandObject | None = None) -> str:
@@ -609,49 +606,18 @@ def _extract_media_directives(text: str) -> tuple[str, list[str], bool]:
 
 def _strip_tool_directive_lines(text: str) -> str:
     return strip_tool_directive_lines(text)
+
+
 def _default_timezone_name() -> str:
-    profile_path = config.MEMORY_DIR / "user_profile.yaml"
-    try:
-        data = yaml.safe_load(profile_path.read_text()) or {}
-        prefs = data.get("preferences") or {}
-        tz_name = prefs.get("timezone")
-        if isinstance(tz_name, str) and tz_name.strip():
-            return tz_name.strip()
-    except Exception:
-        pass
-    return "UTC"
+    return _default_timezone_name_impl()
 
 
 def _strip_markdown_code_fence(text: str) -> str:
-    stripped = text.strip()
-    if stripped.startswith("```") and stripped.endswith("```"):
-        lines = stripped.splitlines()
-        if len(lines) >= 2:
-            return "\n".join(lines[1:-1]).strip()
-    return stripped
+    return _strip_markdown_code_fence_impl(text)
 
 
 def _weekday_to_int(name: str) -> int | None:
-    mapping = {
-        "mon": 0,
-        "monday": 0,
-        "tue": 1,
-        "tues": 1,
-        "tuesday": 1,
-        "wed": 2,
-        "wednesday": 2,
-        "thu": 3,
-        "thur": 3,
-        "thurs": 3,
-        "thursday": 3,
-        "fri": 4,
-        "friday": 4,
-        "sat": 5,
-        "saturday": 5,
-        "sun": 6,
-        "sunday": 6,
-    }
-    return mapping.get(name.strip().lower())
+    return _weekday_to_int_impl(name)
 
 
 def _get_recent_commits(limit: int = 10) -> list[tuple[str, str, str]]:

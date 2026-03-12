@@ -2,6 +2,16 @@
 
 This repository stores the canonical Grafana skill/tool used by local Codex instances.
 
+## Clarified Scope
+
+- Canonical source of truth is this repository path (`tools/shared-skills/grafana`).
+- All local Codex instances should reference this same path via `skills/grafana` symlink.
+- Secret tokens are never stored in git; only local env/secret files hold credentials.
+- Current implementation is provider-agnostic at CLI level (plain Python + Grafana HTTP API).
+- Agent-specific adapters (Codex/Claude/OpenAI-compatible tool wrappers) should call the same CLI backend to avoid divergence.
+- Existing legacy path `/home/claude-developer/.shared-codex-skills/grafana` is superseded by the repo-backed location.
+- Running sessions may require restart/new session to pick up skill metadata updates.
+
 ## Location
 
 - Skill root: `tools/shared-skills/grafana/`

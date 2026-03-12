@@ -38,3 +38,12 @@ def test_find_channel_matches_username_title_and_id() -> None:
     assert _MODULE._find_channel(channels, "ai_engineer_helper")["entity_id"] == 3019299921
     assert _MODULE._find_channel(channels, "AI для Инженеров")["entity_id"] == 3019299921
     assert _MODULE._find_channel(channels, "3019299921")["entity_id"] == 3019299921
+
+
+def test_set_env_value_can_clear_allowlists() -> None:
+    lines = ["TELEGRAM_PROXY_ALLOWED_CHANNEL_IDS=1,2", "TELEGRAM_PROXY_ALLOWED_CHAT_IDS=3,4"]
+
+    updated = _MODULE._set_env_value(lines, "TELEGRAM_PROXY_ALLOWED_CHANNEL_IDS", "")
+    updated = _MODULE._set_env_value(updated, "TELEGRAM_PROXY_ALLOWED_CHAT_IDS", "")
+
+    assert updated == ["TELEGRAM_PROXY_ALLOWED_CHANNEL_IDS=", "TELEGRAM_PROXY_ALLOWED_CHAT_IDS="]

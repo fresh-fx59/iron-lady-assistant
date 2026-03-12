@@ -302,6 +302,12 @@ This helper:
 - restarts `telegram-proxy.service`;
 - runs one immediate native collect pass and prints a JSON summary.
 
+To collect from all subscribed channels plus their linked discussion chats, clear the allowlists in one command:
+
+```bash
+venv/bin/python scripts/add_telegram_digest_channel.py --all-visible
+```
+
 If the current shell cannot run `sudo`, you can still stage the allowlist change without restarting:
 
 ```bash

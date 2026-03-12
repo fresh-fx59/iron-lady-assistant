@@ -128,10 +128,15 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Allowlist a Telegram channel for digest collection, restart the proxy, and collect once."
     )
-    parser.add_argument(
+    target = parser.add_mutually_exclusive_group(required=True)
+    target.add_argument(
         "--channel",
-        required=True,
         help="Channel username, numeric entity id, or channel URL such as https://t.me/ai_engineer_helper",
+    )
+    target.add_argument(
+        "--all-visible",
+        action="store_true",
+        help="Clear channel/chat allowlists so the digest includes all subscribed channels and linked discussion chats.",
     )
     parser.add_argument(
         "--limit",
@@ -161,24 +166,29 @@ def main() -> int:
     if not base_url or not api_key:
         raise SystemExit("TELEGRAM_PROXY_BASE_URL or TELEGRAM_PROXY_API_KEY is missing in .env")
 
-    lookup = _extract_channel_lookup(args.channel)
-    payload = _proxy_request(
-        base_url,
-        api_key,
-        "/v1/channels",
-        {"limit": str(args.limit), "lookup": lookup},
-    )
-    channel = _find_channel(list(payload.get("channels", [])), lookup)
+    channel: dict[str, Any] | None = None
+    if args.all_visible:
+        lines = _set_env_value(lines, "TELEGRAM_PROXY_ALLOWED_CHANNEL_IDS", "")
+        lines = _set_env_value(lines, "TELEGRAM_PROXY_ALLOWED_CHAT_IDS", "")
+    else:
+        lookup = _extract_channel_lookup(args.channel)
+        payload = _proxy_request(
+            base_url,
+            api_key,
+            "/v1/channels",
+            {"limit": str(args.limit), "lookup": lookup},
+        )
+        channel = _find_channel(list(payload.get("channels", [])), lookup)
 
-    allowed_channels = _csv_to_int_set(env.get("TELEGRAM_PROXY_ALLOWED_CHANNEL_IDS"))
-    allowed_chats = _csv_to_int_set(env.get("TELEGRAM_PROXY_ALLOWED_CHAT_IDS"))
-    allowed_channels.add(int(channel["entity_id"]))
-    linked_chat_id = channel.get("linked_chat_id")
-    if linked_chat_id:
-        allowed_chats.add(int(linked_chat_id))
+        allowed_channels = _csv_to_int_set(env.get("TELEGRAM_PROXY_ALLOWED_CHANNEL_IDS"))
+        allowed_chats = _csv_to_int_set(env.get("TELEGRAM_PROXY_ALLOWED_CHAT_IDS"))
+        allowed_channels.add(int(channel["entity_id"]))
+        linked_chat_id = channel.get("linked_chat_id")
+        if linked_chat_id:
+            allowed_chats.add(int(linked_chat_id))
 
-    lines = _set_env_value(lines, "TELEGRAM_PROXY_ALLOWED_CHANNEL_IDS", _int_set_to_csv(allowed_channels))
-    lines = _set_env_value(lines, "TELEGRAM_PROXY_ALLOWED_CHAT_IDS", _int_set_to_csv(allowed_chats))
+        lines = _set_env_value(lines, "TELEGRAM_PROXY_ALLOWED_CHANNEL_IDS", _int_set_to_csv(allowed_channels))
+        lines = _set_env_value(lines, "TELEGRAM_PROXY_ALLOWED_CHAT_IDS", _int_set_to_csv(allowed_chats))
     ENV_PATH.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
     health: dict[str, Any] | None = None
@@ -190,12 +200,17 @@ def main() -> int:
         result = _collect_once()
 
     summary = {
-        "channel": {
-            "entity_id": channel["entity_id"],
-            "title": channel["title"],
-            "username": channel.get("username"),
-            "linked_chat_id": linked_chat_id,
-        },
+        "mode": "all_visible" if args.all_visible else "single_channel",
+        "channel": (
+            None
+            if channel is None
+            else {
+                "entity_id": channel["entity_id"],
+                "title": channel["title"],
+                "username": channel.get("username"),
+                "linked_chat_id": channel.get("linked_chat_id"),
+            }
+        ),
         "proxy_health": health,
         "collector_result": result,
     }

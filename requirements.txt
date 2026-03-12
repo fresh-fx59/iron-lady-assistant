@@ -5,3 +5,4 @@ pyyaml
 watchdog
 telethon
 edge-tts
+cryptography

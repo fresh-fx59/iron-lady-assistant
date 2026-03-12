@@ -1,4 +1,3 @@
-import sys
 import sqlite3
 import types
 from datetime import datetime, timedelta, timezone
@@ -63,85 +62,68 @@ def test_render_briefing_groups_recent_channel_and_linked_chat_messages(tmp_path
 
 
 @pytest.mark.asyncio
-async def test_collect_digest_fetches_linked_chat_via_get_entity_when_missing_from_dialogs(
+async def test_collect_digest_via_proxy_ingests_channel_and_linked_chat_messages(
     tmp_path,
     monkeypatch,
 ) -> None:
-    class FakeChannel:
-        def __init__(self, entity_id: int, title: str, username: str | None, *, broadcast: bool) -> None:
-            self.id = entity_id
-            self.title = title
-            self.username = username
-            self.broadcast = broadcast
+    class FakeProxyClient:
+        async def list_channels(self, *, limit: int):  # noqa: ARG002
+            return [
+                types.SimpleNamespace(
+                    entity_id=100,
+                    title="Main Channel",
+                    username="main_channel",
+                    linked_chat_id=200,
+                    linked_chat_title="Main Channel Chat",
+                    linked_chat_username=None,
+                )
+            ]
 
-    class FakeDialog:
-        def __init__(self, entity) -> None:  # noqa: ANN001
-            self.entity = entity
+        async def read_messages(self, *, kind: str, entity_id: int, min_id: int, limit: int):  # noqa: ARG002
+            if kind == "channel" and entity_id == 100:
+                return [
+                    {
+                        "message_id": 101,
+                        "posted_at": "2026-03-12T08:00:00+00:00",
+                        "sender_id": 10,
+                        "views": 123,
+                        "forwards": 4,
+                        "replies": 2,
+                        "link": "https://t.me/main_channel/101",
+                        "text": "Proxy channel update",
+                        "raw_json": {"id": 101},
+                    }
+                ]
+            if kind == "linked_chat" and entity_id == 200:
+                return [
+                    {
+                        "message_id": 55,
+                        "posted_at": "2026-03-12T08:05:00+00:00",
+                        "sender_id": 20,
+                        "views": None,
+                        "forwards": None,
+                        "replies": 7,
+                        "link": None,
+                        "text": "Proxy linked chat discussion",
+                        "raw_json": {"id": 55},
+                    }
+                ]
+            return []
 
-    class FakeStringSession:
-        def __init__(self, value: str) -> None:
-            self.value = value
-
-    class FakeGetFullChannelRequest:
-        def __init__(self, entity) -> None:  # noqa: ANN001
-            self.entity = entity
-
-    class FakeClient:
-        def __init__(self, session, api_id: int, api_hash: str) -> None:  # noqa: ANN001
-            self.session = session
-            self.api_id = api_id
-            self.api_hash = api_hash
-            self.channel = FakeChannel(100, "Main Channel", "main_channel", broadcast=True)
-            self.linked_chat = FakeChannel(200, "Main Channel Chat", None, broadcast=False)
-
-        async def __aenter__(self):
-            return self
-
-        async def __aexit__(self, exc_type, exc, tb):  # noqa: ANN001
-            return False
-
-        async def iter_dialogs(self, limit: int):  # noqa: ARG002
-            yield FakeDialog(self.channel)
-
-        async def __call__(self, request):  # noqa: ANN001
-            assert isinstance(request, FakeGetFullChannelRequest)
-            return types.SimpleNamespace(full_chat=types.SimpleNamespace(linked_chat_id=200))
-
-        async def get_entity(self, entity_id: int):
-            assert entity_id == 200
-            return self.linked_chat
-
-        async def iter_messages(self, entity, min_id: int, reverse: bool, limit: int):  # noqa: ANN001, ARG002
-            if False:
-                yield entity  # pragma: no cover
-
-    telethon_mod = types.ModuleType("telethon")
-    telethon_mod.TelegramClient = FakeClient
-    telethon_sessions_mod = types.ModuleType("telethon.sessions")
-    telethon_sessions_mod.StringSession = FakeStringSession
-    telethon_channels_mod = types.ModuleType("telethon.tl.functions.channels")
-    telethon_channels_mod.GetFullChannelRequest = FakeGetFullChannelRequest
-    telethon_types_mod = types.ModuleType("telethon.tl.types")
-    telethon_types_mod.Channel = FakeChannel
-
-    monkeypatch.setitem(sys.modules, "telethon", telethon_mod)
-    monkeypatch.setitem(sys.modules, "telethon.sessions", telethon_sessions_mod)
-    monkeypatch.setitem(sys.modules, "telethon.tl.functions.channels", telethon_channels_mod)
-    monkeypatch.setitem(sys.modules, "telethon.tl.types", telethon_types_mod)
-
-    monkeypatch.setattr("src.telegram_digest.config.TELEGRAM_USER_API_ID", 1)
-    monkeypatch.setattr("src.telegram_digest.config.TELEGRAM_USER_API_HASH", "hash")
-    monkeypatch.setattr("src.telegram_digest.config.TELEGRAM_USER_SESSION", "")
-    monkeypatch.setattr("src.telegram_digest.config.TELEGRAM_USER_SESSION_PATH", tmp_path / "telethon_user")
+    monkeypatch.setattr("src.telegram_digest.TelegramProxyClient", FakeProxyClient)
 
     db_path = tmp_path / "digest.db"
     brief_path = tmp_path / "brief.md"
     payload = await collect_digest(db_path=db_path, brief_path=brief_path, source_limit=10, collect_limit=10)
 
     assert payload["status"] == "ok"
+    assert payload["payload"]["transport"] == "telegram_proxy"
     con = sqlite3.connect(db_path)
     row = con.execute(
         "SELECT linked_channel_key FROM digest_sources WHERE peer_key = 'linked_chat:200'"
     ).fetchone()
     assert row is not None
     assert row[0] == "channel:100"
+    brief = brief_path.read_text()
+    assert "Proxy channel update" in brief
+    assert "Proxy linked chat discussion" in brief

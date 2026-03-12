@@ -255,22 +255,36 @@ The native command must return JSON with `status`, `should_alert`, `change_type`
 
 For Telegram channel monitoring, keep ingestion native and keep the final digest as a normal scheduled LLM task:
 
-- use a Telethon user session to collect messages from subscribed channels and linked discussion chats
+- use a read-only Telegram proxy backed by a Telethon user session to collect messages from subscribed channels and linked discussion chats
 - refresh a local briefing file during the day
 - deliver one daily digest back into the target Telegram topic
 
-Required `.env` values:
+Recommended `.env` values for the proxy-backed path:
 
 ```bash
-TELEGRAM_USER_API_ID=...
-TELEGRAM_USER_API_HASH=...
-# optional if you prefer a StringSession; otherwise a local session file is used under memory/
-TELEGRAM_USER_SESSION=...
+TELEGRAM_PROXY_BASE_URL=http://127.0.0.1:8787
+TELEGRAM_PROXY_API_KEY=...
+TELEGRAM_PROXY_ENCRYPTED_CREDENTIALS=...
+TELEGRAM_PROXY_KEY_CREDENTIAL_NAME=telegram_proxy_key
 ```
+
+Generate the encrypted Telegram credential blob with the repo-local helper:
+
+```bash
+python3 -m src.telegram_proxy_crypto_tool generate-key
+python3 -m src.telegram_proxy_crypto_tool encrypt \
+  --key <fernet_key> \
+  --api-id <telegram_api_id> \
+  --api-hash <telegram_api_hash> \
+  --session-string <telethon_string_session>
+```
+
+Keep the generated Fernet key out of `.env`; load it into the proxy service via `LoadCredentialEncrypted=` in `telegram-proxy.service`.
 
 Collector run:
 
 ```bash
+python3 -m src.telegram_proxy
 python3 -m src.telegram_digest_tool collect
 python3 -m src.telegram_digest_tool render
 ```
@@ -291,6 +305,14 @@ The installer creates:
 - an interval native collector schedule (`[[SCHEDULE_NATIVE]]`) that updates `memory/telegram_digest.db` and `memory/telegram_digest_brief.md`
 - a daily delivery schedule (`[[SCHEDULE_DELIVER]]`) that reads the briefing, writes a Russian executive summary, and can attach a voice-note audio reply via the existing `MEDIA:` / `[[audio_as_voice]]` contract
 - the daily delivery prompt uses `USE_TOOL: edge-tts-safe` (repo-local edge-tts wrapper), not `sag`
+
+Systemd setup for the proxy:
+
+```bash
+sudo install -m 0644 telegram-proxy.service /etc/systemd/system/telegram-proxy.service
+sudo systemctl daemon-reload
+sudo systemctl enable --now telegram-proxy.service
+```
 
 ### F08 Governance Validator (Monitor-Only)
 

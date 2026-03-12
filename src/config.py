@@ -6,7 +6,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-VERSION: str = "0.29.0"
+VERSION: str = "0.29.1"
 
 # ── Bot token (required) ────────────────────────────────────
 BOT_TOKEN: str = os.getenv("TELEGRAM_BOT_TOKEN", "")
@@ -143,9 +143,37 @@ STEP_PLAN_AUTO_TRIGGER_ENABLED: bool = os.getenv(
     "STEP_PLAN_AUTO_TRIGGER_ENABLED", "1"
 ).strip().lower() not in {"0", "false", "no"}
 STEP_PLAN_DEFAULT_FOLDER: str = os.getenv("STEP_PLAN_DEFAULT_FOLDER", "").strip()
-TELEGRAM_USER_API_ID: int = int(os.getenv("TELEGRAM_USER_API_ID", "0"))
-TELEGRAM_USER_API_HASH: str = os.getenv("TELEGRAM_USER_API_HASH", "").strip()
-TELEGRAM_USER_SESSION: str = os.getenv("TELEGRAM_USER_SESSION", "").strip()
+TELEGRAM_PROXY_BASE_URL: str = os.getenv("TELEGRAM_PROXY_BASE_URL", "").strip().rstrip("/")
+TELEGRAM_PROXY_API_KEY: str = os.getenv("TELEGRAM_PROXY_API_KEY", "").strip()
+TELEGRAM_PROXY_REQUEST_TIMEOUT_SECONDS: float = float(
+    os.getenv("TELEGRAM_PROXY_REQUEST_TIMEOUT_SECONDS", "30")
+)
+TELEGRAM_PROXY_BIND_HOST: str = os.getenv("TELEGRAM_PROXY_BIND_HOST", "127.0.0.1").strip() or "127.0.0.1"
+TELEGRAM_PROXY_BIND_PORT: int = int(os.getenv("TELEGRAM_PROXY_BIND_PORT", "8787"))
+_raw_proxy_allowed_channel_ids = os.getenv("TELEGRAM_PROXY_ALLOWED_CHANNEL_IDS", "")
+TELEGRAM_PROXY_ALLOWED_CHANNEL_IDS: set[int] = {
+    int(item.strip())
+    for item in _raw_proxy_allowed_channel_ids.split(",")
+    if item.strip()
+}
+_raw_proxy_allowed_chat_ids = os.getenv("TELEGRAM_PROXY_ALLOWED_CHAT_IDS", "")
+TELEGRAM_PROXY_ALLOWED_CHAT_IDS: set[int] = {
+    int(item.strip())
+    for item in _raw_proxy_allowed_chat_ids.split(",")
+    if item.strip()
+}
+TELEGRAM_PROXY_KEY_CREDENTIAL_NAME: str = (
+    os.getenv("TELEGRAM_PROXY_KEY_CREDENTIAL_NAME", "telegram_proxy_key").strip()
+    or "telegram_proxy_key"
+)
+_raw_proxy_key_fallback_path = os.getenv("TELEGRAM_PROXY_KEY_FALLBACK_PATH", "").strip()
+TELEGRAM_PROXY_KEY_FALLBACK_PATH: Path | None = (
+    Path(os.path.expanduser(_raw_proxy_key_fallback_path)) if _raw_proxy_key_fallback_path else None
+)
+TELEGRAM_PROXY_ENCRYPTED_CREDENTIALS: str = os.getenv(
+    "TELEGRAM_PROXY_ENCRYPTED_CREDENTIALS",
+    "",
+).strip()
 TELEGRAM_DIGEST_COLLECT_LIMIT: int = max(10, int(os.getenv("TELEGRAM_DIGEST_COLLECT_LIMIT", "200")))
 TELEGRAM_DIGEST_SOURCE_LIMIT: int = max(1, int(os.getenv("TELEGRAM_DIGEST_SOURCE_LIMIT", "200")))
 TELEGRAM_DIGEST_COLLECT_INTERVAL_MINUTES: int = max(
@@ -162,7 +190,7 @@ MEMORY_DIR: Path = Path(
 os.makedirs(MEMORY_DIR, exist_ok=True)
 TELEGRAM_DIGEST_DB_PATH: Path = MEMORY_DIR / "telegram_digest.db"
 TELEGRAM_DIGEST_BRIEF_PATH: Path = MEMORY_DIR / "telegram_digest_brief.md"
-TELEGRAM_USER_SESSION_PATH: Path = MEMORY_DIR / "telethon_user"
+TELEGRAM_PROXY_SESSION_PATH: Path = MEMORY_DIR / "telethon_user_proxy"
 
 # ── Tool system ───────────────────────────────────────────
 _raw_tools_dir = os.getenv("TOOLS_DIR") or None

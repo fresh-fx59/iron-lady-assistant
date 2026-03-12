@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 import json
-import logging
 import sqlite3
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -12,8 +11,7 @@ from pathlib import Path
 from typing import Any
 
 from . import config
-
-logger = logging.getLogger(__name__)
+from .telegram_proxy_client import TelegramProxyClient
 
 
 @dataclass(frozen=True)
@@ -275,127 +273,73 @@ async def collect_digest(
     source_limit: int | None = None,
     collect_limit: int | None = None,
 ) -> dict[str, Any]:
+    return await _collect_digest_via_proxy(
+        db_path=db_path,
+        brief_path=brief_path,
+        window_hours=window_hours,
+        source_limit=source_limit,
+        collect_limit=collect_limit,
+    )
+
+
+async def _collect_digest_via_proxy(
+    *,
+    db_path: Path | None = None,
+    brief_path: Path | None = None,
+    window_hours: int | None = None,
+    source_limit: int | None = None,
+    collect_limit: int | None = None,
+) -> dict[str, Any]:
     store = TelegramDigestStore(db_path)
     brief_target = brief_path or config.TELEGRAM_DIGEST_BRIEF_PATH
     window_hours = window_hours or config.TELEGRAM_DIGEST_WINDOW_HOURS
     source_limit = source_limit or config.TELEGRAM_DIGEST_SOURCE_LIMIT
     collect_limit = collect_limit or config.TELEGRAM_DIGEST_COLLECT_LIMIT
 
-    if not config.TELEGRAM_USER_API_ID or not config.TELEGRAM_USER_API_HASH:
-        return {
-            "status": "error",
-            "should_alert": False,
-            "change_type": "missing_config",
-            "summary": "Telegram user API credentials are not configured.",
-        }
-
-    try:
-        from telethon import TelegramClient
-        from telethon.sessions import StringSession
-        from telethon.tl.functions.channels import GetFullChannelRequest
-        from telethon.tl.types import Channel
-    except Exception as exc:  # pragma: no cover - dependency/import failure
-        return {
-            "status": "error",
-            "should_alert": False,
-            "change_type": "missing_dependency",
-            "summary": f"Telethon import failed: {exc}",
-        }
-
-    session: object
-    if config.TELEGRAM_USER_SESSION:
-        session = StringSession(config.TELEGRAM_USER_SESSION)
-    else:
-        session = str(config.TELEGRAM_USER_SESSION_PATH)
+    client = TelegramProxyClient()
+    channels = await client.list_channels(limit=source_limit)
 
     collected_messages = 0
     tracked_sources = 0
-    linked_chat_to_channel: dict[int, str] = {}
+    for channel in channels:
+        channel_key = _peer_key("channel", int(channel.entity_id))
+        store.upsert_source(
+            peer_key=channel_key,
+            entity_id=int(channel.entity_id),
+            title=(channel.title or "Unnamed channel").strip(),
+            username=channel.username,
+            kind="channel",
+            linked_channel_key=None,
+        )
+        tracked_sources += 1
+        collected_messages += await _collect_proxy_messages_for_peer(
+            client=client,
+            store=store,
+            peer_key=channel_key,
+            kind="channel",
+            entity_id=int(channel.entity_id),
+            collect_limit=collect_limit,
+        )
 
-    client = TelegramClient(session, config.TELEGRAM_USER_API_ID, config.TELEGRAM_USER_API_HASH)
-    async with client:
-        dialogs = [dialog async for dialog in client.iter_dialogs(limit=source_limit)]
-        entity_by_id: dict[int, Any] = {}
-        channel_entities: list[Any] = []
-        for dialog in dialogs:
-            entity = dialog.entity
-            if not isinstance(entity, Channel):
-                continue
-            entity_by_id[int(entity.id)] = entity
-            if getattr(entity, "broadcast", False):
-                channel_entities.append(entity)
-
-        for entity in channel_entities:
-            channel_key = _peer_key("channel", int(entity.id))
-            store.upsert_source(
-                peer_key=channel_key,
-                entity_id=int(entity.id),
-                title=(getattr(entity, "title", None) or "Unnamed channel").strip(),
-                username=getattr(entity, "username", None),
-                kind="channel",
-                linked_channel_key=None,
-            )
-            tracked_sources += 1
-            try:
-                full = await client(GetFullChannelRequest(entity))
-                linked_chat_id = getattr(full.full_chat, "linked_chat_id", None)
-                if linked_chat_id:
-                    linked_chat_to_channel[int(linked_chat_id)] = channel_key
-            except Exception:
-                logger.debug("Could not resolve linked chat for channel=%s", getattr(entity, "id", None), exc_info=True)
-
-        target_entities: list[tuple[str, Any, str | None]] = []
-        for entity in channel_entities:
-            target_entities.append((_peer_key("channel", int(entity.id)), entity, None))
-        for linked_chat_id in sorted(linked_chat_to_channel):
-            linked_entity = entity_by_id.get(linked_chat_id)
-            if linked_entity is None:
-                try:
-                    linked_entity = await client.get_entity(linked_chat_id)
-                except Exception:
-                    logger.debug("Could not resolve linked chat entity id=%s", linked_chat_id, exc_info=True)
-                    continue
-            linked_key = _peer_key("linked_chat", linked_chat_id)
+        if channel.linked_chat_id:
+            linked_key = _peer_key("linked_chat", int(channel.linked_chat_id))
             store.upsert_source(
                 peer_key=linked_key,
-                entity_id=linked_chat_id,
-                title=(getattr(linked_entity, "title", None) or "Unnamed linked chat").strip(),
-                username=getattr(linked_entity, "username", None),
+                entity_id=int(channel.linked_chat_id),
+                title=((channel.linked_chat_title or "Unnamed linked chat")).strip(),
+                username=channel.linked_chat_username,
                 kind="linked_chat",
-                linked_channel_key=linked_chat_to_channel[linked_chat_id],
+                linked_channel_key=channel_key,
             )
             tracked_sources += 1
-            target_entities.append((linked_key, linked_entity, None))
-
-        for peer_key, entity, _ in target_entities:
-            last_message_id = store.last_message_id(peer_key)
-            latest_seen = last_message_id
-            async for message in client.iter_messages(entity, min_id=last_message_id, reverse=True, limit=collect_limit):
-                text = (getattr(message, "message", None) or "").strip()
-                if not text:
-                    continue
-                entity_username = getattr(entity, "username", None)
-                link = f"https://t.me/{entity_username}/{message.id}" if entity_username else None
-                replies = None
-                reply_info = getattr(message, "replies", None)
-                if reply_info is not None:
-                    replies = getattr(reply_info, "replies", None)
-                inserted = store.insert_message(
-                    peer_key=peer_key,
-                    message_id=int(message.id),
-                    posted_at=message.date or _utc_now(),
-                    sender_id=getattr(message, "sender_id", None),
-                    views=getattr(message, "views", None),
-                    forwards=getattr(message, "forwards", None),
-                    replies=replies,
-                    link=link,
-                    text=text,
-                    raw_json=message.to_dict(),
-                )
-                if inserted:
-                    collected_messages += 1
-                latest_seen = max(latest_seen, int(message.id))
-            store.mark_collected(peer_key, latest_seen if latest_seen > 0 else None)
+            collected_messages += await _collect_proxy_messages_for_peer(
+                client=client,
+                store=store,
+                peer_key=linked_key,
+                kind="linked_chat",
+                entity_id=int(channel.linked_chat_id),
+                collect_limit=collect_limit,
+            )
 
     brief = store.render_briefing(window_hours=window_hours)
     brief_target.write_text(brief)
@@ -413,8 +357,53 @@ async def collect_digest(
             "collected_messages": collected_messages,
             "tracked_sources": tracked_sources,
             "recent_messages": recent_count,
+            "transport": "telegram_proxy",
         },
     }
+
+
+async def _collect_proxy_messages_for_peer(
+    *,
+    client: TelegramProxyClient,
+    store: TelegramDigestStore,
+    peer_key: str,
+    kind: str,
+    entity_id: int,
+    collect_limit: int,
+) -> int:
+    last_message_id = store.last_message_id(peer_key)
+    latest_seen = last_message_id
+    inserted_count = 0
+    messages = await client.read_messages(
+        kind=kind,
+        entity_id=entity_id,
+        min_id=last_message_id,
+        limit=collect_limit,
+    )
+    for message in messages:
+        posted_at_raw = message.get("posted_at")
+        posted_at = (
+            datetime.fromisoformat(posted_at_raw)
+            if isinstance(posted_at_raw, str) and posted_at_raw
+            else _utc_now()
+        )
+        inserted = store.insert_message(
+            peer_key=peer_key,
+            message_id=int(message["message_id"]),
+            posted_at=posted_at,
+            sender_id=message.get("sender_id"),
+            views=message.get("views"),
+            forwards=message.get("forwards"),
+            replies=message.get("replies"),
+            link=message.get("link"),
+            text=str(message.get("text", "")).strip(),
+            raw_json=message.get("raw_json") or {},
+        )
+        if inserted:
+            inserted_count += 1
+        latest_seen = max(latest_seen, int(message["message_id"]))
+    store.mark_collected(peer_key, latest_seen if latest_seen > 0 else None)
+    return inserted_count
 
 
 def collect_digest_sync(**kwargs: Any) -> dict[str, Any]:

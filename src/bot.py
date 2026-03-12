@@ -77,6 +77,7 @@ class _ChatState:
     lock: asyncio.Lock
     process_handle: dict | None  # Will contain {"proc": proc} when running
     cancel_requested: bool
+    reset_requested: bool
 
 
 # Per-conversation state dict
@@ -259,7 +260,12 @@ def _worklog_subprocess_env(
 def _get_state(scope_key: str) -> _ChatState:
     """Get or create state for a conversation scope."""
     if scope_key not in _chat_states:
-        _chat_states[scope_key] = _ChatState(lock=asyncio.Lock(), process_handle=None, cancel_requested=False)
+        _chat_states[scope_key] = _ChatState(
+            lock=asyncio.Lock(),
+            process_handle=None,
+            cancel_requested=False,
+            reset_requested=False,
+        )
     return _chat_states[scope_key]
 
 
@@ -927,11 +933,26 @@ async def cmd_new(message: Message) -> None:
     ):
         reflection_session: ChatSession = replace(session)
         asyncio.create_task(_reflect(chat_id, reflection_session, provider))
+    state = _get_state(scope_key)
+    if state.lock.locked():
+        state.cancel_requested = True
+        state.reset_requested = True
+        proc = state.process_handle.get("proc") if state.process_handle else None
+        if proc:
+            kill_result = proc.kill()
+            if inspect.isawaitable(kill_result):
+                await kill_result
     session_manager.new_conversation(chat_id, thread_id)
     session_manager.new_codex_conversation(chat_id, thread_id)
     steering_ledger_store.clear(scope_key=scope_key)
     _clear_errors(scope_key)
-    await message.answer("Conversation cleared. Send a message to start fresh.")
+    if state.lock.locked():
+        await message.answer(
+            "Conversation reset requested. If a request was running, it is being cancelled. "
+            "Send your next message in a moment."
+        )
+    else:
+        await message.answer("Conversation cleared. Send a message to start fresh.")
 
 
 def _parse_reflection_payload(text: str) -> dict[str, object]:
@@ -2333,6 +2354,12 @@ async def _handle_message_inner(message: Message, override_text: str | None = No
 
     if state.lock.locked():
         metrics.MESSAGES_TOTAL.labels(status="busy").inc()
+        if state.reset_requested:
+            await message.answer(
+                "The previous request is still stopping after /new. "
+                "Please resend your fresh request in a moment."
+            )
+            return
         ok_fast_resume, _ = resume_state_store.can_fast_resume(
             scope_key=scope_key,
             input_text=raw_prompt,
@@ -2348,8 +2375,9 @@ async def _handle_message_inner(message: Message, override_text: str | None = No
         return
 
     async with state.lock:
-        # Reset cancellation state
+        # A newly-started foreground run supersedes any prior reset request.
         state.cancel_requested = False
+        state.reset_requested = False
 
         session = session_manager.get(chat_id, thread_id)
         progress = ProgressReporter(message)
@@ -2591,6 +2619,8 @@ async def _handle_message_inner(message: Message, override_text: str | None = No
                 await typing_task
             except asyncio.CancelledError:
                 pass
+            state.process_handle = None
+            state.reset_requested = False
 
         # ── Send response ─────────────────────────────────────
         if state.cancel_requested:

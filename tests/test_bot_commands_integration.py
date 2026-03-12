@@ -185,6 +185,25 @@ class TestNewCommand:
         mock_message.answer.assert_called_once()
         assert "cleared" in mock_message.answer.call_args[0][0].lower()
 
+    async def test_new_cancels_active_run_before_reset(self, mock_message):
+        """An active run should be cancelled instead of surviving across /new."""
+        mock_message.text = "/new"
+        state = _get_state("123456789:main")
+        await state.lock.acquire()
+        proc = AsyncMock()
+        state.process_handle = {"proc": proc}
+
+        try:
+            await cmd_new(mock_message)
+        finally:
+            if state.lock.locked():
+                state.lock.release()
+
+        proc.kill.assert_awaited_once()
+        assert state.cancel_requested is True
+        assert state.reset_requested is True
+        assert "reset requested" in mock_message.answer.call_args[0][0].lower()
+
     async def test_new_restores_persisted_provider_for_scope(self, mock_message):
         """If runtime provider drifted, /new should restore persisted provider selection."""
         from src.bot import provider_manager, session_manager
@@ -305,6 +324,27 @@ class TestReflectionProviderSelection:
         await cmd_new(mock_message)
 
         mock_message.answer.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_busy_message_after_new_is_not_treated_as_follow_up(mock_message, monkeypatch):
+    """Fresh messages after /new should not be appended to the old run."""
+    state = _get_state("123456789:main")
+    await state.lock.acquire()
+    state.reset_requested = True
+    monkeypatch.setattr("src.bot._touch_thread_context", lambda *args, **kwargs: None)
+    monkeypatch.setattr("src.bot.f08_advisory.submit_chat_turn", lambda **kwargs: None)
+    mock_message.answer.reset_mock()
+
+    try:
+        await handle_message(mock_message)
+    finally:
+        if state.lock.locked():
+            state.lock.release()
+
+    mock_message.answer.assert_awaited_once()
+    reply_text = mock_message.answer.await_args.args[0]
+    assert "still stopping after /new" in reply_text.lower()
 
 
 def test_worklog_subprocess_env_includes_thread_scope_for_parallel_topics() -> None:

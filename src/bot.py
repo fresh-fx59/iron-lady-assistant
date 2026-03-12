@@ -96,7 +96,7 @@ _EMPTY_RESPONSE_FALLBACK_TEXT = (
     "Please resend your last message."
 )
 _AUDIO_PROGRESS_UPDATE_INTERVAL = 1.0
-_VOICE_TRANSCRIPTION_PROGRESS_INTERVAL = 1.0
+_VOICE_TRANSCRIPTION_PROGRESS_INTERVAL = 2.0
 # Backward-compatible state paths retained for tests/fixtures importing these symbols.
 _STEP_PLAN_STATE_PATH = config.MEMORY_DIR / "step_plan_state.json"
 _SCOPE_SNAPSHOT_PATH = config.MEMORY_DIR / "scope_snapshot.json"

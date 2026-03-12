@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import subprocess
+from datetime import datetime, timezone
 from pathlib import Path
 
 from aiogram import Bot, Dispatcher
@@ -159,8 +160,99 @@ async def send_ready_notification(bot: Bot) -> None:
             kwargs["message_thread_id"] = target_thread_id
         await bot.send_message(**kwargs)
         logging.info("Sent ready notification to chat=%s thread=%s", target_chat_id, target_thread_id)
+        await auto_resume_step_plan_after_restart(bot)
     except Exception as e:
         logging.warning("Could not send ready notification: %s", e)
+
+
+async def auto_resume_step_plan_after_restart(bot: Bot) -> bool:
+    """Auto-queue the next step-plan continuation turn after restart."""
+    global task_manager
+
+    if task_manager is None:
+        return False
+
+    try:
+        state = bot_module._load_step_plan_state()  # noqa: SLF001
+    except Exception:
+        return False
+
+    if not state.get("active") or not state.get("restart_between_steps"):
+        return False
+
+    if state.get("current_task_id"):
+        logging.info("Skipping step-plan auto-resume; current_task_id is already set")
+        return False
+
+    blocked_until_raw = str(state.get("auto_resume_blocked_until") or "").strip()
+    if blocked_until_raw:
+        try:
+            blocked_until = datetime.fromisoformat(blocked_until_raw)
+            if blocked_until.tzinfo is None:
+                blocked_until = blocked_until.replace(tzinfo=timezone.utc)
+            if blocked_until > datetime.now(timezone.utc):
+                logging.info("Skipping step-plan auto-resume; blocked until %s", blocked_until.isoformat())
+                return False
+        except Exception:
+            logging.debug("Invalid auto_resume_blocked_until value: %s", blocked_until_raw)
+
+    chat_id = int(state.get("chat_id") or 0)
+    if chat_id == 0:
+        return False
+    thread_id_raw = state.get("message_thread_id")
+    thread_id = int(thread_id_raw) if thread_id_raw is not None else None
+    user_id = int(state.get("user_id") or (min(ALLOWED_USER_IDS) if ALLOWED_USER_IDS else abs(chat_id)))
+    current_index = int(state.get("current_index") or 0)
+    steps = state.get("steps") if isinstance(state.get("steps"), list) else []
+    next_step = steps[current_index] if current_index < len(steps) else None
+
+    scope_key = bot_module._scope_key(chat_id, thread_id)  # noqa: SLF001
+    provider = bot_module.provider_manager.get_provider(scope_key)
+    session = bot_module.session_manager.get(chat_id, thread_id)
+    model, session_id, provider_cli, resume_arg = bot_module._scheduled_task_backend(  # noqa: SLF001
+        session,
+        provider,
+    )
+
+    step_hint = f"\nCurrent step file: {next_step}" if next_step else ""
+    prompt = (
+        "continue plan\n"
+        "Run the next planned step safely. "
+        "After code changes run relevant tests and continue only if tests pass."
+        f"{step_hint}"
+    )
+    task_id = await task_manager.submit(
+        chat_id=chat_id,
+        user_id=user_id,
+        message_thread_id=thread_id,
+        prompt=prompt,
+        model=model,
+        session_id=session_id,
+        provider_cli=provider_cli,
+        resume_arg=resume_arg,
+    )
+
+    state["current_task_id"] = task_id
+    state["updated_at"] = datetime.now(timezone.utc).isoformat()
+    state["last_error"] = ""
+    try:
+        bot_module._save_step_plan_state(state)  # noqa: SLF001
+    except Exception:
+        logging.debug("Failed to persist step-plan state after auto-resume submit", exc_info=True)
+
+    notify_kwargs = {
+        "chat_id": chat_id,
+        "text": (
+            f"🔁 Auto-resumed step plan after restart: step {current_index + 1}/{max(1, len(steps))}. "
+            f"Task id: <code>{task_id}</code>"
+        ),
+        "parse_mode": "HTML",
+    }
+    if thread_id is not None:
+        notify_kwargs["message_thread_id"] = thread_id
+    await bot.send_message(**notify_kwargs)
+    logging.info("Queued step-plan auto-resume task=%s chat=%s thread=%s", task_id, chat_id, thread_id)
+    return True
 
 
 async def initialize_runtime(bot: Bot) -> tuple[object, object]:

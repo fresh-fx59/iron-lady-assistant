@@ -765,6 +765,25 @@ def _is_codex_family_cli(cli_name: str | None) -> bool:
     return bool(cli_name and cli_name.lower().startswith("codex"))
 
 
+def _load_step_plan_state() -> dict[str, object]:
+    try:
+        payload = json.loads(_STEP_PLAN_STATE_PATH.read_text(encoding="utf-8"))
+        return payload if isinstance(payload, dict) else {}
+    except Exception:
+        return {}
+
+
+def _save_step_plan_state(state: dict[str, object]) -> None:
+    try:
+        _STEP_PLAN_STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        _STEP_PLAN_STATE_PATH.write_text(
+            json.dumps(state, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+    except Exception:
+        logger.debug("Could not persist step plan state", exc_info=True)
+
+
 def _current_model_label(session: object, provider) -> str:
     if _is_codex_family_cli(provider.cli):
         return session.codex_model or provider.model or "default"
@@ -772,10 +791,7 @@ def _current_model_label(session: object, provider) -> str:
 
 
 def _step_plan_active_flag() -> bool:
-    try:
-        payload = json.loads(_STEP_PLAN_STATE_PATH.read_text(encoding="utf-8"))
-    except Exception:
-        return False
+    payload = _load_step_plan_state()
     return bool(payload.get("active"))
 
 

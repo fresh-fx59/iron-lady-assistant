@@ -119,3 +119,67 @@ async def test_initialize_runtime_skips_embedded_scheduler_when_disabled(monkeyp
     task_manager.start.assert_awaited_once()
     task_manager.add_observer.assert_not_called()
     schedule_manager.start.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_auto_resume_step_plan_after_restart_submits_next_step(monkeypatch) -> None:
+    bot = AsyncMock()
+    task_mgr = AsyncMock()
+    task_mgr.submit = AsyncMock(return_value="step-task-1")
+    monkeypatch.setattr(main, "task_manager", task_mgr, raising=False)
+    monkeypatch.setattr(main, "ALLOWED_USER_IDS", {12345})
+
+    state = {
+        "active": True,
+        "restart_between_steps": True,
+        "chat_id": -100123,
+        "message_thread_id": 77,
+        "user_id": 12345,
+        "current_index": 1,
+        "steps": ["/tmp/01.md", "/tmp/02.md"],
+        "current_task_id": None,
+        "auto_resume_blocked_until": "",
+    }
+    saved = {}
+
+    monkeypatch.setattr(main.bot_module, "_load_step_plan_state", lambda: dict(state), raising=False)
+    monkeypatch.setattr(main.bot_module, "_save_step_plan_state", lambda payload: saved.update(payload), raising=False)
+    monkeypatch.setattr(main.bot_module, "_scope_key", lambda c, t: f"{c}:{t}", raising=False)
+    monkeypatch.setattr(
+        main.bot_module,
+        "_scheduled_task_backend",
+        lambda _session, _provider: ("sonnet", "sess-1", "claude", None),
+        raising=False,
+    )
+    provider_stub = type("ProviderStub", (), {"name": "claude"})()
+    monkeypatch.setattr(
+        main.bot_module,
+        "provider_manager",
+        type("ProviderMgrStub", (), {"get_provider": staticmethod(lambda _scope: provider_stub)})(),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        main.bot_module,
+        "session_manager",
+        type("SessionMgrStub", (), {"get": staticmethod(lambda _chat, _thread: object())})(),
+        raising=False,
+    )
+
+    resumed = await main.auto_resume_step_plan_after_restart(bot)
+
+    assert resumed is True
+    task_mgr.submit.assert_awaited_once()
+    submit_kwargs = task_mgr.submit.await_args.kwargs
+    assert submit_kwargs["chat_id"] == -100123
+    assert submit_kwargs["message_thread_id"] == 77
+    assert "continue plan" in submit_kwargs["prompt"]
+    assert "Current step file: /tmp/02.md" in submit_kwargs["prompt"]
+    assert saved["current_task_id"] == "step-task-1"
+    assert saved["last_error"] == ""
+
+    # Ready notification + auto-resume status post.
+    assert bot.send_message.await_count == 1
+    notify_kwargs = bot.send_message.await_args.kwargs
+    assert notify_kwargs["chat_id"] == -100123
+    assert notify_kwargs["message_thread_id"] == 77
+    assert "Auto-resumed step plan" in notify_kwargs["text"]

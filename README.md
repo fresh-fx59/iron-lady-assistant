@@ -278,6 +278,24 @@ Write a short operator-facing alert only when the validator reports a new issue,
 - after remediation, the scheduler reruns the main validator command and includes post-remediation verification in the final escalation context
 - when no custom diagnostics are configured, the scheduler still runs built-in safe diagnostics for known metric-presence incidents
 
+To update an existing native schedule without editing `schedules.db` directly, use the scheduler admin tool:
+
+```bash
+python3 -m src.schedule_admin_tool set-native-remediation \
+  --schedule-id <schedule_id> \
+  --auto-remediate true
+```
+
+You can also attach explicit hooks while updating:
+
+```bash
+python3 -m src.schedule_admin_tool set-native-remediation \
+  --schedule-id <schedule_id> \
+  --auto-remediate true \
+  --diagnose-command "/path/to/diagnose_incident --json" \
+  --remediate-command "/path/to/safe_fix"
+```
+
 ### Telegram Channel Daily Digest
 
 For Telegram channel monitoring, keep ingestion native and keep the final digest as a normal scheduled LLM task:

@@ -287,6 +287,29 @@ async def test_native_schedule_can_attempt_remediation_and_include_verification(
 
 
 @pytest.mark.asyncio
+async def test_update_native_schedule_options_renders_hooks_without_direct_db_edits(tmp_path) -> None:
+    manager = ScheduleManager(_StubTaskManager(), tmp_path / "schedules.db")
+    sid = await manager.create_every(
+        chat_id=25,
+        user_id=38,
+        prompt="[[SCHEDULE_NATIVE]]\ncommand: /bin/echo ok\nKeep quiet unless something changes.\n",
+        interval_minutes=5,
+        model="opus",
+    )
+
+    updated = await manager.update_native_schedule_options(
+        sid,
+        auto_remediate=True,
+        diagnose_command=["/bin/echo", "diag"],
+    )
+
+    assert updated is True
+    schedule = (await manager.list_for_chat(25))[0]
+    assert "auto_remediate: true" in schedule.prompt
+    assert "diagnose_command: /bin/echo diag" in schedule.prompt
+
+
+@pytest.mark.asyncio
 async def test_scheduler_notifications_post_to_configured_topic(tmp_path) -> None:
     stub = _StubTaskManager()
     notifier = AsyncMock()

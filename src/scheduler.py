@@ -25,6 +25,7 @@ logger = logging.getLogger(__name__)
 _RESPONSE_STATUS_RE = re.compile(r"overall status:\s*[`']?(ok|warn|critical|error|failed)[`']?", re.IGNORECASE)
 _NATIVE_SCHEDULE_HEADER = "[[SCHEDULE_NATIVE]]"
 _SCHEDULE_DELIVER_MARKER = "[[SCHEDULE_DELIVER]]"
+_NO_UPDATE = object()
 
 
 @dataclass(frozen=True)
@@ -469,6 +470,22 @@ class ScheduleManager:
         updated = await asyncio.to_thread(self._cancel_schedule, task_id)
         return updated > 0
 
+    async def update_native_schedule_options(
+        self,
+        task_id: str,
+        *,
+        auto_remediate: bool | object = _NO_UPDATE,
+        diagnose_command: list[str] | None | object = _NO_UPDATE,
+        remediate_command: list[str] | None | object = _NO_UPDATE,
+    ) -> bool:
+        return await asyncio.to_thread(
+            self._update_native_schedule_options,
+            task_id,
+            auto_remediate,
+            diagnose_command,
+            remediate_command,
+        )
+
     def _cancel_schedule(self, task_id: str) -> int:
         with self._connect() as con:
             cur = con.execute(
@@ -486,6 +503,36 @@ class ScheduleManager:
                 (task_id,),
             )
             return cur.rowcount
+
+    def _update_native_schedule_options(
+        self,
+        task_id: str,
+        auto_remediate: bool | object,
+        diagnose_command: list[str] | None | object,
+        remediate_command: list[str] | None | object,
+    ) -> bool:
+        with self._connect() as con:
+            row = con.execute(
+                "SELECT prompt FROM scheduled_tasks WHERE id = ? AND state = 'active'",
+                (task_id,),
+            ).fetchone()
+            if row is None:
+                return False
+            spec = self._parse_native_schedule(row["prompt"])
+            if spec is None:
+                raise ValueError("Schedule is not a native schedule")
+            updated_spec = NativeScheduleSpec(
+                command=spec.command,
+                diagnose_command=spec.diagnose_command if diagnose_command is _NO_UPDATE else diagnose_command,
+                remediate_command=spec.remediate_command if remediate_command is _NO_UPDATE else remediate_command,
+                auto_remediate=spec.auto_remediate if auto_remediate is _NO_UPDATE else bool(auto_remediate),
+                escalation_context=spec.escalation_context,
+            )
+            con.execute(
+                "UPDATE scheduled_tasks SET prompt = ? WHERE id = ?",
+                (self._render_native_schedule(updated_spec), task_id),
+            )
+            return True
 
     async def _worker_loop(self) -> None:
         while True:
@@ -703,11 +750,15 @@ class ScheduleManager:
         verification_result: NativeScheduleResult | None = None
         verification_error: str | None = None
 
-        if native_spec.auto_remediate and native_spec.remediate_command:
+        remediation_command = native_spec.remediate_command
+        if native_spec.auto_remediate and remediation_command is None:
+            remediation_command = self._default_remediation_command(native_result)
+
+        if native_spec.auto_remediate and remediation_command:
             try:
                 remediation_output = await asyncio.to_thread(
                     self._run_auxiliary_command,
-                    native_spec.remediate_command,
+                    remediation_command,
                     "remediation",
                 )
             except Exception as exc:
@@ -717,6 +768,8 @@ class ScheduleManager:
                 verification_result = await asyncio.to_thread(self._execute_native_schedule, native_spec)
             except Exception as exc:
                 verification_error = str(exc)
+        elif native_spec.auto_remediate:
+            remediation_error = "No automatic remediation is available for this incident."
 
         return IncidentActionReport(
             diagnostics=tuple(diagnostics),
@@ -1408,8 +1461,35 @@ class ScheduleManager:
         ]
 
     @staticmethod
+    def _default_remediation_command(result: NativeScheduleResult) -> list[str] | None:
+        payload_checks = result.payload.get("checks")
+        if not isinstance(payload_checks, list):
+            return None
+        check_names = {
+            str(item.get("name"))
+            for item in payload_checks
+            if isinstance(item, dict) and str(item.get("status")) in {"warn", "critical"}
+        }
+        if {"scrape_up", "series_presence", "f08_series_presence"} & check_names:
+            return ["systemctl", "restart", "telegram-bot.service"]
+        return None
+
+    @staticmethod
     def _parse_bool_flag(value: str) -> bool:
         return value.strip().lower() in {"1", "true", "yes", "on"}
+
+    @staticmethod
+    def _render_native_schedule(spec: NativeScheduleSpec) -> str:
+        lines = [_NATIVE_SCHEDULE_HEADER, f"command: {shlex.join(spec.command)}"]
+        if spec.diagnose_command:
+            lines.append(f"diagnose_command: {shlex.join(spec.diagnose_command)}")
+        if spec.remediate_command:
+            lines.append(f"remediate_command: {shlex.join(spec.remediate_command)}")
+        if spec.auto_remediate:
+            lines.append("auto_remediate: true")
+        if spec.escalation_context:
+            lines.append(spec.escalation_context.strip())
+        return "\n".join(lines).strip() + "\n"
 
     @staticmethod
     def _build_native_escalation_prompt(

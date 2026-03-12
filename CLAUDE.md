@@ -1,6 +1,6 @@
 # Claude Code as Telegram Assistant
 
-**Current version: `0.30.0`** — defined in `src/config.py` as `VERSION`.
+**Current version: `0.31.0`** — defined in `src/config.py` as `VERSION`.
 
 Telegram bot that bridges messages to Claude Code's `--print` mode via subprocess, providing a conversational AI assistant through Telegram.
 
@@ -48,6 +48,7 @@ src/
 - Treat `recovery` as a correlation/report signal unless further action is still required.
 - Keep repeated unchanged incidents silent inside a cooldown/dedup window.
 - Native schedules may provide `diagnose_command`, `remediate_command`, and `auto_remediate: true` to opt into deeper automatic handling.
+- Existing native schedules can be updated through `python3 -m src.schedule_admin_tool set-native-remediation ...` instead of direct SQLite edits.
 
 ## Setup
 

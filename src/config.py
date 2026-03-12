@@ -6,7 +6,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-VERSION: str = "0.29.6"
+VERSION: str = "0.29.7"
 
 # ── Bot token (required) ────────────────────────────────────
 BOT_TOKEN: str = os.getenv("TELEGRAM_BOT_TOKEN", "")
@@ -146,7 +146,7 @@ STEP_PLAN_DEFAULT_FOLDER: str = os.getenv("STEP_PLAN_DEFAULT_FOLDER", "").strip(
 TELEGRAM_PROXY_BASE_URL: str = os.getenv("TELEGRAM_PROXY_BASE_URL", "").strip().rstrip("/")
 TELEGRAM_PROXY_API_KEY: str = os.getenv("TELEGRAM_PROXY_API_KEY", "").strip()
 TELEGRAM_PROXY_REQUEST_TIMEOUT_SECONDS: float = float(
-    os.getenv("TELEGRAM_PROXY_REQUEST_TIMEOUT_SECONDS", "30")
+    os.getenv("TELEGRAM_PROXY_REQUEST_TIMEOUT_SECONDS", "120")
 )
 TELEGRAM_PROXY_BIND_HOST: str = os.getenv("TELEGRAM_PROXY_BIND_HOST", "127.0.0.1").strip() or "127.0.0.1"
 TELEGRAM_PROXY_BIND_PORT: int = int(os.getenv("TELEGRAM_PROXY_BIND_PORT", "8787"))

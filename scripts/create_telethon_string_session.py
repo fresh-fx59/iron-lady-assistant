@@ -14,10 +14,12 @@ def _prompt(label: str) -> str:
 
 async def _run(api_id: int, api_hash: str, phone: str) -> None:
     client = TelegramClient(StringSession(), api_id, api_hash)
-    async with client:
-        await client.start(phone=phone)
+    try:
+        await client.start(phone=lambda: phone)
         print("\nStringSession:\n")
         print(client.session.save())
+    finally:
+        await client.disconnect()
 
 
 def build_parser() -> argparse.ArgumentParser:

@@ -377,6 +377,33 @@ command: /home/claude-developer/iron-lady-assistant/scripts/validate_f08_observa
 Write a short operator-facing alert only when the validator reports a new issue, changed issue, or recovery.
 ```
 
+### F10 Baseline Summary (Monitor-Only, 14d Gate)
+
+Use this native summary to keep F10 fully non-interfering while collecting cost baseline, then emit a high-signal summary when the 14-day window completes.
+
+One-off/manual run:
+
+```bash
+./scripts/f10_baseline_summary.py \
+  --format text \
+  --baseline-start 2026-03-12T00:00:00+00:00 \
+  --window-days 14 \
+  --state-file /home/claude-developer/iron-lady-assistant/work-dir/f10_baseline_summary.state.json
+```
+
+Scheduler-native mode:
+
+```text
+[[SCHEDULE_NATIVE]]
+command: /home/claude-developer/iron-lady-assistant/scripts/f10_baseline_summary.py --format json --alert-on-change --baseline-start 2026-03-12T00:00:00+00:00 --window-days 14 --state-file /home/claude-developer/iron-lady-assistant/work-dir/f10_baseline_summary.state.json
+Write a concise operator summary only when change_type=baseline_ready, new_issue, or recovery.
+```
+
+Expected behavior:
+- Before `2026-03-26T00:00:00+00:00`, output stays in `phase=collecting` and remains silent when unchanged.
+- At/after `2026-03-26T00:00:00+00:00`, the first transition to `phase=ready` emits a single change-detected summary for optimization planning.
+- Runtime path remains unchanged (monitor-only, no model/provider/session/tool interventions).
+
 ### External Scheduler Daemon
 
 Recurring schedules can run outside the polling bot process:

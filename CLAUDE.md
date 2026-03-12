@@ -1,6 +1,6 @@
 # Claude Code as Telegram Assistant
 
-**Current version: `0.26.0`** — defined in `src/config.py` as `VERSION`.
+**Current version: `0.29.13`** — defined in `src/config.py` as `VERSION`.
 
 Telegram bot that bridges messages to Claude Code's `--print` mode via subprocess, providing a conversational AI assistant through Telegram.
 
@@ -38,6 +38,15 @@ src/
 ├── formatter.py            # Markdown→HTML conversion, message splitting
 └── metrics.py              # Prometheus metrics: counters, histograms, gauges
 ```
+
+## Scheduled Validator Incident Policy
+
+- Treat `new_issue` and `worsened_issue` as incident triggers.
+- Run deterministic diagnostics before any model-assisted reasoning.
+- Allow automatic remediation only for explicitly safe actions.
+- Verify after remediation and send a compact final report instead of intermediate noise.
+- Treat `recovery` as a correlation/report signal unless further action is still required.
+- Keep repeated unchanged incidents silent inside a cooldown/dedup window.
 
 ## Setup
 

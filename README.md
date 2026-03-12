@@ -253,6 +253,15 @@ Write a short operator-facing alert only when the validator reports a new issue,
 
 The native command must return JSON with `status`, `should_alert`, `change_type`, and `summary`. When `should_alert=false`, the scheduler stores the run result and stays silent. When `should_alert=true`, the scheduler submits a background LLM task with the validator JSON as escalation context.
 
+Operational policy for validator-backed schedules:
+
+- treat `new_issue` and `worsened_issue` as incident triggers, not passive notifications
+- collect deterministic diagnostics first: validator payload, service health, recent logs, and direct dependency checks
+- attempt only explicitly safe automatic remediations
+- verify after remediation and send one compact outcome report
+- treat `recovery` as a correlation/report event unless it still leaves an actionable problem
+- keep repeated unchanged incidents quiet inside a dedup/cooldown window
+
 ### Telegram Channel Daily Digest
 
 For Telegram channel monitoring, keep ingestion native and keep the final digest as a normal scheduled LLM task:
@@ -394,6 +403,7 @@ The daemon will execute due schedules in the background and mirror only high-sig
 Routine submitted/started/success noise stays silent unless you explicitly set `SCHEDULER_NOTIFY_LEVEL=all`.
 Scheduled jobs also preserve the provider runtime they were created with, so a task created from a `codex*` thread will continue running through that same Codex CLI when the standalone daemon picks it up.
 Schedules can also use a native command mode by starting the prompt with `[[SCHEDULE_NATIVE]]` and providing a `command:` line. This is the recommended path for deterministic health checks and validators because it removes routine LLM cost from the steady-state path.
+For validator schedules, the intended loop is: native check -> incident classification -> deterministic diagnosis/remediation -> compact report. The LLM is for escalation and summarization, not for the steady-state check itself.
 `setup.sh` can also generate and install both `telegram-bot.service` and `telegram-scheduler.service` when you choose the external scheduler option.
 The bundled systemd units include the per-user npm bin path so `codex` CLIs installed under `~/.npm-<user>/bin` stay available after reboot.
 

@@ -75,6 +75,7 @@ class ToolTimeoutPolicy:
     network_seconds: float = 90.0
     browser_seconds: float = 120.0
     local_shell_seconds: float = 45.0
+    file_change_seconds: float = 240.0
     default_seconds: float = 60.0
     retryable_timeout_retries: int = 1
 
@@ -286,6 +287,8 @@ class TaskManager:
     @classmethod
     def _tool_category(cls, tool_name: str | None) -> str:
         name = cls._normalize_tool_name(tool_name)
+        if any(token in name for token in ("file_change", "apply_patch", "edit_file", "replace_file")):
+            return "file_change"
         if name in {"read", "write", "edit", "glob", "grep", "ls", "list"}:
             return "io"
         if "browser" in name or name in {"playwright", "puppeteer"}:
@@ -299,6 +302,8 @@ class TaskManager:
     @classmethod
     def _tool_timeout_seconds(cls, category: str) -> float:
         policy = cls._TOOL_TIMEOUT_POLICY
+        if category == "file_change":
+            return policy.file_change_seconds
         if category == "io":
             return policy.io_seconds
         if category == "network":
@@ -312,7 +317,7 @@ class TaskManager:
     @classmethod
     def _is_tool_retryable(cls, tool_name: str | None, category: str) -> bool:
         name = cls._normalize_tool_name(tool_name)
-        if category in {"network", "io"}:
+        if category in {"network", "io", "file_change"}:
             return True
         return name in {"read", "glob", "grep", "web_search", "weather", "summarize"}
 

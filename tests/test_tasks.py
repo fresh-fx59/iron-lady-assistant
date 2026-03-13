@@ -200,6 +200,16 @@ async def test_execute_task_retries_once_for_idempotent_tool_timeout(monkeypatch
     timed_out_proc.kill.assert_awaited_once()
 
 
+def test_tool_category_file_change_uses_extended_timeout() -> None:
+    category = TaskManager._tool_category("file_change")  # noqa: SLF001
+    assert category == "file_change"
+    assert TaskManager._tool_timeout_seconds(category) == TaskManager._TOOL_TIMEOUT_POLICY.file_change_seconds  # noqa: SLF001
+
+
+def test_file_change_timeout_is_retryable() -> None:
+    assert TaskManager._is_tool_retryable("file_change", "file_change") is True  # noqa: SLF001
+
+
 @pytest.mark.asyncio
 async def test_execute_task_retries_transient_codex_empty_result_once(monkeypatch) -> None:
     bot = AsyncMock()

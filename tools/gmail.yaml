@@ -23,8 +23,18 @@ instructions: |
   - If recipient or target message is ambiguous, ask a clarifying question first.
   - Prefer listing/searching first, then acting on a specific message ID.
 
-  Prerequisites (one-time OAuth setup):
-  - `gog auth credentials /path/to/client_secret.json`
+  Preferred setup (user-friendly):
+  - Run `python -m src.gmail_setup_tool doctor`
+  - Then run `python -m src.gmail_setup_tool authorize --account you@gmail.com --services gmail`
+  - For headless/server auth, add `--remote`
+
+  Operator provisioning (once per host, not per user):
+  - Set `GOG_OAUTH_CREDENTIALS_PATH=/secure/path/google-oauth-client.json`
+  - Or set `GOG_OAUTH_CREDENTIALS_JSON` from secret storage
+  - This removes the need for each end user to create their own Google Cloud Console project
+
+  Fallback only if shared credentials are unavailable:
+  - `gog auth credentials set /path/to/client_secret.json`
   - `gog auth add you@gmail.com --services gmail`
   - `gog auth list`
 
@@ -42,4 +52,4 @@ instructions: |
   - Check available command in help first (`delete` vs `trash` can differ by version).
   - Then execute delete/trash for explicit message IDs only.
   - Example pattern: `gog gmail messages <delete-or-trash> <messageId> --account you@gmail.com`
-setup: 'Ensure binary installed: gog'
+setup: 'Ensure command is available: python -m src.gmail_setup_tool --help'

@@ -6,7 +6,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-VERSION: str = "0.33.18"
+VERSION: str = "0.34.0"
 
 # ── Bot token (required) ────────────────────────────────────
 BOT_TOKEN: str = os.getenv("TELEGRAM_BOT_TOKEN", "")
@@ -205,4 +205,20 @@ TOOL_DENYLIST: set[str] = {
 }
 TOOL_REQUIRE_APPROVAL_FOR_RISKY: bool = (
     os.getenv("TOOL_REQUIRE_APPROVAL_FOR_RISKY", "0").strip().lower() in {"1", "true", "yes"}
+)
+
+# ── Gmail bootstrap web flow ──────────────────────────────
+GMAIL_BOOTSTRAP_GOOGLE_CLIENT_ID: str = os.getenv("GMAIL_BOOTSTRAP_GOOGLE_CLIENT_ID", "").strip()
+GMAIL_BOOTSTRAP_GOOGLE_CLIENT_SECRET: str = os.getenv(
+    "GMAIL_BOOTSTRAP_GOOGLE_CLIENT_SECRET", ""
+).strip()
+GMAIL_BOOTSTRAP_GOOGLE_SCOPES: tuple[str, ...] = tuple(
+    item.strip()
+    for item in (
+        os.getenv(
+            "GMAIL_BOOTSTRAP_GOOGLE_SCOPES",
+            "openid,email,https://www.googleapis.com/auth/cloud-platform",
+        )
+    ).split(",")
+    if item.strip()
 )

@@ -11,13 +11,34 @@ triggers:
 instructions: '# gog
 
 
-  Use `gog` for Gmail/Calendar/Drive/Contacts/Sheets/Docs. Requires OAuth setup.
+  Use `gog` for Gmail/Calendar/Drive/Contacts/Sheets/Docs. Prefer shared OAuth setup
+  so end users do not need to create a Google Cloud Console project.
 
 
-  Setup (once)
+  Preferred setup (once per account)
 
 
-  - `gog auth credentials /path/to/client_secret.json`
+  - `python -m src.gmail_setup_tool doctor`
+
+  - `python -m src.gmail_setup_tool authorize --account you@gmail.com --services gmail,calendar,drive,contacts,docs,sheets`
+
+  - Add `--remote` for headless/server auth
+
+
+  Operator provisioning (once per host)
+
+
+  - Set `GOG_OAUTH_CREDENTIALS_PATH=/secure/path/google-oauth-client.json`
+
+  - Or set `GOG_OAUTH_CREDENTIALS_JSON` from secret storage
+
+  - The helper will install those credentials into `gog` automatically
+
+
+  Fallback if shared credentials are unavailable
+
+
+  - `gog auth credentials set /path/to/client_secret.json`
 
   - `gog auth add you@gmail.com --services gmail,calendar,drive,contacts,docs,sheets`
 
@@ -77,4 +98,4 @@ instructions: '# gog
   - Sheets clear: `gog sheets clear <sheetId> "Tab!A2:Z"`
 
   - Sheet'
-setup: 'Ensure binary installed: gog'
+setup: 'Ensure command is available: python -m src.gmail_setup_tool --help'

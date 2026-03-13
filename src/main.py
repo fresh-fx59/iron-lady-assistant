@@ -190,8 +190,7 @@ async def auto_resume_step_plan_after_restart(bot: Bot) -> bool:
         return False
 
     restart_between_steps = bool(state.get("restart_between_steps"))
-    steps = state.get("steps") if isinstance(state.get("steps"), list) else []
-    current_index = int(state.get("current_index") or 0)
+    steps, current_index = bot_module._step_plan_pending_steps(state)  # noqa: SLF001
     has_pending_steps = current_index < len(steps)
 
     if not restart_between_steps or not has_pending_steps:
@@ -237,7 +236,10 @@ async def auto_resume_step_plan_after_restart(bot: Bot) -> bool:
     thread_id_raw = state.get("message_thread_id")
     thread_id = int(thread_id_raw) if thread_id_raw is not None else None
     user_id = int(state.get("user_id") or (min(ALLOWED_USER_IDS) if ALLOWED_USER_IDS else abs(chat_id)))
-    next_step = steps[current_index] if current_index < len(steps) else None
+    next_action = bot_module._ensure_step_plan_next_action(state)  # noqa: SLF001
+    if next_action is None:
+        logging.info("Skipping step-plan auto-resume; no valid next_action is available")
+        return False
 
     scope_key = bot_module._scope_key(chat_id, thread_id)  # noqa: SLF001
     provider = bot_module.provider_manager.get_provider(scope_key)
@@ -247,13 +249,7 @@ async def auto_resume_step_plan_after_restart(bot: Bot) -> bool:
         provider,
     )
 
-    step_hint = f"\nCurrent step file: {next_step}" if next_step else ""
-    prompt = (
-        "continue plan\n"
-        "Run the next planned step safely. "
-        "After code changes run relevant tests and continue only if tests pass."
-        f"{step_hint}"
-    )
+    prompt = str(next_action["prompt"])
     task_id = await task_manager.submit(
         chat_id=chat_id,
         user_id=user_id,
@@ -266,6 +262,7 @@ async def auto_resume_step_plan_after_restart(bot: Bot) -> bool:
     )
 
     state["current_task_id"] = task_id
+    bot_module._ensure_step_plan_next_action(state)  # noqa: SLF001
     state["updated_at"] = datetime.now(timezone.utc).isoformat()
     state["last_error"] = ""
     try:

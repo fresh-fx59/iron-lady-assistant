@@ -193,6 +193,9 @@ async def test_auto_resume_step_plan_after_restart_submits_next_step(monkeypatch
     assert "Current step file: /tmp/02.md" in submit_kwargs["prompt"]
     assert saved["current_task_id"] == "step-task-1"
     assert saved["last_error"] == ""
+    assert saved["next_action"]["type"] == "continue_step_plan"
+    assert saved["next_action"]["step_index"] == 1
+    assert saved["next_action"]["step_path"] == "/tmp/02.md"
 
     # Ready notification + auto-resume status post.
     assert bot.send_message.await_count == 1
@@ -252,3 +255,67 @@ async def test_auto_resume_reactivates_inactive_state_when_pending_steps_exist(m
     assert resumed is True
     assert saved["active"] is True
     assert saved["current_task_id"] == "step-task-2"
+    assert saved["next_action"]["step_index"] == 0
+    assert saved["next_action"]["step_path"] == "/tmp/01.md"
+
+
+@pytest.mark.asyncio
+async def test_auto_resume_uses_persisted_next_action_prompt_when_present(monkeypatch) -> None:
+    bot = AsyncMock()
+    task_mgr = AsyncMock()
+    task_mgr.submit = AsyncMock(return_value="step-task-3")
+    task_mgr.get_status = AsyncMock(return_value=None)
+    monkeypatch.setattr(main, "task_manager", task_mgr, raising=False)
+    monkeypatch.setattr(main, "ALLOWED_USER_IDS", {12345})
+
+    persisted_prompt = "continue plan\nUse the persisted next action prompt.\nCurrent step file: /tmp/02.md"
+    state = {
+        "active": True,
+        "restart_between_steps": True,
+        "chat_id": -100123,
+        "message_thread_id": 77,
+        "user_id": 12345,
+        "current_index": 1,
+        "steps": ["/tmp/01.md", "/tmp/02.md"],
+        "current_task_id": None,
+        "auto_resume_blocked_until": "",
+        "next_action": {
+            "type": "continue_step_plan",
+            "prompt": persisted_prompt,
+            "step_index": 1,
+            "step_path": "/tmp/02.md",
+            "reason": "restart_between_steps",
+            "created_at": "2026-03-13T12:00:00+00:00",
+        },
+    }
+    saved = {}
+
+    monkeypatch.setattr(main.bot_module, "_load_step_plan_state", lambda: dict(state), raising=False)
+    monkeypatch.setattr(main.bot_module, "_save_step_plan_state", lambda payload: saved.update(payload), raising=False)
+    monkeypatch.setattr(main.bot_module, "_scope_key", lambda c, t: f"{c}:{t}", raising=False)
+    monkeypatch.setattr(
+        main.bot_module,
+        "_scheduled_task_backend",
+        lambda _session, _provider: ("sonnet", "sess-1", "claude", None),
+        raising=False,
+    )
+    provider_stub = type("ProviderStub", (), {"name": "claude"})()
+    monkeypatch.setattr(
+        main.bot_module,
+        "provider_manager",
+        type("ProviderMgrStub", (), {"get_provider": staticmethod(lambda _scope: provider_stub)})(),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        main.bot_module,
+        "session_manager",
+        type("SessionMgrStub", (), {"get": staticmethod(lambda _chat, _thread: object())})(),
+        raising=False,
+    )
+
+    resumed = await main.auto_resume_step_plan_after_restart(bot)
+
+    assert resumed is True
+    submit_kwargs = task_mgr.submit.await_args.kwargs
+    assert submit_kwargs["prompt"] == persisted_prompt
+    assert saved["next_action"]["prompt"] == persisted_prompt

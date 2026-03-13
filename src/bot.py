@@ -770,6 +770,71 @@ def _step_plan_active_flag() -> bool:
     return bool(payload.get("active"))
 
 
+def _step_plan_pending_steps(state: dict[str, object]) -> tuple[list[str], int]:
+    steps = state.get("steps") if isinstance(state.get("steps"), list) else []
+    current_index = int(state.get("current_index") or 0)
+    return steps, current_index
+
+
+def _build_step_plan_next_action(state: dict[str, object]) -> dict[str, object] | None:
+    steps, current_index = _step_plan_pending_steps(state)
+    if current_index < 0 or current_index >= len(steps):
+        return None
+    next_step = str(steps[current_index]).strip()
+    if not next_step:
+        return None
+    prompt = (
+        "continue plan\n"
+        "Run the next planned step safely. "
+        "After code changes run relevant tests and continue only if tests pass."
+        f"\nCurrent step file: {next_step}"
+    )
+    return {
+        "type": "continue_step_plan",
+        "prompt": prompt,
+        "step_index": current_index,
+        "step_path": next_step,
+        "reason": "restart_between_steps",
+        "created_at": datetime.now(tz.utc).isoformat(),
+    }
+
+
+def _normalize_step_plan_next_action(state: dict[str, object]) -> dict[str, object] | None:
+    payload = state.get("next_action")
+    if not isinstance(payload, dict):
+        return None
+    if str(payload.get("type") or "").strip() != "continue_step_plan":
+        return None
+    prompt = str(payload.get("prompt") or "").strip()
+    step_path = str(payload.get("step_path") or "").strip()
+    try:
+        step_index = int(payload.get("step_index"))
+    except Exception:
+        return None
+    if not prompt or not step_path:
+        return None
+    return {
+        "type": "continue_step_plan",
+        "prompt": prompt,
+        "step_index": step_index,
+        "step_path": step_path,
+        "reason": str(payload.get("reason") or "restart_between_steps"),
+        "created_at": str(payload.get("created_at") or datetime.now(tz.utc).isoformat()),
+    }
+
+
+def _ensure_step_plan_next_action(state: dict[str, object]) -> dict[str, object] | None:
+    current = _normalize_step_plan_next_action(state)
+    if current is not None:
+        return current
+    current = _build_step_plan_next_action(state)
+    if current is None:
+        state.pop("next_action", None)
+        return None
+    state["next_action"] = current
+    return current
+
+
 def _provider_session_id(session: object, provider) -> str | None:
     if _is_codex_family_cli(getattr(provider, "cli", None)):
         return getattr(session, "codex_session_id", None)

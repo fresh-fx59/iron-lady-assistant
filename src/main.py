@@ -406,6 +406,9 @@ async def auto_resume_step_plan_after_restart(bot: Bot) -> bool:
         session_id=session_id,
         provider_cli=provider_cli,
         resume_arg=resume_arg,
+        notification_mode=TaskNotificationMode.DELIVER_RESPONSE,
+        live_feedback=True,
+        feedback_title="🔁 <b>Resuming previous step after restart...</b>",
     )
 
     state["current_task_id"] = task_id

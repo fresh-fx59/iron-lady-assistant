@@ -3,6 +3,7 @@ from unittest.mock import AsyncMock
 from pathlib import Path
 
 import pytest
+from src.tasks import TaskNotificationMode
 
 from src import main
 
@@ -192,6 +193,9 @@ async def test_auto_resume_step_plan_after_restart_submits_next_step(monkeypatch
     assert submit_kwargs["message_thread_id"] == 77
     assert "continue plan" in submit_kwargs["prompt"]
     assert "Current step file: /tmp/02.md" in submit_kwargs["prompt"]
+    assert submit_kwargs["notification_mode"] == TaskNotificationMode.DELIVER_RESPONSE
+    assert submit_kwargs["live_feedback"] is True
+    assert submit_kwargs["feedback_title"] == "🔁 <b>Resuming previous step after restart...</b>"
     assert saved["current_task_id"] == "step-task-1"
     assert saved["last_error"] == ""
     assert saved["next_action"]["type"] == "continue_step_plan"
@@ -258,6 +262,9 @@ async def test_auto_resume_reactivates_inactive_state_when_pending_steps_exist(m
     assert saved["current_task_id"] == "step-task-2"
     assert saved["next_action"]["step_index"] == 0
     assert saved["next_action"]["step_path"] == "/tmp/01.md"
+    submit_kwargs = task_mgr.submit.await_args.kwargs
+    assert submit_kwargs["notification_mode"] == TaskNotificationMode.DELIVER_RESPONSE
+    assert submit_kwargs["live_feedback"] is True
 
 
 @pytest.mark.asyncio
@@ -319,6 +326,8 @@ async def test_auto_resume_uses_persisted_next_action_prompt_when_present(monkey
     assert resumed is True
     submit_kwargs = task_mgr.submit.await_args.kwargs
     assert submit_kwargs["prompt"] == persisted_prompt
+    assert submit_kwargs["notification_mode"] == TaskNotificationMode.DELIVER_RESPONSE
+    assert submit_kwargs["live_feedback"] is True
     assert saved["next_action"]["prompt"] == persisted_prompt
 
 

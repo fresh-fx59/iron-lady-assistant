@@ -224,10 +224,46 @@ async def replay_queued_turns_once(bot: Bot) -> int:
     return submitted
 
 
+async def replay_queued_background_tasks_once() -> int:
+    global task_manager
+
+    if task_manager is None:
+        return 0
+    if bot_module.lifecycle_store.is_draining():  # noqa: SLF001
+        return 0
+
+    queued_tasks = await asyncio.to_thread(bot_module.lifecycle_store.claim_queued_background_tasks, limit=10)  # noqa: SLF001
+    submitted = 0
+    for item in queued_tasks:
+        try:
+            notification_mode = TaskNotificationMode(item.notification_mode)
+            await task_manager.submit(
+                chat_id=item.chat_id,
+                user_id=item.user_id,
+                message_thread_id=item.message_thread_id,
+                prompt=item.prompt,
+                model=item.model,
+                session_id=item.session_id,
+                provider_cli=item.provider_cli,
+                resume_arg=item.resume_arg,
+                notification_mode=notification_mode,
+                live_feedback=item.live_feedback,
+                feedback_title=item.feedback_title,
+                task_id=item.task_id,
+            )
+            await asyncio.to_thread(bot_module.lifecycle_store.mark_background_task_submitted, item.task_id)  # noqa: SLF001
+            submitted += 1
+        except Exception:
+            logging.exception("Failed to replay queued background task id=%s", item.task_id)
+            await asyncio.to_thread(bot_module.lifecycle_store.requeue_background_task, item.task_id)  # noqa: SLF001
+    return submitted
+
+
 async def lifecycle_replay_loop(bot: Bot) -> None:
     while True:
         try:
             await replay_queued_turns_once(bot)
+            await replay_queued_background_tasks_once()
         except asyncio.CancelledError:
             raise
         except Exception:

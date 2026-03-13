@@ -175,11 +175,29 @@ class TaskManager:
         task_id: str | None = None,
     ) -> str:
         """Submit a task for background execution. Returns task ID."""
+        effective_task_id = task_id or str(uuid.uuid4())
         if self._lifecycle_store and getattr(self._lifecycle_store, "is_draining", None):
             if self._lifecycle_store.is_draining():
+                if getattr(self._lifecycle_store, "enqueue_background_task", None):
+                    self._lifecycle_store.enqueue_background_task(
+                        task_id=effective_task_id,
+                        chat_id=chat_id,
+                        message_thread_id=message_thread_id,
+                        user_id=user_id,
+                        prompt=prompt,
+                        model=model,
+                        session_id=session_id,
+                        provider_cli=provider_cli,
+                        resume_arg=resume_arg,
+                        notification_mode=notification_mode.value,
+                        live_feedback=live_feedback,
+                        feedback_title=feedback_title,
+                    )
+                    logger.info("Queued background task %s behind deploy drain", effective_task_id)
+                    return effective_task_id
                 raise RuntimeError("Deploy drain in progress; new background work is temporarily blocked.")
         task = BackgroundTask(
-            id=task_id or str(uuid.uuid4()),
+            id=effective_task_id,
             chat_id=chat_id,
             message_thread_id=message_thread_id,
             user_id=user_id,

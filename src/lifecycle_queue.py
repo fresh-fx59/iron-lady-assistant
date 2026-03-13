@@ -29,6 +29,26 @@ class QueuedTurn:
     updated_at: str
 
 
+@dataclass(frozen=True)
+class QueuedBackgroundTask:
+    id: int
+    task_id: str
+    chat_id: int
+    message_thread_id: int | None
+    user_id: int
+    prompt: str
+    model: str
+    session_id: str | None
+    provider_cli: str
+    resume_arg: str | None
+    notification_mode: str
+    live_feedback: bool
+    feedback_title: str | None
+    status: str
+    created_at: str
+    updated_at: str
+
+
 class LifecycleQueueStore:
     """Persist deploy-drain state, active work, and deferred turns across restarts."""
 
@@ -102,6 +122,28 @@ class LifecycleQueueStore:
 
             CREATE INDEX IF NOT EXISTS idx_lifecycle_queued_turns_status_created
                 ON lifecycle_queued_turns(status, created_at, id);
+
+            CREATE TABLE IF NOT EXISTS lifecycle_queued_tasks (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                task_id TEXT NOT NULL UNIQUE,
+                chat_id INTEGER NOT NULL,
+                message_thread_id INTEGER,
+                user_id INTEGER NOT NULL,
+                prompt TEXT NOT NULL,
+                model TEXT NOT NULL,
+                session_id TEXT,
+                provider_cli TEXT NOT NULL,
+                resume_arg TEXT,
+                notification_mode TEXT NOT NULL,
+                live_feedback INTEGER NOT NULL,
+                feedback_title TEXT,
+                status TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_lifecycle_queued_tasks_status_created
+                ON lifecycle_queued_tasks(status, created_at, id);
             """
         )
         row = con.execute(
@@ -207,6 +249,14 @@ class LifecycleQueueStore:
             con.execute(
                 """
                 UPDATE lifecycle_queued_turns
+                SET status = 'queued', updated_at = ?
+                WHERE status = 'replaying'
+                """,
+                (_utc_now(),),
+            )
+            con.execute(
+                """
+                UPDATE lifecycle_queued_tasks
                 SET status = 'queued', updated_at = ?
                 WHERE status = 'replaying'
                 """,
@@ -382,4 +432,108 @@ class LifecycleQueueStore:
                 WHERE id = ?
                 """,
                 (_utc_now(), turn_id),
+            )
+
+    def enqueue_background_task(
+        self,
+        *,
+        task_id: str,
+        chat_id: int,
+        message_thread_id: int | None,
+        user_id: int,
+        prompt: str,
+        model: str,
+        session_id: str | None,
+        provider_cli: str,
+        resume_arg: str | None,
+        notification_mode: str,
+        live_feedback: bool,
+        feedback_title: str | None,
+    ) -> int:
+        with self._lock, self._connect() as con:
+            existing = con.execute(
+                "SELECT id FROM lifecycle_queued_tasks WHERE task_id = ?",
+                (task_id,),
+            ).fetchone()
+            if existing:
+                return int(existing["id"])
+            now = _utc_now()
+            cur = con.execute(
+                """
+                INSERT INTO lifecycle_queued_tasks(
+                    task_id, chat_id, message_thread_id, user_id, prompt, model, session_id,
+                    provider_cli, resume_arg, notification_mode, live_feedback, feedback_title,
+                    status, created_at, updated_at
+                )
+                VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?)
+                """,
+                (
+                    task_id,
+                    chat_id,
+                    message_thread_id,
+                    user_id,
+                    prompt,
+                    model,
+                    session_id,
+                    provider_cli,
+                    resume_arg,
+                    notification_mode,
+                    1 if live_feedback else 0,
+                    feedback_title,
+                    now,
+                    now,
+                ),
+            )
+            return int(cur.lastrowid)
+
+    def claim_queued_background_tasks(self, *, limit: int = 10) -> list[QueuedBackgroundTask]:
+        with self._lock, self._connect() as con:
+            rows = con.execute(
+                """
+                SELECT id, task_id, chat_id, message_thread_id, user_id, prompt, model, session_id,
+                       provider_cli, resume_arg, notification_mode, live_feedback, feedback_title,
+                       status, created_at, updated_at
+                FROM lifecycle_queued_tasks
+                WHERE status = 'queued'
+                ORDER BY created_at ASC, id ASC
+                LIMIT ?
+                """,
+                (limit,),
+            ).fetchall()
+            if not rows:
+                return []
+            now = _utc_now()
+            con.executemany(
+                "UPDATE lifecycle_queued_tasks SET status = 'replaying', updated_at = ? WHERE id = ?",
+                [(now, int(row["id"])) for row in rows],
+            )
+            claimed: list[QueuedBackgroundTask] = []
+            for row in rows:
+                payload = dict(row)
+                payload["status"] = "replaying"
+                payload["updated_at"] = now
+                payload["live_feedback"] = bool(payload["live_feedback"])
+                claimed.append(QueuedBackgroundTask(**payload))
+            return claimed
+
+    def mark_background_task_submitted(self, task_id: str) -> None:
+        with self._lock, self._connect() as con:
+            con.execute(
+                """
+                UPDATE lifecycle_queued_tasks
+                SET status = 'submitted', updated_at = ?
+                WHERE task_id = ?
+                """,
+                (_utc_now(), task_id),
+            )
+
+    def requeue_background_task(self, task_id: str) -> None:
+        with self._lock, self._connect() as con:
+            con.execute(
+                """
+                UPDATE lifecycle_queued_tasks
+                SET status = 'queued', updated_at = ?
+                WHERE task_id = ?
+                """,
+                (_utc_now(), task_id),
             )

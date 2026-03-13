@@ -382,3 +382,51 @@ async def test_replay_queued_turns_once_submits_deliver_response_task(monkeypatc
     assert submit_kwargs["prompt"] == "queued prompt"
     assert submit_kwargs["notification_mode"] == main.TaskNotificationMode.DELIVER_RESPONSE
     assert marked == [(1, "queued-task-1")]
+
+
+@pytest.mark.asyncio
+async def test_replay_queued_background_tasks_once_submits_with_original_task_id(monkeypatch) -> None:
+    task_mgr = AsyncMock()
+    task_mgr.submit = AsyncMock(return_value="task-bg-1")
+    monkeypatch.setattr(main, "task_manager", task_mgr, raising=False)
+
+    queued_task = type(
+        "QueuedTaskStub",
+        (),
+        {
+            "task_id": "task-bg-1",
+            "chat_id": -100123,
+            "message_thread_id": 77,
+            "user_id": 12345,
+            "prompt": "queued bg prompt",
+            "model": "sonnet",
+            "session_id": "sess-1",
+            "provider_cli": "claude",
+            "resume_arg": None,
+            "notification_mode": "full",
+            "live_feedback": False,
+            "feedback_title": None,
+        },
+    )()
+    marked: list[str] = []
+
+    store = type(
+        "LifecycleStoreStub",
+        (),
+        {
+            "is_draining": staticmethod(lambda: False),
+            "claim_queued_background_tasks": staticmethod(lambda limit=10: [queued_task]),
+            "mark_background_task_submitted": staticmethod(lambda task_id: marked.append(task_id)),
+            "requeue_background_task": staticmethod(lambda _task_id: None),
+        },
+    )()
+    monkeypatch.setattr(main.bot_module, "lifecycle_store", store, raising=False)
+
+    submitted = await main.replay_queued_background_tasks_once()
+
+    assert submitted == 1
+    submit_kwargs = task_mgr.submit.await_args.kwargs
+    assert submit_kwargs["task_id"] == "task-bg-1"
+    assert submit_kwargs["prompt"] == "queued bg prompt"
+    assert submit_kwargs["notification_mode"] == main.TaskNotificationMode.FULL
+    assert marked == ["task-bg-1"]

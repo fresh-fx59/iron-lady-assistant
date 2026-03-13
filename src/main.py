@@ -215,6 +215,7 @@ async def replay_queued_turns_once(bot: Bot) -> int:
                 provider_cli=provider_cli,
                 resume_arg=resume_arg,
                 notification_mode=TaskNotificationMode.DELIVER_RESPONSE,
+                live_feedback=True,
             )
             await asyncio.to_thread(bot_module.lifecycle_store.mark_turn_submitted, turn.id, task_id)  # noqa: SLF001
             submitted += 1

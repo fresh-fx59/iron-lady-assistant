@@ -381,6 +381,7 @@ async def test_replay_queued_turns_once_submits_deliver_response_task(monkeypatc
     assert submit_kwargs["message_thread_id"] == 77
     assert submit_kwargs["prompt"] == "queued prompt"
     assert submit_kwargs["notification_mode"] == main.TaskNotificationMode.DELIVER_RESPONSE
+    assert submit_kwargs["live_feedback"] is True
     assert marked == [(1, "queued-task-1")]
 
 

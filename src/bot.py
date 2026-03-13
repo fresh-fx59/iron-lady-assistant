@@ -1570,6 +1570,8 @@ async def _handle_message_inner(message: Message, override_text: str | None = No
             user_id=_actor_id(message),
             kind="interactive_turn",
             prompt_preview=raw_prompt,
+            resume_prompt=raw_prompt,
+            source_message_id=getattr(message, "message_id", None),
         )
 
         try:

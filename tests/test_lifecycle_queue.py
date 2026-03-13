@@ -110,3 +110,27 @@ def test_begin_deploy_queues_later_operations_until_prior_one_completes(tmp_path
 
     assert store.activate_deploy_if_ready(second) == "draining"
     assert store.barrier_phase() == "draining"
+
+
+def test_checkpoint_interactive_scopes_moves_resumable_turns_into_queue(tmp_path) -> None:
+    store = LifecycleQueueStore(tmp_path / "lifecycle.db")
+
+    store.upsert_active_scope(
+        scope_key="123:main",
+        chat_id=123,
+        message_thread_id=None,
+        user_id=7,
+        kind="interactive_turn",
+        prompt_preview="hello",
+        resume_prompt="hello",
+        source_message_id=55,
+    )
+
+    checkpointed = store.checkpoint_interactive_scopes()
+
+    assert checkpointed == 1
+    assert store.active_scope_count() == 0
+    claimed = store.claim_queued_turns(limit=10)
+    assert len(claimed) == 1
+    assert claimed[0].prompt == "hello"
+    assert claimed[0].prompt_format == "raw"

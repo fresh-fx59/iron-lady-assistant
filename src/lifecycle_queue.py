@@ -102,6 +102,8 @@ class LifecycleQueueStore:
                 user_id INTEGER,
                 kind TEXT NOT NULL,
                 prompt_preview TEXT,
+                resume_prompt TEXT,
+                source_message_id INTEGER,
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
             );
@@ -162,6 +164,14 @@ class LifecycleQueueStore:
             con.execute(
                 "ALTER TABLE lifecycle_queued_turns ADD COLUMN prompt_format TEXT NOT NULL DEFAULT 'augmented'"
             )
+        active_columns = {
+            row["name"]
+            for row in con.execute("PRAGMA table_info(lifecycle_active_scopes)").fetchall()
+        }
+        if "resume_prompt" not in active_columns:
+            con.execute("ALTER TABLE lifecycle_active_scopes ADD COLUMN resume_prompt TEXT")
+        if "source_message_id" not in active_columns:
+            con.execute("ALTER TABLE lifecycle_active_scopes ADD COLUMN source_message_id INTEGER")
 
     def _upsert_state_unlocked(self, con: sqlite3.Connection, key: str, value: str) -> None:
         con.execute(
@@ -369,21 +379,26 @@ class LifecycleQueueStore:
         user_id: int | None,
         kind: str,
         prompt_preview: str | None,
+        resume_prompt: str | None = None,
+        source_message_id: int | None = None,
     ) -> None:
         with self._lock, self._connect() as con:
             created_at = _utc_now()
             con.execute(
                 """
                 INSERT INTO lifecycle_active_scopes(
-                    scope_key, chat_id, message_thread_id, user_id, kind, prompt_preview, created_at, updated_at
+                    scope_key, chat_id, message_thread_id, user_id, kind, prompt_preview,
+                    resume_prompt, source_message_id, created_at, updated_at
                 )
-                VALUES(?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(scope_key) DO UPDATE SET
                     chat_id = excluded.chat_id,
                     message_thread_id = excluded.message_thread_id,
                     user_id = excluded.user_id,
                     kind = excluded.kind,
                     prompt_preview = excluded.prompt_preview,
+                    resume_prompt = excluded.resume_prompt,
+                    source_message_id = excluded.source_message_id,
                     updated_at = excluded.updated_at
                 """,
                 (
@@ -393,6 +408,8 @@ class LifecycleQueueStore:
                     user_id,
                     kind,
                     (prompt_preview or "")[:400],
+                    resume_prompt,
+                    source_message_id,
                     created_at,
                     created_at,
                 ),
@@ -407,6 +424,36 @@ class LifecycleQueueStore:
             row = con.execute("SELECT COUNT(*) AS c FROM lifecycle_active_scopes").fetchone()
             return int(row["c"]) if row else 0
 
+    def checkpoint_interactive_scopes(self) -> int:
+        """Persist resumable interactive scopes into the queued-turn ledger and clear them."""
+        with self._lock, self._connect() as con:
+            rows = con.execute(
+                """
+                SELECT scope_key, chat_id, message_thread_id, user_id, resume_prompt, source_message_id
+                FROM lifecycle_active_scopes
+                WHERE kind = 'interactive_turn' AND COALESCE(resume_prompt, '') <> ''
+                """
+            ).fetchall()
+            if not rows:
+                return 0
+            for row in rows:
+                self._enqueue_turn_unlocked(
+                    con,
+                    scope_key=str(row["scope_key"]),
+                    chat_id=int(row["chat_id"]),
+                    message_thread_id=row["message_thread_id"],
+                    user_id=int(row["user_id"] or abs(int(row["chat_id"]))),
+                    prompt=str(row["resume_prompt"]),
+                    prompt_format="raw",
+                    source_message_id=row["source_message_id"],
+                    operation_id=None,
+                )
+            con.executemany(
+                "DELETE FROM lifecycle_active_scopes WHERE scope_key = ?",
+                [(str(row["scope_key"]),) for row in rows],
+            )
+            return len(rows)
+
     def enqueue_turn(
         self,
         *,
@@ -420,40 +467,65 @@ class LifecycleQueueStore:
         operation_id: str | None = None,
     ) -> int:
         with self._lock, self._connect() as con:
-            if source_message_id is not None:
-                existing = con.execute(
-                    """
-                    SELECT id FROM lifecycle_queued_turns
-                    WHERE scope_key = ? AND source_message_id = ? AND status IN ('queued', 'replaying', 'submitted')
-                    ORDER BY id DESC LIMIT 1
-                    """,
-                    (scope_key, source_message_id),
-                ).fetchone()
-                if existing:
-                    return int(existing["id"])
-            now = _utc_now()
-            cur = con.execute(
-                """
-                INSERT INTO lifecycle_queued_turns(
-                    scope_key, chat_id, message_thread_id, user_id, prompt, prompt_format, source_message_id,
-                    status, operation_id, task_id, created_at, updated_at
-                )
-                VALUES(?, ?, ?, ?, ?, ?, ?, 'queued', ?, NULL, ?, ?)
-                """,
-                (
-                    scope_key,
-                    chat_id,
-                    message_thread_id,
-                    user_id,
-                    prompt,
-                    prompt_format,
-                    source_message_id,
-                    operation_id,
-                    now,
-                    now,
-                ),
+            return self._enqueue_turn_unlocked(
+                con,
+                scope_key=scope_key,
+                chat_id=chat_id,
+                message_thread_id=message_thread_id,
+                user_id=user_id,
+                prompt=prompt,
+                prompt_format=prompt_format,
+                source_message_id=source_message_id,
+                operation_id=operation_id,
             )
-            return int(cur.lastrowid)
+
+    def _enqueue_turn_unlocked(
+        self,
+        con: sqlite3.Connection,
+        *,
+        scope_key: str,
+        chat_id: int,
+        message_thread_id: int | None,
+        user_id: int,
+        prompt: str,
+        prompt_format: str,
+        source_message_id: int | None,
+        operation_id: str | None,
+    ) -> int:
+        if source_message_id is not None:
+            existing = con.execute(
+                """
+                SELECT id FROM lifecycle_queued_turns
+                WHERE scope_key = ? AND source_message_id = ? AND status IN ('queued', 'replaying', 'submitted')
+                ORDER BY id DESC LIMIT 1
+                """,
+                (scope_key, source_message_id),
+            ).fetchone()
+            if existing:
+                return int(existing["id"])
+        now = _utc_now()
+        cur = con.execute(
+            """
+            INSERT INTO lifecycle_queued_turns(
+                scope_key, chat_id, message_thread_id, user_id, prompt, prompt_format, source_message_id,
+                status, operation_id, task_id, created_at, updated_at
+            )
+            VALUES(?, ?, ?, ?, ?, ?, ?, 'queued', ?, NULL, ?, ?)
+            """,
+            (
+                scope_key,
+                chat_id,
+                message_thread_id,
+                user_id,
+                prompt,
+                prompt_format,
+                source_message_id,
+                operation_id,
+                now,
+                now,
+            ),
+        )
+        return int(cur.lastrowid)
 
     def claim_queued_turns(self, *, limit: int = 10) -> list[QueuedTurn]:
         with self._lock, self._connect() as con:

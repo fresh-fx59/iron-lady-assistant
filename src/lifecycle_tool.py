@@ -64,6 +64,12 @@ def main(argv: list[str] | None = None) -> int:
             if active == 0:
                 print("idle")
                 return 0
+            checkpointed = store.checkpoint_interactive_scopes()
+            if checkpointed:
+                active = store.active_scope_count()
+                if active == 0:
+                    print(f"idle checkpointed={checkpointed}")
+                    return 0
             time.sleep(max(0.1, args.poll_seconds))
         print(f"timeout active={store.active_scope_count()}", file=sys.stderr)
         return 1

@@ -5,6 +5,10 @@ from typing import Any, Callable
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 
+def _is_message_not_modified_error(exc: Exception) -> bool:
+    return "message is not modified" in str(exc).lower()
+
+
 async def cmd_model(
     message: Any,
     command: Any,
@@ -99,7 +103,16 @@ async def cb_model_switch(
         keyboard.button(text=button_text, callback_data=f"model:{option}")
     keyboard.adjust(2)
 
-    await callback.message.edit_text("\n".join(lines), reply_markup=keyboard.as_markup(), parse_mode="HTML")
+    try:
+        await callback.message.edit_text(
+            "\n".join(lines),
+            reply_markup=keyboard.as_markup(),
+            parse_mode="HTML",
+        )
+    except Exception as exc:
+        if not _is_message_not_modified_error(exc):
+            raise
+        logger.info("Chat %s: skipped unchanged model selector refresh for '%s'", scope_key, current)
     await callback.answer(f"Switched to {current}")
 
 
@@ -176,5 +189,14 @@ async def cb_provider_switch(
         keyboard.button(text=button_text, callback_data=f"provider:{option.name}")
     keyboard.adjust(2)
 
-    await callback.message.edit_text("\n".join(lines), reply_markup=keyboard.as_markup(), parse_mode="HTML")
+    try:
+        await callback.message.edit_text(
+            "\n".join(lines),
+            reply_markup=keyboard.as_markup(),
+            parse_mode="HTML",
+        )
+    except Exception as exc:
+        if not _is_message_not_modified_error(exc):
+            raise
+        logger.info("Chat %s: skipped unchanged provider selector refresh for '%s'", scope_key, provider.name)
     await callback.answer(f"Switched to {provider.name}")

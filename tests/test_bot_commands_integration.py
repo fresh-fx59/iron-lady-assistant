@@ -15,6 +15,8 @@ from aiogram.types import FSInputFile
 from aiogram.exceptions import TelegramAPIError, TelegramRetryAfter
 
 from src.bot import (
+    cb_model_switch,
+    cb_provider_switch,
     cmd_start,
     cmd_new,
     cmd_model,
@@ -462,6 +464,68 @@ class TestModelCommand:
         await cmd_model(mock_message)
 
         mock_message.answer.assert_not_called()
+
+
+@pytest.mark.asyncio
+class TestModelAndProviderCallbacks:
+    async def test_model_callback_ignores_unchanged_edit_error(self, mock_message):
+        from src.bot import provider_manager
+        from src.bot import session_manager
+
+        provider_manager.set_provider("123456789:main", "codex")
+        session_manager.set_codex_model(123456789, "gpt-5.4")
+
+        callback = AsyncMock()
+        callback.data = "model:gpt-5.4"
+        callback.from_user.id = 123456789
+        callback.message = mock_message
+        callback.answer = AsyncMock()
+        callback.message.edit_text = AsyncMock(
+            side_effect=Exception("Telegram server says - Bad Request: message is not modified")
+        )
+
+        await cb_model_switch(callback)
+
+        callback.message.edit_text.assert_called_once()
+        callback.answer.assert_called_once()
+        assert session_manager.get(123456789).codex_model == "gpt-5.4"
+
+    async def test_provider_callback_ignores_unchanged_edit_error(self, mock_message):
+        from src.bot import provider_manager
+        from src.bot import session_manager
+
+        provider_manager.set_provider("123456789:main", "codex")
+        session_manager.set_provider(123456789, "codex")
+
+        callback = AsyncMock()
+        callback.data = "provider:codex"
+        callback.from_user.id = 123456789
+        callback.message = mock_message
+        callback.answer = AsyncMock()
+        callback.message.edit_text = AsyncMock(
+            side_effect=Exception("Telegram server says - Bad Request: message is not modified")
+        )
+
+        await cb_provider_switch(callback)
+
+        callback.message.edit_text.assert_called_once()
+        callback.answer.assert_called_once_with("Switched to codex")
+        assert session_manager.get(123456789).provider == "codex"
+
+    async def test_model_callback_still_raises_other_edit_errors(self, mock_message):
+        from src.bot import provider_manager
+
+        provider_manager.set_provider("123456789:main", "codex")
+
+        callback = AsyncMock()
+        callback.data = "model:gpt-5.4"
+        callback.from_user.id = 123456789
+        callback.message = mock_message
+        callback.answer = AsyncMock()
+        callback.message.edit_text = AsyncMock(side_effect=RuntimeError("network broke"))
+
+        with pytest.raises(RuntimeError, match="network broke"):
+            await cb_model_switch(callback)
 
 
 class TestCommandArgs:

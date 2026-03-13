@@ -80,7 +80,7 @@ For browser-based Ozon buying and order tracking, this repo now includes a dedic
 ```bash
 cd /home/claude-developer/iron-lady-assistant
 ./scripts/install_agent_browser_host.sh
-python3 -m src.ozon_browser login --headed
+python3 -m src.ozon_browser --headed login
 python3 -m src.ozon_browser orders
 python3 -m src.ozon_browser prepare-buy "детский шампунь Johnson's" --max-price 700 --checkout
 python3 -m src.ozon_browser place-order --confirm
@@ -89,9 +89,30 @@ python3 -m src.ozon_browser place-order --confirm
 Notes:
 - Browser state is kept under `~/.local/state/iron-lady-assistant/ozon-browser/`
 - Host preparation helper: [`scripts/install_agent_browser_host.sh`](/home/claude-developer/iron-lady-assistant/scripts/install_agent_browser_host.sh)
-- `login --headed` is the intended one-time step for manual auth or challenge solving
+- `--headed login` is the intended one-time step for manual auth or challenge solving
+- Optional passthroughs:
+  - `--proxy socks5://127.0.0.1:11080` to change egress gently without host routing changes
+  - `--cdp 9222` to attach to an already-running Chrome/Chromium instead of launching a fresh browser
+  - `--allowed-domains '*'` to disable the wrapper domain allowlist during debugging
 - If local Linux browser launch fails because of missing shared libraries, keep using the same wrapper but switch to a remote `agent-browser` provider such as `--provider browseruse`, `--provider kernel`, or `--provider browserbase`
 - The final purchase step is intentionally separate and requires `--confirm`
+
+### Lower-Detection Manual Login Path
+
+If Ozon blocks the default Playwright-launched session, try a more normal browser launch and attach over CDP:
+
+```bash
+cd /home/claude-developer/iron-lady-assistant
+./scripts/start_ozon_chrome_display.sh
+python3 -m src.ozon_browser --cdp 9222 --session ozon login
+```
+
+For safe remote interaction, keep VNC localhost-only and forward it over SSH:
+
+```bash
+./scripts/start_ozon_vnc_local.sh
+ssh -N -L 5901:127.0.0.1:5901 claude-developer@31.220.78.216
+```
 
 ### Alternative: Manual Setup
 

@@ -37,6 +37,8 @@ class BrowserConfig:
     download_path: Path
     session: str = DEFAULT_SESSION
     provider: str | None = None
+    proxy: str | None = None
+    cdp: str | None = None
     headed: bool = False
     allow_domains: str = DEFAULT_ALLOWED_DOMAINS
     max_output: int = 12000
@@ -71,6 +73,12 @@ class OzonBrowser:
                 self.run("wait", "7000")
                 payload = self.eval_json(_orders_extract_script())
                 current_url = self.run("get", "url")
+                if self._looks_access_blocked(payload):
+                    incident = self._extract_incident(payload)
+                    message = "Ozon returned an access-restricted page"
+                    if incident:
+                        message += f" (incident: {incident})"
+                    raise BrowserCommandError(message)
                 if self._looks_logged_out(payload, current_url):
                     continue
                 payload["current_url"] = current_url
@@ -187,23 +195,46 @@ class OzonBrowser:
     def eval_json(self, script: str) -> dict[str, Any]:
         raw = self.run("eval", script)
         try:
-            return json.loads(raw)
+            payload = json.loads(raw)
         except json.JSONDecodeError as exc:
             raise BrowserCommandError(f"Browser eval did not return JSON: {raw}") from exc
+        if isinstance(payload, str):
+            try:
+                payload = json.loads(payload)
+            except json.JSONDecodeError as exc:
+                raise BrowserCommandError(f"Browser eval returned nested non-JSON text: {payload}") from exc
+        if not isinstance(payload, dict):
+            raise BrowserCommandError(f"Browser eval returned unexpected payload type: {type(payload).__name__}")
+        return payload
 
     def run(self, *args: str) -> str:
         command = self._command(*args)
-        result = subprocess.run(
+        result = self._run_subprocess(command)
+        if args and args[0] != "close" and self._should_restart_daemon(result):
+            self._close_daemon()
+            result = self._run_subprocess(command)
+        if result.returncode != 0:
+            stderr = (result.stderr or result.stdout).strip()
+            raise BrowserCommandError(stderr or f"agent-browser failed: {' '.join(args)}")
+        return result.stdout.strip()
+
+    def _run_subprocess(self, command: list[str]) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
             command,
             cwd=self.config.repo_root,
             capture_output=True,
             text=True,
             check=False,
         )
-        if result.returncode != 0:
-            stderr = (result.stderr or result.stdout).strip()
-            raise BrowserCommandError(stderr or f"agent-browser failed: {' '.join(args)}")
-        return result.stdout.strip()
+
+    def _close_daemon(self) -> None:
+        close_command = ["npx", "agent-browser", "--session", self.config.session, "close"]
+        self._run_subprocess(close_command)
+
+    @staticmethod
+    def _should_restart_daemon(result: subprocess.CompletedProcess[str]) -> bool:
+        combined = "\n".join(part.strip() for part in (result.stdout, result.stderr) if part).lower()
+        return "ignored: daemon already running" in combined
 
     def _command(self, *args: str) -> list[str]:
         command = [
@@ -222,6 +253,10 @@ class OzonBrowser:
         ]
         if self.config.provider:
             command.extend(["--provider", self.config.provider])
+        if self.config.proxy:
+            command.extend(["--proxy", self.config.proxy])
+        if self.config.cdp:
+            command.extend(["--cdp", self.config.cdp])
         if self.config.headed:
             command.append("--headed")
         if self.config.user_agent:
@@ -238,6 +273,17 @@ class OzonBrowser:
             return True
         signals = ("войти", "вход", "login", "sign in")
         return any(signal in page_text for signal in signals) and not payload.get("orders")
+
+    @staticmethod
+    def _looks_access_blocked(payload: dict[str, Any]) -> bool:
+        page_text = (payload.get("page_text") or "").lower()
+        return "доступ ограничен" in page_text or "access restricted" in page_text
+
+    @staticmethod
+    def _extract_incident(payload: dict[str, Any]) -> str | None:
+        page_text = str(payload.get("page_text") or "")
+        match = re.search(r"Инцидент:\s*([A-Za-z0-9_:-]+)", page_text)
+        return match.group(1) if match else None
 
 
 def _compact_text(value: str) -> str:
@@ -378,9 +424,16 @@ def _click_by_text_script(candidates: list[str]) -> str:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Ozon automation wrapper built on top of agent-browser.")
     parser.add_argument("--provider", help="agent-browser provider: browseruse, kernel, browserbase, ios")
+    parser.add_argument("--proxy", help="Browser proxy URL passed through to agent-browser, e.g. socks5://127.0.0.1:11080")
+    parser.add_argument("--cdp", help="Attach to an already-running Chrome/Chromium via CDP port or endpoint.")
     parser.add_argument("--session", default=os.environ.get("OZON_SESSION", DEFAULT_SESSION))
     parser.add_argument("--profile-path", type=Path)
     parser.add_argument("--download-path", type=Path)
+    parser.add_argument(
+        "--allowed-domains",
+        default=DEFAULT_ALLOWED_DOMAINS,
+        help="Comma-separated allowed domains. Use '*' to disable the wrapper allowlist.",
+    )
     parser.add_argument("--headed", action="store_true", help="Show the browser window instead of headless mode.")
     parser.add_argument("--max-output", type=int, default=12000)
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -423,7 +476,10 @@ def _resolve_config(args: argparse.Namespace) -> BrowserConfig:
         download_path=download_path,
         session=args.session,
         provider=(args.provider or None),
+        proxy=(args.proxy or None),
+        cdp=(args.cdp or None),
         headed=bool(args.headed),
+        allow_domains=args.allowed_domains,
         max_output=args.max_output,
     )
 

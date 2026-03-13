@@ -347,10 +347,10 @@ main() {
   header "Next Step"
   printf "Try:\n"
   printf "  cd %s\n" "${REPO_ROOT}"
-  printf "  python3 -m src.ozon_browser login --headed\n"
+  printf "  python3 -m src.ozon_browser --headed login\n"
   if [[ "${WITH_XVFB}" -eq 1 ]]; then
     printf "If a display is still needed on the VPS, try:\n"
-    printf "  xvfb-run -a python3 -m src.ozon_browser login --headed\n"
+    printf "  xvfb-run -a python3 -m src.ozon_browser --headed login\n"
   fi
 }
 

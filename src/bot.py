@@ -52,6 +52,7 @@ from .features import rollback_selfmod_handlers as _rollback_selfmod_handlers
 from .features import message_media_handlers as _message_media_handlers
 from .features import media_reply_pipeline as _media_reply_pipeline
 from .features import turn_response_dispatch as _turn_response_dispatch
+from .features import turn_provider_execution as _turn_provider_execution
 from .f08_governance import F08GovernanceAdvisory
 from .media import (
     extract_media_directives,
@@ -1496,232 +1497,42 @@ async def _handle_message_inner(message: Message, override_text: str | None = No
         response_has_user_content = False
         output_size_out = 0
 
-        try:
-            if provider.cli != "claude" and _find_provider_cli(provider.cli) is None:
-                fallback = provider_manager.reset(scope_key)
-                session_manager.set_provider(chat_id, fallback.name, thread_id)
-                await message.answer(
-                    f"Provider <b>{provider.name}</b> requires missing CLI "
-                    f"<code>{provider.cli}</code>. Switched to <b>{fallback.name}</b>.",
-                    parse_mode="HTML",
-                )
-                provider = fallback
-            turn_prompt = override_text
-            pending_apply_ids: list[str] = []
-            while True:
-                effective_prompt = _as_text(turn_prompt) or raw_prompt
-                env = _worklog_subprocess_env(
-                    provider_manager.subprocess_env(provider),
-                    chat_id=chat_id,
-                    message_thread_id=thread_id,
-                    provider=provider,
-                    session=session,
-                )
-                logger.info(
-                    "Chat %s: using provider '%s' (cli=%s) with env=%s",
-                    scope_key,
-                    provider.name,
-                    provider.cli,
-                    {k: v for k, v in env.items() if k.startswith("ANTHROPIC_")},
-                )
-                resume_state_store.record_start(
-                    scope_key=scope_key,
-                    task_id=f"msg:{message.message_id}",
-                    step_id="interactive_turn",
-                    provider_cli=provider.cli,
-                    model=_current_model_label(session, provider),
-                    session_id=session.codex_session_id if _is_codex_family_cli(provider.cli) else session.claude_session_id,
-                    input_text=effective_prompt,
-                    resume_reason="manual_continue" if turn_prompt else "restart",
-                )
-
-                if _is_codex_family_cli(provider.cli):
-                    provider_attempts += 1
-                    codex_model = _codex_model_arg(session, provider)
-                    final_response = await _run_codex_with_retries(
-                        message,
-                        state,
-                        session,
-                        progress,
-                        codex_model,
-                        session.codex_session_id,
-                        provider.resume_arg,
-                        env,
-                        provider.cli,
-                        override_text=effective_prompt,
-                        observed_tools=observed_tools,
-                    )
-                else:
-                    provider_attempts += 1
-                    final_response = await _run_claude(
-                        message, state, session, progress, env,
-                        override_text=effective_prompt,
-                        observed_tools=observed_tools,
-                    )
-                final_provider_name = provider.name
-                final_model_name = _current_model_label(session, provider)
-
-                # ── Fallback on provider errors ───────────────────────
-                error_text_l = (final_response.text or "").strip().lower() if final_response else ""
-                should_fallback = bool(
-                    final_response
-                    and final_response.is_error
-                    and not state.cancel_requested
-                    and (
-                        provider_manager.is_rate_limit_error(final_response.text)
-                        # Claude CLI sometimes returns a generic empty-body failure.
-                        or (provider.cli == "claude" and error_text_l == "claude returned an error.")
-                    )
-                )
-                if should_fallback:
-                    next_provider = provider_manager.advance(scope_key)
-                    if next_provider:
-                        reason = (
-                            "Rate limited"
-                            if provider_manager.is_rate_limit_error(final_response.text)
-                            else "Provider error"
-                        )
-                        await message.answer(
-                            f"{reason} on <b>{provider.name}</b>. "
-                            f"Switching to <b>{next_provider.name}</b>...",
-                            parse_mode="HTML",
-                        )
-                        logger.info(
-                            "Chat %s: fallback from '%s' to '%s' (error=%r)",
-                            scope_key, provider.name, next_provider.name, final_response.text,
-                        )
-                        provider = next_provider
-                        session_manager.set_provider(chat_id, next_provider.name, thread_id)
-                        env = _worklog_subprocess_env(
-                            provider_manager.subprocess_env(next_provider),
-                            chat_id=chat_id,
-                            message_thread_id=thread_id,
-                            provider=next_provider,
-                            session=session,
-                        )
-                        if _is_codex_family_cli(next_provider.cli):
-                            provider_attempts += 1
-                            codex_model = _codex_model_arg(session, next_provider)
-                            final_response = await _run_codex_with_retries(
-                                message,
-                                state,
-                                session,
-                                progress,
-                                codex_model,
-                                session.codex_session_id,
-                                next_provider.resume_arg,
-                                env,
-                                next_provider.cli,
-                                override_text=effective_prompt,
-                                observed_tools=observed_tools,
-                            )
-                        else:
-                            provider_attempts += 1
-                            final_response = await _run_claude(
-                                message, state, session, progress, env,
-                                override_text=effective_prompt,
-                                observed_tools=observed_tools,
-                            )
-                        final_provider_name = next_provider.name
-                        final_model_name = _current_model_label(session, next_provider)
-
-                requested_tools = ToolRegistry.extract_requested_tools(
-                    final_response.text if final_response else ""
-                )
-                if (
-                    requested_tools
-                    and final_response
-                    and not final_response.is_error
-                    and not state.cancel_requested
-                ):
-                    selected_tool = requested_tools[0]
-                    logger.info(
-                        "Chat %d: second-pass tool activation requested: %s",
-                        message.chat.id,
-                        selected_tool,
-                    )
-                    await progress.report_tool("tool_selector", selected_tool)
-                    forced_prompt = _inject_tool_request(effective_prompt, selected_tool)
-                    if _is_codex_family_cli(provider.cli):
-                        provider_attempts += 1
-                        codex_model = _codex_model_arg(session, provider)
-                        retry_response = await _run_codex_with_retries(
-                            message,
-                            state,
-                            session,
-                            progress,
-                            codex_model,
-                            session.codex_session_id,
-                            provider.resume_arg,
-                            env,
-                            provider.cli,
-                            override_text=forced_prompt,
-                            observed_tools=observed_tools,
-                        )
-                    else:
-                        provider_attempts += 1
-                        retry_response = await _run_claude(
-                            message,
-                            state,
-                            session,
-                            progress,
-                            env,
-                            override_text=forced_prompt,
-                            observed_tools=observed_tools,
-                        )
-                    if retry_response:
-                        final_response = retry_response
-
-                if (
-                    final_response
-                    and not final_response.is_error
-                    and not state.cancel_requested
-                    and final_response.session_id
-                ):
-                    if _is_codex_family_cli(provider.cli):
-                        session_manager.update_codex_session_id(chat_id, final_response.session_id, thread_id)
-                    else:
-                        session_manager.update_session_id(chat_id, final_response.session_id, thread_id)
-
-                if (
-                    pending_apply_ids
-                    and final_response
-                    and not final_response.is_error
-                    and not state.cancel_requested
-                ):
-                    steering_ledger_store.mark_applied(scope_key=scope_key, event_ids=pending_apply_ids)
-                    pending_apply_ids = []
-
-                if not final_response or final_response.is_error or state.cancel_requested:
-                    break
-
-                unapplied = steering_ledger_store.get_unapplied(scope_key=scope_key)
-                if not unapplied:
-                    break
-                if _has_high_risk_conflict(unapplied):
-                    await message.answer(
-                        "I received a high-risk follow-up while work is in progress. "
-                        "Please clarify the exact intended change in one message."
-                    )
-                    break
-
-                pending_apply_ids = [event.event_id for event in unapplied]
-                steering_events_applied += len(unapplied)
-                await progress.report_tool("steering", f"{len(unapplied)} pending update(s)")
-                turn_prompt = _build_steering_patch(raw_prompt, unapplied)
-                logger.info(
-                    "Chat %s: applying %d cumulative steering event(s) in continuation",
-                    scope_key,
-                    len(unapplied),
-                )
-        finally:
-            typing_task.cancel()
-            try:
-                await typing_task
-            except asyncio.CancelledError:
-                pass
-            state.process_handle = None
-            state.reset_requested = False
+        execution = await _turn_provider_execution.run_provider_execution_loop(
+            message=message,
+            state=state,
+            session=session,
+            progress=progress,
+            typing_task=typing_task,
+            scope_key=scope_key,
+            chat_id=chat_id,
+            thread_id=thread_id,
+            raw_prompt=raw_prompt,
+            override_text=override_text,
+            provider_manager=provider_manager,
+            session_manager=session_manager,
+            resume_state_store=resume_state_store,
+            steering_ledger_store=steering_ledger_store,
+            logger=logger,
+            current_model_label_fn=_current_model_label,
+            is_codex_family_cli_fn=_is_codex_family_cli,
+            find_provider_cli_fn=_find_provider_cli,
+            as_text_fn=_as_text,
+            worklog_subprocess_env_fn=_worklog_subprocess_env,
+            codex_model_arg_fn=_codex_model_arg,
+            run_codex_with_retries_fn=_run_codex_with_retries,
+            run_claude_fn=_run_claude,
+            extract_requested_tools_fn=ToolRegistry.extract_requested_tools,
+            inject_tool_request_fn=_inject_tool_request,
+            build_steering_patch_fn=_build_steering_patch,
+            has_high_risk_conflict_fn=_has_high_risk_conflict,
+        )
+        final_response = execution.final_response
+        provider = execution.provider
+        observed_tools = execution.observed_tools
+        provider_attempts = execution.provider_attempts
+        steering_events_applied = execution.steering_events_applied
+        final_provider_name = execution.final_provider_name
+        final_model_name = execution.final_model_name
 
         response_has_user_content, output_size_out = await _turn_response_dispatch.dispatch_turn_response(
             message=message,

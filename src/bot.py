@@ -49,6 +49,7 @@ from .features import provider_runtime as _provider_runtime
 from .features import provider_command_handlers as _provider_command_handlers
 from .features import lifecycle_ops_command_handlers as _lifecycle_ops_command_handlers
 from .features import background_schedule_handlers as _background_schedule_handlers
+from .features import rollback_selfmod_handlers as _rollback_selfmod_handlers
 from .f08_governance import F08GovernanceAdvisory
 from .media import (
     extract_media_directives,
@@ -85,6 +86,16 @@ self_mod_manager = SelfModificationManager(Path(__file__).resolve().parent.paren
 f08_advisory = F08GovernanceAdvisory()
 task_manager: TaskManager | None = None  # Set in main()
 schedule_manager: ScheduleManager | None = None  # Set in main()
+
+
+def _reload_tool_registry() -> None:
+    global tool_registry, context_plugins
+    tool_registry = ToolRegistry(
+        config.TOOLS_DIR,
+        denylist=config.TOOL_DENYLIST,
+        require_approval_for_risky=config.TOOL_REQUIRE_APPROVAL_FOR_RISKY,
+    )
+    context_plugins = ContextPluginRegistry([tool_registry])
 
 # Restore persisted provider selections from sessions
 for _scope_id, _session in session_manager.sessions.items():
@@ -1046,197 +1057,75 @@ async def cmd_cancel(message: Message) -> None:
 
 @router.message(Command("rollback"))
 async def cmd_rollback(message: Message) -> None:
-    if not _is_admin(message.from_user and message.from_user.id):
-        await message.answer("This command is admin-only.")
-        return
-    await _show_rollback_options(message.chat.id, message.bot, _thread_id(message))
+    await _rollback_selfmod_handlers.cmd_rollback(
+        message,
+        is_admin=_is_admin,
+        show_rollback_options_fn=_show_rollback_options,
+        thread_id_fn=_thread_id,
+    )
 
 
 @router.callback_query(F.data == "rollback_auto")
 async def cb_rollback_auto(callback: CallbackQuery) -> None:
-    if not _is_admin(callback.from_user and callback.from_user.id):
-        await callback.answer("Admin only", show_alert=True)
-        return
-    if not callback.message:
-        await callback.answer()
-        return
-    await callback.answer()
-    await _show_rollback_options(
-        callback.message.chat.id,
-        callback.bot,
-        _thread_id(callback.message),
+    await _rollback_selfmod_handlers.cb_rollback_auto(
+        callback,
+        is_admin=_is_admin,
+        show_rollback_options_fn=_show_rollback_options,
+        thread_id_fn=_thread_id,
     )
 
 
 @router.callback_query(F.data.startswith("rollback:"))
 async def cb_rollback(callback: CallbackQuery) -> None:
-    if not _is_admin(callback.from_user and callback.from_user.id):
-        await callback.answer("Admin only", show_alert=True)
-        return
-    if not callback.message:
-        await callback.answer()
-        return
-
-    target_hash = callback.data.split(":", 1)[1]
-    short_hash = target_hash[:8]
-
-    kb = InlineKeyboardBuilder()
-    kb.button(text=f"Yes, rollback to {short_hash}", callback_data=f"rollback_confirm:{target_hash}")
-    kb.button(text="No, cancel", callback_data="rollback_cancel")
-    kb.adjust(1)
-
-    await callback.message.edit_text(
-        f"Rollback to commit <code>{short_hash}</code>?\n\nThis will reset the repo and restart the bot service.",
-        parse_mode="HTML",
-        reply_markup=kb.as_markup(),
+    await _rollback_selfmod_handlers.cb_rollback(
+        callback,
+        is_admin=_is_admin,
     )
-    await callback.answer()
 
 
 @router.callback_query(F.data.startswith("rollback_confirm:"))
 async def cb_rollback_confirm(callback: CallbackQuery) -> None:
-    if not _is_admin(callback.from_user and callback.from_user.id):
-        await callback.answer("Admin only", show_alert=True)
-        return
-    if not callback.message:
-        await callback.answer()
-        return
-
-    target_hash = callback.data.split(":", 1)[1]
-    short_hash = target_hash[:8]
-    await callback.answer()
-    await callback.message.edit_text(
-        f"Rolling back to <code>{short_hash}</code>...",
-        parse_mode="HTML",
-    )
-
-    ok, details = await asyncio.to_thread(_reset_to_commit, target_hash)
-    if not ok:
-        await callback.message.answer(f"Rollback failed: {details}")
-        return
-
-    _clear_errors(_scope_key_from_message(callback.message))
-    await callback.message.answer(
-        f"Rollback complete: <code>{short_hash}</code>\nRestarting <code>telegram-bot.service</code>...",
-        parse_mode="HTML",
-    )
-    asyncio.create_task(
-        _restart_service(callback.message.chat.id, callback.bot, _thread_id(callback.message))
+    await _rollback_selfmod_handlers.cb_rollback_confirm(
+        callback,
+        is_admin=_is_admin,
+        reset_to_commit_fn=_reset_to_commit,
+        clear_errors_fn=_clear_errors,
+        scope_key_from_message_fn=_scope_key_from_message,
+        restart_service_fn=_restart_service,
+        thread_id_fn=_thread_id,
     )
 
 
 @router.callback_query(F.data == "rollback_cancel")
 async def cb_rollback_cancel(callback: CallbackQuery) -> None:
-    await callback.answer("Rollback cancelled")
-    if callback.message:
-        await callback.message.edit_text("Rollback cancelled.")
+    await _rollback_selfmod_handlers.cb_rollback_cancel(callback)
 
 
 @router.message(Command("selfmod_stage"))
 async def cmd_selfmod_stage(message: Message, command: CommandObject | None = None) -> None:
-    """Admin-only: stage plugin candidate code into sandbox."""
-    if not _is_admin(message.from_user and message.from_user.id):
-        await message.answer("This command is admin-only.")
-        return
-
-    text = message.text or ""
-    header, sep, body = text.partition("\n")
-    if command is not None:
-        relative_path = _command_args(message, command)
-    else:
-        header_parts = header.split(maxsplit=1)
-        relative_path = header_parts[1].strip() if len(header_parts) > 1 else ""
-    if not relative_path:
-        await message.answer(
-            "Usage:\n"
-            "/selfmod_stage <relative_plugin_path.py>\n"
-            "```python\n# plugin code here\n```",
-            parse_mode="Markdown",
-        )
-        return
-    if not sep or not body.strip():
-        await message.answer("Provide plugin code on lines after the command.")
-        return
-
-    plugin_code = _strip_markdown_code_fence(body)
-    if not plugin_code:
-        await message.answer("Plugin code is empty after parsing.")
-        return
-
-    try:
-        staged_path = await asyncio.to_thread(
-            self_mod_manager.stage_plugin,
-            relative_path,
-            plugin_code + ("\n" if not plugin_code.endswith("\n") else ""),
-        )
-    except Exception as exc:
-        await message.answer(f"Staging failed: {exc}")
-        return
-
-    await message.answer(
-        "✅ Staged plugin candidate\n"
-        f"<b>Path:</b> <code>{relative_path}</code>\n"
-        f"<b>Sandbox file:</b> <code>{staged_path}</code>\n"
-        "Next: run /selfmod_apply with this path.",
-        parse_mode="HTML",
+    await _rollback_selfmod_handlers.cmd_selfmod_stage(
+        message,
+        command,
+        is_admin=_is_admin,
+        command_args_fn=_command_args,
+        strip_markdown_code_fence_fn=_strip_markdown_code_fence,
+        self_mod_manager=self_mod_manager,
     )
 
 
 @router.message(Command("selfmod_apply"))
 async def cmd_selfmod_apply(message: Message, command: CommandObject | None = None) -> None:
-    """Admin-only: validate sandbox candidate, promote, and hot-reload."""
-    if not _is_admin(message.from_user and message.from_user.id):
-        await message.answer("This command is admin-only.")
-        return
-
-    args = _command_args(message, command)
-    if not args:
-        await message.answer(
-            "Usage: /selfmod_apply <relative_plugin_path.py> [test_target]\n"
-            "Example: /selfmod_apply tools_plugin.py tests/test_context_plugins.py"
-        )
-        return
-
-    parts = args.split(maxsplit=1)
-    relative_path = parts[0].strip()
-    test_target = parts[1].strip() if len(parts) > 1 else "tests/test_context_plugins.py"
-    f08_advisory.submit_selfmod_apply(
-        scope_key=_scope_key_from_message(message),
-        relative_path=relative_path,
-        test_target=test_target,
+    await _rollback_selfmod_handlers.cmd_selfmod_apply(
+        message,
+        command,
+        is_admin=_is_admin,
+        command_args_fn=_command_args,
+        scope_key_from_message_fn=_scope_key_from_message,
+        f08_advisory=f08_advisory,
+        self_mod_manager=self_mod_manager,
+        truncate_output_fn=_truncate_output,
+        reload_tooling_fn=_reload_tool_registry,
     )
-
-    await message.answer(
-        f"Applying sandbox candidate <code>{relative_path}</code>\n"
-        f"Validation target: <code>{test_target}</code>",
-        parse_mode="HTML",
-    )
-
-    result = await asyncio.to_thread(
-        self_mod_manager.apply_candidate,
-        relative_path,
-        test_target,
-    )
-
-    validation_text = result.validation_output or "(no output)"
-    status = "✅ <b>Self-mod apply succeeded</b>" if result.ok else "❌ <b>Self-mod apply failed</b>"
-    lines = [
-        status,
-        f"<b>Result:</b> {result.message}",
-        "",
-        "<b>Validation output:</b>",
-        f"<pre>{html.escape(_truncate_output(validation_text))}</pre>",
-    ]
-    await message.answer("\n".join(lines), parse_mode="HTML")
-
-    if result.ok:
-        global tool_registry, context_plugins
-        tool_registry = ToolRegistry(
-            config.TOOLS_DIR,
-            denylist=config.TOOL_DENYLIST,
-            require_approval_for_risky=config.TOOL_REQUIRE_APPROVAL_FOR_RISKY,
-        )
-        context_plugins = ContextPluginRegistry([tool_registry])
 
 
 @router.message(Command("bg"))

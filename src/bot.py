@@ -50,6 +50,7 @@ from .features import provider_command_handlers as _provider_command_handlers
 from .features import lifecycle_ops_command_handlers as _lifecycle_ops_command_handlers
 from .features import background_schedule_handlers as _background_schedule_handlers
 from .features import rollback_selfmod_handlers as _rollback_selfmod_handlers
+from .features import message_media_handlers as _message_media_handlers
 from .f08_governance import F08GovernanceAdvisory
 from .media import (
     extract_media_directives,
@@ -1350,196 +1351,58 @@ async def _run_codex_with_retries(
 
 @router.message(F.voice)
 async def handle_voice(message: Message) -> None:
-    """Transcribe voice message via whisper.cpp and process as text."""
-    if not _is_authorized(message.from_user and message.from_user.id, message.chat.id):
-        return
-
-    _log_incoming_message(message, "voice")
-    logger.info(
-        "Entering handle_voice: chat=%s thread=%s message=%s",
-        message.chat.id,
-        _thread_id(message),
-        message.message_id,
+    await _message_media_handlers.handle_voice(
+        message,
+        is_authorized=_is_authorized,
+        log_incoming_message_fn=_log_incoming_message,
+        logger=logger,
+        thread_id_fn=_thread_id,
+        transcribe_module=transcribe,
+        send_chat_action_once_fn=_send_chat_action_once,
+        keep_chat_action_fn=_keep_chat_action,
+        chat_action_typing=ChatAction.TYPING,
+        send_voice_transcription_progress_message_fn=_send_voice_transcription_progress_message,
+        update_voice_transcription_progress_fn=_update_voice_transcription_progress,
+        retry_voice_transcription_progress_message_fn=_retry_voice_transcription_progress_message,
+        publish_voice_transcription_result_fn=_publish_voice_transcription_result,
+        format_voice_transcription_complete_fn=_format_voice_transcription_complete,
+        format_voice_transcription_failed_fn=_format_voice_transcription_failed,
+        handle_message_inner_fn=_handle_message_inner,
+        scope_key_from_message_fn=_scope_key_from_message,
+        record_error_fn=_record_error,
+        metrics=metrics,
+        telegram_api_error_class=TelegramAPIError,
     )
-
-    if not transcribe.is_available():
-        await message.answer(
-            "Voice messages are not supported — whisper.cpp is not installed.\n"
-            "Run <code>bash setup_whisper.sh</code> on the server to enable.",
-            parse_mode="HTML",
-        )
-        return
-
-    import tempfile
-
-    file_lookup_started_at = monotonic()
-    file = await message.bot.get_file(message.voice.file_id)
-    file_lookup_elapsed_ms = (monotonic() - file_lookup_started_at) * 1000
-    tmp = tempfile.NamedTemporaryFile(suffix=".oga", delete=False)
-    transcription_started_at = monotonic()
-    transcription_status_ref: dict[str, int | None] = {"message_id": None}
-    transcription_status_task: asyncio.Task | None = None
-    transcription_status_retry_task: asyncio.Task | None = None
-    transcription_completed = False
-    transcription_failed_notified = False
-    await _send_chat_action_once(message, ChatAction.TYPING)
-    transcription_typing_task = asyncio.create_task(_keep_chat_action(message, ChatAction.TYPING))
-    try:
-        await asyncio.sleep(0)
-        (
-            transcription_status_message_id,
-            transcription_retry_after,
-        ) = await _send_voice_transcription_progress_message(
-            message,
-            monotonic() - transcription_started_at,
-        )
-        transcription_status_ref["message_id"] = transcription_status_message_id
-        if transcription_status_message_id is not None:
-            transcription_status_task = asyncio.create_task(
-                _update_voice_transcription_progress(
-                    message,
-                    transcription_status_message_id,
-                    transcription_started_at,
-                )
-            )
-        elif transcription_retry_after is not None:
-            transcription_status_retry_task = asyncio.create_task(
-                _retry_voice_transcription_progress_message(
-                    message,
-                    transcription_status_ref,
-                    transcription_started_at,
-                    transcription_retry_after,
-                )
-            )
-        download_started_at = monotonic()
-        await message.bot.download_file(file.file_path, tmp.name)
-        download_elapsed_ms = (monotonic() - download_started_at) * 1000
-        transcribe_started_at = monotonic()
-        text = await transcribe.transcribe(tmp.name)
-        transcribe_elapsed_ms = (monotonic() - transcribe_started_at) * 1000
-        transcription_completed = True
-        total_pre_llm_elapsed_ms = (monotonic() - transcription_started_at) * 1000
-        logger.info("Chat %d: transcribed voice (%ds) → %d chars",
-                     message.chat.id, message.voice.duration, len(text))
-        logger.info(
-            "Voice pipeline timings: chat=%s thread=%s message=%s voice_duration_s=%s "
-            "file_lookup_ms=%.1f download_ms=%.1f transcribe_call_ms=%.1f total_pre_llm_ms=%.1f "
-            "temp_audio=%s",
-            message.chat.id,
-            _thread_id(message),
-            message.message_id,
-            message.voice.duration,
-            file_lookup_elapsed_ms,
-            download_elapsed_ms,
-            transcribe_elapsed_ms,
-            total_pre_llm_elapsed_ms,
-            os.path.basename(tmp.name),
-        )
-    except Exception:
-        logger.exception("Voice transcription failed")
-        transcription_failed_notified = True
-        await message.answer("Failed to transcribe voice message.")
-        return
-    finally:
-        transcription_typing_task.cancel()
-        try:
-            await transcription_typing_task
-        except asyncio.CancelledError:
-            pass
-        if transcription_status_task is not None:
-            transcription_status_task.cancel()
-            try:
-                await transcription_status_task
-            except asyncio.CancelledError:
-                pass
-        if transcription_status_retry_task is not None:
-            transcription_status_retry_task.cancel()
-            try:
-                await transcription_status_retry_task
-            except asyncio.CancelledError:
-                pass
-        transcription_elapsed_seconds = monotonic() - transcription_started_at
-        transcription_status_message_id = transcription_status_ref["message_id"]
-        transcription_final_text = (
-            _format_voice_transcription_complete(transcription_elapsed_seconds)
-            if transcription_completed
-            else _format_voice_transcription_failed(transcription_elapsed_seconds)
-        )
-        await _publish_voice_transcription_result(
-            message,
-            progress_message_id=transcription_status_message_id,
-            text=transcription_final_text,
-            send_summary=transcription_completed or not transcription_failed_notified,
-        )
-        os.unlink(tmp.name)
-
-    override = f"[Voice message] {text}"
-    try:
-        await _handle_message_inner(message, override_text=override)
-    except TelegramAPIError:
-        logger.exception("Voice response delivery failed after transcription")
-        metrics.MESSAGES_TOTAL.labels(status="error").inc()
-        _record_error(_scope_key_from_message(message))
-    except Exception:
-        logger.exception("Unhandled exception in handle_voice")
-        metrics.MESSAGES_TOTAL.labels(status="error").inc()
-        _record_error(_scope_key_from_message(message))
-        try:
-            await message.answer("An internal error occurred while processing your voice message.")
-        except TelegramAPIError:
-            logger.exception("Voice fallback error delivery failed")
 
 
 @router.message(F.text)
 async def handle_message(message: Message) -> None:
-    _log_incoming_message(message, "text")
-    logger.info(
-        "Entering handle_message: chat=%s thread=%s message=%s",
-        message.chat.id,
-        _thread_id(message),
-        message.message_id,
+    await _message_media_handlers.handle_text_message(
+        message,
+        log_incoming_message_fn=_log_incoming_message,
+        logger=logger,
+        thread_id_fn=_thread_id,
+        handle_message_inner_fn=_handle_message_inner,
+        metrics=metrics,
+        scope_key_from_message_fn=_scope_key_from_message,
+        record_error_fn=_record_error,
+        build_rollback_suggestion_markup_fn=_build_rollback_suggestion_markup,
     )
-    try:
-        await _handle_message_inner(message)
-    except Exception:
-        logger.exception("Unhandled exception in handle_message")
-        metrics.MESSAGES_TOTAL.labels(status="error").inc()
-        scope_key = _scope_key_from_message(message)
-        _record_error(scope_key)
-        reply_markup = _build_rollback_suggestion_markup(
-            scope_key,
-            message.from_user and message.from_user.id,
-        )
-        await message.answer(
-            "An internal error occurred while processing your request.",
-            reply_markup=reply_markup,
-        )
 
 
 @router.message(F.photo)
 async def handle_photo_message(message: Message) -> None:
-    _log_incoming_message(message, "photo")
-    logger.info(
-        "Entering handle_photo_message: chat=%s thread=%s message=%s",
-        message.chat.id,
-        _thread_id(message),
-        message.message_id,
+    await _message_media_handlers.handle_photo_message(
+        message,
+        log_incoming_message_fn=_log_incoming_message,
+        logger=logger,
+        thread_id_fn=_thread_id,
+        handle_message_inner_fn=_handle_message_inner,
+        metrics=metrics,
+        scope_key_from_message_fn=_scope_key_from_message,
+        record_error_fn=_record_error,
+        build_rollback_suggestion_markup_fn=_build_rollback_suggestion_markup,
     )
-    try:
-        await _handle_message_inner(message)
-    except Exception:
-        logger.exception("Unhandled exception in handle_photo_message")
-        metrics.MESSAGES_TOTAL.labels(status="error").inc()
-        scope_key = _scope_key_from_message(message)
-        _record_error(scope_key)
-        reply_markup = _build_rollback_suggestion_markup(
-            scope_key,
-            message.from_user and message.from_user.id,
-        )
-        await message.answer(
-            "An internal error occurred while processing your request.",
-            reply_markup=reply_markup,
-        )
 
 
 @router.channel_post(F.text)
@@ -1554,16 +1417,20 @@ async def handle_channel_photo(message: Message) -> None:
 
 @router.message(F.forum_topic_created)
 async def handle_forum_topic_created(message: Message) -> None:
-    if not _is_authorized(message.from_user and message.from_user.id, message.chat.id):
-        return
-    _touch_thread_context(message)
+    await _message_media_handlers.handle_forum_topic_created(
+        message,
+        is_authorized=_is_authorized,
+        touch_thread_context_fn=_touch_thread_context,
+    )
 
 
 @router.message(F.forum_topic_edited)
 async def handle_forum_topic_edited(message: Message) -> None:
-    if not _is_authorized(message.from_user and message.from_user.id, message.chat.id):
-        return
-    _touch_thread_context(message)
+    await _message_media_handlers.handle_forum_topic_edited(
+        message,
+        is_authorized=_is_authorized,
+        touch_thread_context_fn=_touch_thread_context,
+    )
 
 
 async def _handle_message_inner(message: Message, override_text: str | None = None) -> None:

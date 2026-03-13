@@ -115,7 +115,8 @@ async def test_handle_message_queues_request_while_lifecycle_is_draining(mock_me
     mock_message.answer.assert_awaited_once()
     assert "queued" in mock_message.answer.await_args.args[0].lower()
     assert queued[0]["scope_key"] == "123456789:main"
-    assert queued[0]["prompt"] == "aug::queued raw prompt"
+    assert queued[0]["prompt"] == "queued raw prompt"
+    assert queued[0]["prompt_format"] == "raw"
 
 
 # ── Contract 2: /start command ────────────────────────────────────

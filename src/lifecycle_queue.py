@@ -21,6 +21,7 @@ class QueuedTurn:
     message_thread_id: int | None
     user_id: int
     prompt: str
+    prompt_format: str
     source_message_id: int | None
     status: str
     operation_id: str | None
@@ -112,6 +113,7 @@ class LifecycleQueueStore:
                 message_thread_id INTEGER,
                 user_id INTEGER NOT NULL,
                 prompt TEXT NOT NULL,
+                prompt_format TEXT NOT NULL DEFAULT 'augmented',
                 source_message_id INTEGER,
                 status TEXT NOT NULL,
                 operation_id TEXT,
@@ -152,6 +154,14 @@ class LifecycleQueueStore:
         ).fetchone()
         if not row:
             self._upsert_state_unlocked(con, "barrier_phase", "open")
+        columns = {
+            row["name"]
+            for row in con.execute("PRAGMA table_info(lifecycle_queued_turns)").fetchall()
+        }
+        if "prompt_format" not in columns:
+            con.execute(
+                "ALTER TABLE lifecycle_queued_turns ADD COLUMN prompt_format TEXT NOT NULL DEFAULT 'augmented'"
+            )
 
     def _upsert_state_unlocked(self, con: sqlite3.Connection, key: str, value: str) -> None:
         con.execute(
@@ -405,6 +415,7 @@ class LifecycleQueueStore:
         message_thread_id: int | None,
         user_id: int,
         prompt: str,
+        prompt_format: str = "raw",
         source_message_id: int | None,
         operation_id: str | None = None,
     ) -> int:
@@ -424,10 +435,10 @@ class LifecycleQueueStore:
             cur = con.execute(
                 """
                 INSERT INTO lifecycle_queued_turns(
-                    scope_key, chat_id, message_thread_id, user_id, prompt, source_message_id,
+                    scope_key, chat_id, message_thread_id, user_id, prompt, prompt_format, source_message_id,
                     status, operation_id, task_id, created_at, updated_at
                 )
-                VALUES(?, ?, ?, ?, ?, ?, 'queued', ?, NULL, ?, ?)
+                VALUES(?, ?, ?, ?, ?, ?, ?, 'queued', ?, NULL, ?, ?)
                 """,
                 (
                     scope_key,
@@ -435,6 +446,7 @@ class LifecycleQueueStore:
                     message_thread_id,
                     user_id,
                     prompt,
+                    prompt_format,
                     source_message_id,
                     operation_id,
                     now,
@@ -448,7 +460,7 @@ class LifecycleQueueStore:
             rows = con.execute(
                 """
                 SELECT id, scope_key, chat_id, message_thread_id, user_id, prompt, source_message_id,
-                       status, operation_id, task_id, created_at, updated_at
+                       prompt_format, status, operation_id, task_id, created_at, updated_at
                 FROM lifecycle_queued_turns
                 WHERE status = 'queued'
                 ORDER BY created_at ASC, id ASC
@@ -481,6 +493,17 @@ class LifecycleQueueStore:
                 WHERE id = ?
                 """,
                 (task_id, _utc_now(), turn_id),
+            )
+
+    def mark_turn_completed(self, turn_id: int) -> None:
+        with self._lock, self._connect() as con:
+            con.execute(
+                """
+                UPDATE lifecycle_queued_turns
+                SET status = 'submitted', updated_at = ?
+                WHERE id = ?
+                """,
+                (_utc_now(), turn_id),
             )
 
     def requeue_turn(self, turn_id: int) -> None:

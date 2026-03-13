@@ -3,6 +3,7 @@ import logging
 import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
+from types import SimpleNamespace
 
 from aiogram import Bot, Dispatcher
 from aiogram.client.session.aiohttp import AiohttpSession
@@ -31,6 +32,41 @@ from .tasks import TaskNotificationMode
 
 _startup_notice_sent_at: dict[tuple[int, int | None], datetime] = {}
 _lifecycle_replay_task: asyncio.Task | None = None
+
+
+class _ReplayMessage:
+    """Minimal message shim so queued-turn replay can reuse the foreground pipeline."""
+
+    def __init__(
+        self,
+        *,
+        bot: Bot,
+        chat_id: int,
+        message_thread_id: int | None,
+        user_id: int,
+        message_id: int | None,
+        text: str,
+    ) -> None:
+        self.bot = bot
+        self.chat = SimpleNamespace(id=chat_id)
+        self.message_thread_id = message_thread_id
+        self.from_user = SimpleNamespace(id=user_id)
+        self.message_id = message_id or 0
+        self.text = text
+        self.caption = None
+        self.content_type = "text"
+        self.photo = None
+        self.voice = None
+
+    async def answer(self, text: str, **kwargs):
+        payload = {
+            "chat_id": self.chat.id,
+            "text": text,
+            **kwargs,
+        }
+        if self.message_thread_id is not None:
+            payload.setdefault("message_thread_id", self.message_thread_id)
+        return await self.bot.send_message(**payload)
 
 
 def mark_good_commit() -> None:
@@ -192,12 +228,6 @@ async def replay_queued_turns_once(bot: Bot) -> int:
     for turn in queued_turns:
         try:
             scope_key = bot_module._scope_key(turn.chat_id, turn.message_thread_id)  # noqa: SLF001
-            provider = bot_module.provider_manager.get_provider(scope_key)
-            session = bot_module.session_manager.get(turn.chat_id, turn.message_thread_id)
-            model, session_id, provider_cli, resume_arg = bot_module._scheduled_task_backend(  # noqa: SLF001
-                session,
-                provider,
-            )
             notify_kwargs = {
                 "chat_id": turn.chat_id,
                 "text": "🔁 Resuming queued request after deploy.",
@@ -205,19 +235,41 @@ async def replay_queued_turns_once(bot: Bot) -> int:
             if turn.message_thread_id is not None:
                 notify_kwargs["message_thread_id"] = turn.message_thread_id
             await bot.send_message(**notify_kwargs)
-            task_id = await task_manager.submit(
-                chat_id=turn.chat_id,
-                user_id=turn.user_id,
-                message_thread_id=turn.message_thread_id,
-                prompt=turn.prompt,
-                model=model,
-                session_id=session_id,
-                provider_cli=provider_cli,
-                resume_arg=resume_arg,
-                notification_mode=TaskNotificationMode.DELIVER_RESPONSE,
-                live_feedback=True,
-            )
-            await asyncio.to_thread(bot_module.lifecycle_store.mark_turn_submitted, turn.id, task_id)  # noqa: SLF001
+            if str(getattr(turn, "prompt_format", "augmented")) == "raw":
+                state = bot_module._get_state(scope_key)  # noqa: SLF001
+                if state.lock.locked():
+                    await asyncio.to_thread(bot_module.lifecycle_store.requeue_turn, turn.id)  # noqa: SLF001
+                    continue
+                replay_message = _ReplayMessage(
+                    bot=bot,
+                    chat_id=turn.chat_id,
+                    message_thread_id=turn.message_thread_id,
+                    user_id=turn.user_id,
+                    message_id=turn.source_message_id,
+                    text=turn.prompt,
+                )
+                await bot_module._handle_message_inner(replay_message, override_text=turn.prompt)  # noqa: SLF001
+                await asyncio.to_thread(bot_module.lifecycle_store.mark_turn_completed, turn.id)  # noqa: SLF001
+            else:
+                provider = bot_module.provider_manager.get_provider(scope_key)
+                session = bot_module.session_manager.get(turn.chat_id, turn.message_thread_id)
+                model, session_id, provider_cli, resume_arg = bot_module._scheduled_task_backend(  # noqa: SLF001
+                    session,
+                    provider,
+                )
+                task_id = await task_manager.submit(
+                    chat_id=turn.chat_id,
+                    user_id=turn.user_id,
+                    message_thread_id=turn.message_thread_id,
+                    prompt=turn.prompt,
+                    model=model,
+                    session_id=session_id,
+                    provider_cli=provider_cli,
+                    resume_arg=resume_arg,
+                    notification_mode=TaskNotificationMode.DELIVER_RESPONSE,
+                    live_feedback=True,
+                )
+                await asyncio.to_thread(bot_module.lifecycle_store.mark_turn_submitted, turn.id, task_id)  # noqa: SLF001
             submitted += 1
         except Exception:
             logging.exception("Failed to replay queued turn id=%s", turn.id)

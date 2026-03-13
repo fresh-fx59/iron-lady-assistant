@@ -1,3 +1,4 @@
+import asyncio
 from unittest.mock import AsyncMock
 from pathlib import Path
 
@@ -322,7 +323,62 @@ async def test_auto_resume_uses_persisted_next_action_prompt_when_present(monkey
 
 
 @pytest.mark.asyncio
-async def test_replay_queued_turns_once_submits_deliver_response_task(monkeypatch) -> None:
+async def test_replay_queued_turns_once_uses_foreground_handler_for_raw_turns(monkeypatch) -> None:
+    bot = AsyncMock()
+    task_mgr = AsyncMock()
+    monkeypatch.setattr(main, "task_manager", task_mgr, raising=False)
+
+    turn = type(
+        "QueuedTurnStub",
+        (),
+        {
+            "id": 1,
+            "chat_id": -100123,
+            "message_thread_id": 77,
+            "user_id": 12345,
+            "prompt": "queued prompt",
+            "prompt_format": "raw",
+            "source_message_id": 321,
+        },
+    )()
+    marked: list[int] = []
+    handled: list[tuple[object, str]] = []
+
+    store = type(
+        "LifecycleStoreStub",
+        (),
+        {
+            "is_draining": staticmethod(lambda: False),
+            "claim_queued_turns": staticmethod(lambda limit=10: [turn]),
+            "mark_turn_completed": staticmethod(lambda turn_id: marked.append(turn_id)),
+            "requeue_turn": staticmethod(lambda _turn_id: None),
+        },
+    )()
+    monkeypatch.setattr(main.bot_module, "lifecycle_store", store, raising=False)
+    monkeypatch.setattr(main.bot_module, "_scope_key", lambda c, t: f"{c}:{t}", raising=False)
+    monkeypatch.setattr(main.bot_module, "_get_state", lambda _scope: type("StateStub", (), {"lock": asyncio.Lock()})(), raising=False)
+
+    async def fake_handle_message_inner(message, override_text=None):
+        handled.append((message, override_text))
+
+    monkeypatch.setattr(main.bot_module, "_handle_message_inner", fake_handle_message_inner, raising=False)
+
+    submitted = await main.replay_queued_turns_once(bot)
+
+    assert submitted == 1
+    bot.send_message.assert_awaited_once()
+    task_mgr.submit.assert_not_awaited()
+    assert handled
+    replay_message, override_text = handled[0]
+    assert replay_message.chat.id == -100123
+    assert replay_message.message_thread_id == 77
+    assert replay_message.message_id == 321
+    assert override_text == "queued prompt"
+    assert marked == [1]
+
+
+@pytest.mark.asyncio
+async def test_replay_queued_turns_once_falls_back_to_background_for_augmented_turns(monkeypatch) -> None:
     bot = AsyncMock()
     task_mgr = AsyncMock()
     task_mgr.submit = AsyncMock(return_value="queued-task-1")
@@ -336,7 +392,9 @@ async def test_replay_queued_turns_once_submits_deliver_response_task(monkeypatc
             "chat_id": -100123,
             "message_thread_id": 77,
             "user_id": 12345,
-            "prompt": "queued prompt",
+            "prompt": "queued augmented prompt",
+            "prompt_format": "augmented",
+            "source_message_id": 321,
         },
     )()
     marked: list[tuple[int, str]] = []
@@ -375,11 +433,7 @@ async def test_replay_queued_turns_once_submits_deliver_response_task(monkeypatc
     submitted = await main.replay_queued_turns_once(bot)
 
     assert submitted == 1
-    bot.send_message.assert_awaited_once()
     submit_kwargs = task_mgr.submit.await_args.kwargs
-    assert submit_kwargs["chat_id"] == -100123
-    assert submit_kwargs["message_thread_id"] == 77
-    assert submit_kwargs["prompt"] == "queued prompt"
     assert submit_kwargs["notification_mode"] == main.TaskNotificationMode.DELIVER_RESPONSE
     assert submit_kwargs["live_feedback"] is True
     assert marked == [(1, "queued-task-1")]

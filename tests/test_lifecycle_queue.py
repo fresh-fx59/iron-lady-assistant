@@ -50,6 +50,7 @@ def test_enqueue_turn_deduplicates_and_claim_replays_in_order(tmp_path) -> None:
     claimed = store.claim_queued_turns(limit=10)
     assert [row.id for row in claimed] == [first, second]
     assert [row.status for row in claimed] == ["replaying", "replaying"]
+    assert [row.prompt_format for row in claimed] == ["raw", "raw"]
 
     store.acknowledge_process_restart()
     replayed_again = store.claim_queued_turns(limit=10)

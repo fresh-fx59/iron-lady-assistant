@@ -1523,13 +1523,13 @@ async def _handle_message_inner(message: Message, override_text: str | None = No
     )
 
     if lifecycle_store.is_draining():
-        queued_prompt = _build_augmented_prompt(raw_prompt)
         lifecycle_store.enqueue_turn(
             scope_key=scope_key,
             chat_id=chat_id,
             message_thread_id=thread_id,
             user_id=_actor_id(message),
-            prompt=queued_prompt,
+            prompt=raw_prompt,
+            prompt_format="raw",
             source_message_id=getattr(message, "message_id", None),
         )
         await message.answer(

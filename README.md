@@ -196,6 +196,14 @@ GitHub Actions deploys can restart services independently via repo variables:
 
 If all three are unset or false, pushes still deploy code to disk but do not restart any service.
 
+When `RESTART_MAIN_APP_ON_PUSH=true`, deploy restart is drain-aware:
+
+- new interactive requests are queued durably while the deploy barrier is draining;
+- queued background and scheduled task submissions are also persisted and replayed after restart;
+- deploy waits for active work to drain, but resumable interactive turns are checkpointed into the queued-turn ledger instead of blocking restart indefinitely.
+
+If deploy reports `Deploy aborted (drain timeout)`, inspect the lifecycle ledger in `memory/lifecycle.db` and `.deploy/deploy.log`. As of `v0.42.0`, interactive scope rows persist a `resume_prompt`, so drain can checkpoint them into `lifecycle_queued_turns` before restart.
+
 ### Option B: Run in a terminal
 
 ```bash
@@ -493,6 +501,11 @@ The bundled systemd units include the per-user npm bin path so `codex` CLIs inst
 - Check system logs: `journalctl -u telegram-bot.service -f`
 - Restart manually: `sudo systemctl restart telegram-bot.service`
 - If running manually, check the terminal output for errors
+
+**"Deploy aborted (drain timeout)"**
+- Check `.deploy/deploy.log` and the lifecycle tables in `memory/lifecycle.db`.
+- Active interactive scopes should now carry a persisted `resume_prompt` and be checkpointed into `lifecycle_queued_turns` during drain.
+- If a legacy row predates `v0.42.0` and has an empty `resume_prompt`, it can block drain until timeout; once backfilled, the next deploy can checkpoint and continue.
 
 **"Applied your follow-up to the active run"**
 - Mid-flight follow-up messages are treated as cumulative steering updates.

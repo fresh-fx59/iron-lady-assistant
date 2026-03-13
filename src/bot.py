@@ -45,6 +45,7 @@ from .features.provider_runtime_helpers import (
     is_transient_codex_error as _is_transient_codex_error_impl,
     sanitize_transient_codex_error_response as _sanitize_transient_codex_error_response_impl,
 )
+from .features import provider_runtime as _provider_runtime
 from .f08_governance import F08GovernanceAdvisory
 from .media import (
     extract_media_directives,
@@ -1896,57 +1897,16 @@ async def _run_claude(
     override_text: str | None = None,
     observed_tools: list[str] | None = None,
 ) -> bridge.ClaudeResponse | None:
-    """Run a single Claude subprocess attempt. Returns the response or None."""
-    state.process_handle = {}
-
-    raw_prompt = _as_text(override_text) or _as_text(getattr(message, "text", None))
-    prompt = _build_augmented_prompt(raw_prompt)
-
-    stream = bridge.stream_message(
-        prompt=prompt,
-        session_id=session.claude_session_id,
-        model=session.model,
-        working_dir=config.CLAUDE_WORKING_DIR,
-        process_handle=state.process_handle,
+    return await _provider_runtime.run_claude(
+        message,
+        state,
+        session,
+        progress,
+        build_augmented_prompt=_build_augmented_prompt,
         subprocess_env=subprocess_env,
+        override_text=override_text,
+        observed_tools=observed_tools,
     )
-    if hasattr(stream, "__aiter__"):
-        iterator = stream
-    else:
-        async def _iter_sync():
-            for item in stream:
-                yield item
-        iterator = _iter_sync()
-
-    async for event in iterator:
-        if state.cancel_requested:
-            await progress.show_cancelled()
-            return bridge.ClaudeResponse(
-                text="Request cancelled.",
-                session_id=session.claude_session_id,
-                is_error=True,
-                cost_usd=0,
-                duration_ms=0,
-                num_turns=0,
-            )
-
-        match event.event_type:
-            case bridge.StreamEventType.TOOL_USE:
-                if event.tool_name:
-                    if observed_tools is not None:
-                        observed_tools.append(event.tool_name)
-                    await progress.report_tool(event.tool_name, event.tool_input)
-            case bridge.StreamEventType.RESULT:
-                return event.response
-            case "TOOL_USE":
-                if getattr(event, "tool_name", None):
-                    if observed_tools is not None:
-                        observed_tools.append(event.tool_name)
-                    await progress.report_tool(event.tool_name, getattr(event, "tool_input", None))
-            case "RESULT":
-                return event.response
-
-    return None
 
 
 async def _run_codex(
@@ -1962,59 +1922,21 @@ async def _run_codex(
     override_text: str | None = None,
     observed_tools: list[str] | None = None,
 ) -> bridge.ClaudeResponse | None:
-    """Run a single Codex CLI subprocess attempt. Returns the response or None."""
-    state.process_handle = {}
-
-    raw_prompt = _as_text(override_text) or _as_text(getattr(message, "text", None))
-    prompt = _build_augmented_prompt(raw_prompt)
-
-    stream = bridge.stream_codex_message(
-        prompt=prompt,
-        session_id=session_id,
+    return await _provider_runtime.run_codex(
+        message,
+        state,
+        session,
+        progress,
+        build_augmented_prompt=_build_augmented_prompt,
+        codex_working_dir=_codex_working_dir,
         model=model,
+        session_id=session_id,
         resume_arg=resume_arg,
-        cli_name=cli_name,
-        working_dir=_codex_working_dir(),
-        process_handle=state.process_handle,
         subprocess_env=subprocess_env,
+        cli_name=cli_name,
+        override_text=override_text,
+        observed_tools=observed_tools,
     )
-    if hasattr(stream, "__aiter__"):
-        iterator = stream
-    else:
-        async def _iter_sync():
-            for item in stream:
-                yield item
-        iterator = _iter_sync()
-
-    async for event in iterator:
-        if state.cancel_requested:
-            await progress.show_cancelled()
-            return bridge.ClaudeResponse(
-                text="Request cancelled.",
-                session_id=session_id,
-                is_error=True,
-                cost_usd=0,
-                duration_ms=0,
-                num_turns=0,
-            )
-
-        match event.event_type:
-            case bridge.StreamEventType.TOOL_USE:
-                if event.tool_name:
-                    if observed_tools is not None:
-                        observed_tools.append(event.tool_name)
-                    await progress.report_tool(event.tool_name, event.tool_input)
-            case bridge.StreamEventType.RESULT:
-                return event.response
-            case "TOOL_USE":
-                if getattr(event, "tool_name", None):
-                    if observed_tools is not None:
-                        observed_tools.append(event.tool_name)
-                    await progress.report_tool(event.tool_name, getattr(event, "tool_input", None))
-            case "RESULT":
-                return event.response
-
-    return None
 
 
 async def _run_codex_with_retries(
@@ -2030,44 +1952,23 @@ async def _run_codex_with_retries(
     override_text: str | None = None,
     observed_tools: list[str] | None = None,
 ) -> bridge.ClaudeResponse | None:
-    retries_left = max(0, config.CODEX_TRANSIENT_MAX_RETRIES)
-    attempt = 0
-    next_session_id = session_id
-
-    while True:
-        attempt += 1
-        response = await _run_codex(
-            message,
-            state,
-            session,
-            progress,
-            model,
-            next_session_id,
-            resume_arg,
-            subprocess_env,
-            cli_name,
-            override_text=override_text,
-            observed_tools=observed_tools,
-        )
-        if not response:
-            return None
-        if state.cancel_requested or not response.is_error or not _is_transient_codex_error(response.text):
-            return response
-        if retries_left <= 0:
-            return _sanitize_transient_codex_error_response(response, attempts=attempt)
-
-        retries_left -= 1
-        logger.warning(
-            "Chat %d: transient Codex error on attempt %d, retrying (%d retries left): %s",
-            message.chat.id,
-            attempt,
-            retries_left,
-            response.text[:200],
-        )
-        if next_session_id:
-            # First retry starts a fresh Codex conversation to bypass stale stream state.
-            next_session_id = None
-        await asyncio.sleep(max(0.0, config.CODEX_TRANSIENT_RETRY_BACKOFF_SECONDS))
+    return await _provider_runtime.run_codex_with_retries(
+        message,
+        state,
+        session,
+        progress,
+        run_codex_fn=_run_codex,
+        is_transient_error_fn=_is_transient_codex_error,
+        sanitize_transient_error_fn=_sanitize_transient_codex_error_response,
+        logger=logger,
+        model=model,
+        session_id=session_id,
+        resume_arg=resume_arg,
+        subprocess_env=subprocess_env,
+        cli_name=cli_name,
+        override_text=override_text,
+        observed_tools=observed_tools,
+    )
 
 
 @router.message(F.voice)

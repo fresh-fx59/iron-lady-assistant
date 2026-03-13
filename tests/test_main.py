@@ -25,6 +25,7 @@ async def test_send_startup_notification_sends_boot_message_only(monkeypatch) ->
 async def test_send_ready_notification_separate_message(monkeypatch) -> None:
     bot = AsyncMock()
     monkeypatch.setattr(main, "ALLOWED_USER_IDS", {12345})
+    main._startup_notice_sent_at.clear()
 
     await main.send_ready_notification(bot)
 
@@ -32,6 +33,18 @@ async def test_send_ready_notification_separate_message(monkeypatch) -> None:
         chat_id=12345,
         text="💬 Ready to accept messages.",
     )
+
+
+@pytest.mark.asyncio
+async def test_send_ready_notification_skips_immediate_duplicate_after_startup(monkeypatch) -> None:
+    bot = AsyncMock()
+    monkeypatch.setattr(main, "ALLOWED_USER_IDS", {12345})
+    main._startup_notice_sent_at.clear()
+    main._startup_notice_sent_at[(12345, None)] = main.datetime.now(main.timezone.utc)
+
+    await main.send_ready_notification(bot)
+
+    bot.send_message.assert_not_awaited()
 
 
 @pytest.mark.asyncio

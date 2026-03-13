@@ -28,6 +28,8 @@ from . import bot as bot_module
 from .bot import router, provider_manager, task_manager, schedule_manager
 from .metrics import start_metrics_server
 
+_startup_notice_sent_at: dict[tuple[int, int | None], datetime] = {}
+
 
 def mark_good_commit() -> None:
     """Mark current git commit as known-good after successful startup."""
@@ -115,6 +117,7 @@ async def send_startup_notification(bot: Bot, commit: str | None = None) -> None
             if target_thread_id is not None:
                 kwargs["message_thread_id"] = target_thread_id
             await bot.send_message(**kwargs)
+            _startup_notice_sent_at[(target_chat_id, target_thread_id)] = datetime.now(timezone.utc)
             logging.info("Sent startup notification to chat=%s thread=%s", target_chat_id, target_thread_id)
         except Exception as e:
             logging.warning("Failed to send startup notification: %s", e)
@@ -155,11 +158,20 @@ async def send_ready_notification(bot: Bot) -> None:
         if target_chat_id is None:
             return
 
-        kwargs = {"chat_id": target_chat_id, "text": "💬 Ready to accept messages."}
-        if target_thread_id is not None:
-            kwargs["message_thread_id"] = target_thread_id
-        await bot.send_message(**kwargs)
-        logging.info("Sent ready notification to chat=%s thread=%s", target_chat_id, target_thread_id)
+        startup_sent_at = _startup_notice_sent_at.get((target_chat_id, target_thread_id))
+        now_utc = datetime.now(timezone.utc)
+        if startup_sent_at and (now_utc - startup_sent_at).total_seconds() < 300:
+            logging.info(
+                "Skipping ready notification for chat=%s thread=%s because startup notice was just sent",
+                target_chat_id,
+                target_thread_id,
+            )
+        else:
+            kwargs = {"chat_id": target_chat_id, "text": "💬 Ready to accept messages."}
+            if target_thread_id is not None:
+                kwargs["message_thread_id"] = target_thread_id
+            await bot.send_message(**kwargs)
+            logging.info("Sent ready notification to chat=%s thread=%s", target_chat_id, target_thread_id)
         await auto_resume_step_plan_after_restart(bot)
     except Exception as e:
         logging.warning("Could not send ready notification: %s", e)

@@ -3,7 +3,9 @@ from __future__ import annotations
 import argparse
 import html
 import json
+import os
 import re
+import secrets
 import shutil
 import subprocess
 from dataclasses import asdict
@@ -26,6 +28,10 @@ def _default_state_path() -> Path:
 
 def _artifact_root() -> Path:
     return config.MEMORY_DIR / "gmail_bootstrap_artifacts"
+
+
+def _gog_keyring_password_path() -> Path:
+    return config.MEMORY_DIR / "gog_keyring_password.txt"
 
 
 def _bootstrap_oauth_credentials_path() -> Path:
@@ -671,8 +677,24 @@ def _validate_credentials_json(raw_text: str) -> dict[str, Any]:
     return payload
 
 
+def _gog_env() -> dict[str, str]:
+    env = os.environ.copy()
+    if env.get("GOG_KEYRING_PASSWORD", "").strip():
+        return env
+    path = _gog_keyring_password_path()
+    if path.exists():
+        password = path.read_text(encoding="utf-8").strip()
+    else:
+        password = secrets.token_urlsafe(32)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(password + "\n", encoding="utf-8")
+        path.chmod(0o600)
+    env["GOG_KEYRING_PASSWORD"] = password
+    return env
+
+
 def _run_gog_command(command: list[str]) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(command, capture_output=True, text=True, check=False)
+    return subprocess.run(command, capture_output=True, text=True, check=False, env=_gog_env())
 
 
 def _extract_first_url(text: str) -> str | None:

@@ -99,14 +99,15 @@ class GmailBootstrapStateStore:
         with self._lock:
             sessions = self._load_all_unlocked()
             now = _now_iso()
+            session_id = str(uuid.uuid4())
             session = GmailBootstrapSession(
-                session_id=str(uuid.uuid4()),
+                session_id=session_id,
                 created_at=now,
                 updated_at=now,
                 phase="oauth_manual_pending",
                 project_id=project_id,
                 project_name=project_name,
-                redirect_uri=redirect_uri,
+                redirect_uri=redirect_uri.format(session_id=session_id),
                 callback_base_url=callback_base_url.rstrip("/"),
                 oauth_client_name=oauth_client_name,
                 telegram_chat_id=telegram_chat_id,

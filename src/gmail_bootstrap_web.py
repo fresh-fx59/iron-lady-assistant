@@ -498,7 +498,7 @@ async def _start_session(request: web.Request) -> web.Response:
     created = store.start_session(
         project_id=project_id,
         project_name=project_name,
-        redirect_uri=f"{callback_base_url}/gmail/oauth/callback",
+        redirect_uri=f"{callback_base_url}/gmail/bootstrap/gog/callback/{{session_id}}",
         callback_base_url=callback_base_url,
         oauth_client_name=oauth_client_name,
         telegram_chat_id=int(telegram_chat_id_raw) if telegram_chat_id_raw else None,
@@ -753,10 +753,9 @@ async def _upload_credentials(request: web.Request) -> web.Response:
     store.record_credentials_uploaded(session_id=session_id, credentials_path=str(credentials_path))
     try:
         _import_gog_credentials(credentials_path)
-        gog_redirect_uri = f"{session.callback_base_url}/gmail/bootstrap/gog/callback/{session_id}"
         auth_url = _start_gog_remote_auth(
             gmail_account_email=gmail_account_email,
-            redirect_uri=gog_redirect_uri,
+            redirect_uri=session.redirect_uri,
         )
         auth_started_session = store.record_gmail_auth_started_for_account(
             session_id=session_id,
@@ -820,7 +819,7 @@ async def _gog_callback(request: web.Request) -> web.Response:
     try:
         _finish_gog_remote_auth(
             gmail_account_email=session.gmail_account_email,
-            redirect_uri=f"{session.callback_base_url}/gmail/bootstrap/gog/callback/{session_id}",
+            redirect_uri=session.redirect_uri,
             auth_url=auth_url,
         )
     except Exception as exc:

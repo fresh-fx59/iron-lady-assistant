@@ -393,7 +393,7 @@ def _render_session_html(base_url: str, session: GmailBootstrapSession) -> str:
     ]
     if session.manual_console_url:
         lines.append(
-            f"<p><strong>Manual checkpoint:</strong> <a href='{session.manual_console_url}'>Google Cloud Console</a></p>"
+            f"<p><strong>Manual checkpoint:</strong> <a href='{session.manual_console_url}' target='_blank' rel='noopener noreferrer'>Google Cloud Console</a></p>"
         )
     if session.failure_reason:
         lines.append(f"<p><strong>Failure detail:</strong> <code>{html.escape(session.failure_reason)}</code></p>")
@@ -450,6 +450,21 @@ def _render_session_html(base_url: str, session: GmailBootstrapSession) -> str:
                 "<label>Gmail account email<input name='gmail_account_email' required placeholder='you@gmail.com'></label>",
                 "<label>client_secret.json<input type='file' name='credentials_file' accept='.json,application/json' required></label>",
                 "<button type='submit'>Upload Credentials and Continue</button>",
+                "</form>",
+            ]
+        )
+    can_retry_gmail_auth = (
+        session.phase in {"failed", "gmail_auth_pending", "credentials_uploaded"}
+        and bool(session.gmail_account_email)
+        and bool(session.credentials_path)
+    )
+    if can_retry_gmail_auth:
+        lines.extend(
+            [
+                "<h2>Retry Gmail Authorization</h2>",
+                "<p>If you changed redirect URIs or fixed OAuth settings, start Google authorization again without uploading files again.</p>",
+                f"<form method='post' action='{base_url}/gmail/bootstrap/session/{session.session_id}/gmail-auth/restart'>",
+                "<button type='submit'>Retry Gmail Authorization</button>",
                 "</form>",
             ]
         )
@@ -792,6 +807,41 @@ async def _upload_bootstrap_credentials(request: web.Request) -> web.Response:
     raise web.HTTPFound(location=f"/gmail/bootstrap/session/{session_id}")
 
 
+async def _restart_gmail_authorization(request: web.Request) -> web.Response:
+    store: GmailBootstrapStateStore = request.app["gmail_bootstrap_store"]
+    session_id = request.match_info["session_id"]
+    session = store.get(session_id)
+    if session is None:
+        raise web.HTTPNotFound(text="Unknown bootstrap session.")
+    if not session.gmail_account_email:
+        raise web.HTTPBadRequest(text="gmail_account_email is missing for this session.")
+    if not session.credentials_path:
+        raise web.HTTPBadRequest(text="credentials_path is missing for this session.")
+    credentials_path = Path(session.credentials_path)
+    if not credentials_path.exists():
+        raise web.HTTPBadRequest(text=f"credentials file not found: {credentials_path}")
+    try:
+        _import_gog_credentials(credentials_path)
+        auth_url = _start_gog_remote_auth(
+            gmail_account_email=session.gmail_account_email,
+            redirect_uri=session.redirect_uri,
+        )
+        started = store.record_gmail_auth_started_for_account(
+            session_id=session_id,
+            gmail_account_email=session.gmail_account_email,
+        )
+        await _notify_telegram_for_session(store, started)
+    except Exception as exc:
+        failed_session = store.record_failed(
+            session_id=session_id,
+            reason=f"gog_remote_restart_failed:{exc}",
+            guidance="Could not restart Gmail authorization. Confirm OAuth redirect URI and uploaded credentials, then retry.",
+        )
+        await _notify_telegram_for_session(store, failed_session)
+        raise web.HTTPFound(location=f"/gmail/bootstrap/session/{session_id}")
+    raise web.HTTPFound(location=auth_url)
+
+
 async def _gog_callback(request: web.Request) -> web.Response:
     store: GmailBootstrapStateStore = request.app["gmail_bootstrap_store"]
     session_id = request.match_info["session_id"]
@@ -871,6 +921,7 @@ def create_app(*, state_path: Path | None = None) -> web.Application:
             web.get("/gmail/bootstrap/google/callback", _google_callback),
             web.post("/gmail/bootstrap/session/{session_id}/bootstrap-credentials/upload", _upload_bootstrap_credentials),
             web.post("/gmail/bootstrap/session/{session_id}/credentials/upload", _upload_credentials),
+            web.post("/gmail/bootstrap/session/{session_id}/gmail-auth/restart", _restart_gmail_authorization),
             web.get("/gmail/bootstrap/gog/callback/{session_id}", _gog_callback),
             web.get("/gmail/bootstrap/session/{session_id}", _session_page),
             web.get("/gmail/bootstrap/api/session/{session_id}", _session_status),

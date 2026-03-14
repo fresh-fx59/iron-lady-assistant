@@ -157,6 +157,47 @@ def test_render_session_html_includes_manual_checklist_and_upload_form(tmp_path)
     assert "Manual Google Cloud Console checkpoint" in html
 
 
+def test_render_session_html_manual_console_link_opens_new_tab() -> None:
+    session = GmailBootstrapSession(
+        session_id="sess-1",
+        created_at="2026-03-13T10:00:00+00:00",
+        updated_at="2026-03-13T10:00:00+00:00",
+        phase="oauth_manual_pending",
+        project_id="ila-demo-project",
+        project_name="ILA Demo Project",
+        redirect_uri="https://bot.example.com/gmail/bootstrap/gog/callback/sess-1",
+        callback_base_url="https://bot.example.com",
+        oauth_client_name="ILA Gmail OAuth",
+        manual_console_url="https://console.cloud.google.com/apis/credentials?project=ila-demo-project",
+    )
+
+    html = _render_session_html("https://bot.example.com", session)
+
+    assert "target='_blank'" in html
+    assert "Google Cloud Console" in html
+
+
+def test_render_session_html_shows_retry_button_when_credentials_and_email_exist() -> None:
+    session = GmailBootstrapSession(
+        session_id="sess-1",
+        created_at="2026-03-13T10:00:00+00:00",
+        updated_at="2026-03-13T10:00:00+00:00",
+        phase="failed",
+        project_id="ila-demo-project",
+        project_name="ILA Demo Project",
+        redirect_uri="https://bot.example.com/gmail/bootstrap/gog/callback/sess-1",
+        callback_base_url="https://bot.example.com",
+        oauth_client_name="ILA Gmail OAuth",
+        gmail_account_email="alex@gmail.com",
+        credentials_path="/tmp/client_secret.json",
+    )
+
+    html = _render_session_html("https://bot.example.com", session)
+
+    assert "Retry Gmail Authorization" in html
+    assert "/gmail/bootstrap/session/sess-1/gmail-auth/restart" in html
+
+
 def test_render_session_html_for_google_auth_failure_omits_upload_form() -> None:
     session = GmailBootstrapSession(
         session_id="sess-1",

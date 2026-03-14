@@ -895,6 +895,26 @@ async def _gog_callback(request: web.Request) -> web.Response:
             auth_url=auth_url,
         )
     except Exception as exc:
+        error_text = str(exc)
+        # Self-heal once for common non-interactive keyring failures by immediately restarting auth.
+        if "keyring" in error_text.lower() and "gog_keyring_password" in error_text.lower():
+            try:
+                if session.credentials_path:
+                    _import_gog_credentials(Path(session.credentials_path))
+                retry_auth_url = _start_gog_remote_auth(
+                    gmail_account_email=session.gmail_account_email,
+                    redirect_uri=session.redirect_uri,
+                )
+                retried = store.record_gmail_auth_started_for_account(
+                    session_id=session_id,
+                    gmail_account_email=session.gmail_account_email,
+                )
+                await _notify_telegram_for_session(store, retried)
+                raise web.HTTPFound(location=retry_auth_url)
+            except web.HTTPException:
+                raise
+            except Exception:
+                pass
         result_session = store.record_failed(
             session_id=session_id,
             reason=f"gog_remote_finish_failed:{exc}",

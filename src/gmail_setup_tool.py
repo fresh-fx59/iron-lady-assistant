@@ -328,7 +328,7 @@ def build_manual_checklist(
             "",
             "## Finish locally",
             "1. Save the file as `client_secret.json` in the same bootstrap directory.",
-            "2. Run `python -m src.gmail_setup_tool authorize --account you@gmail.com` if you want shared-mode import, or future self-hosted import flow.",
+            "2. Return to the Gmail Connect session page and use the UI flow (`Upload Credentials and Continue`, then `Retry Gmail Authorization` if needed).",
             "",
             "Note: this manual checkpoint exists because Google does not expose full generic OAuth client creation for Gmail via public automation APIs.",
         ]

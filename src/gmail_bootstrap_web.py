@@ -310,10 +310,19 @@ def _render_markdown_checklist(markdown_text: str) -> str:
 
 
 def _manual_checklist_text(session: GmailBootstrapSession) -> str | None:
+    legacy_line = (
+        "2. Run `python -m src.gmail_setup_tool authorize --account you@gmail.com` "
+        "if you want shared-mode import, or future self-hosted import flow."
+    )
+    replacement_line = (
+        "2. Return to the Gmail Connect session page and use the UI flow "
+        "(`Upload Credentials and Continue`, then `Retry Gmail Authorization` if needed)."
+    )
     if session.manual_checklist_path:
         path = Path(session.manual_checklist_path)
         if path.exists():
-            return path.read_text(encoding="utf-8")
+            text = path.read_text(encoding="utf-8")
+            return text.replace(legacy_line, replacement_line)
     if session.phase not in {"oauth_manual_pending", "credentials_uploaded", "gmail_auth_pending", "completed"}:
         return None
     return build_manual_checklist(

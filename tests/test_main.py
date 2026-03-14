@@ -9,32 +9,33 @@ from src import main
 
 
 @pytest.mark.asyncio
-async def test_send_startup_notification_sends_boot_message_only(monkeypatch) -> None:
+async def test_send_startup_notification_does_not_send_message(monkeypatch) -> None:
     bot = AsyncMock()
     monkeypatch.setattr(main, "ALLOWED_USER_IDS", {12345})
 
     await main.send_startup_notification(bot, commit="abc12345")
 
-    assert bot.send_message.await_count == 1
-    first = bot.send_message.await_args_list[0].kwargs
-
-    assert first["chat_id"] == 12345
-    assert "Bot restarted" in first["text"]
-    assert "Starting up" in first["text"]
+    bot.send_message.assert_not_awaited()
 
 
 @pytest.mark.asyncio
-async def test_send_ready_notification_separate_message(monkeypatch) -> None:
+async def test_send_ready_notification_only_runs_resume_hook(monkeypatch) -> None:
     bot = AsyncMock()
     monkeypatch.setattr(main, "ALLOWED_USER_IDS", {12345})
     main._startup_notice_sent_at.clear()
+    resumed = False
+
+    async def fake_auto_resume(_bot) -> bool:
+        nonlocal resumed
+        resumed = True
+        return True
+
+    monkeypatch.setattr(main, "auto_resume_step_plan_after_restart", fake_auto_resume)
 
     await main.send_ready_notification(bot)
 
-    bot.send_message.assert_awaited_once_with(
-        chat_id=12345,
-        text="💬 Ready to accept messages.",
-    )
+    bot.send_message.assert_not_awaited()
+    assert resumed is True
 
 
 @pytest.mark.asyncio
@@ -47,23 +48,6 @@ async def test_send_ready_notification_skips_immediate_duplicate_after_startup(m
     await main.send_ready_notification(bot)
 
     bot.send_message.assert_not_awaited()
-
-
-@pytest.mark.asyncio
-async def test_send_startup_notification_prefers_latest_scope_thread(monkeypatch) -> None:
-    bot = AsyncMock()
-    monkeypatch.setattr(main, "ALLOWED_USER_IDS", set())
-    monkeypatch.setattr(main.bot_module, "_load_step_plan_state", lambda: {}, raising=False)
-    monkeypatch.setattr(main.bot_module, "_latest_scope_target", lambda: (-100123, 77), raising=False)
-    monkeypatch.setattr(main.bot_module.config, "ALLOWED_CHAT_IDS", {-100123})
-
-    await main.send_startup_notification(bot, commit="abc12345")
-
-    bot.send_message.assert_awaited_once()
-    kwargs = bot.send_message.await_args.kwargs
-    assert kwargs["chat_id"] == -100123
-    assert kwargs["message_thread_id"] == 77
-    assert "Bot restarted" in kwargs["text"]
 
 
 def test_ensure_worklog_git_hook_configures_hooks_path(monkeypatch, tmppath) -> None:

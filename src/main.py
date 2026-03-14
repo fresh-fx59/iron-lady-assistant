@@ -111,108 +111,19 @@ def ensure_worklog_git_hook() -> None:
 
 
 async def send_startup_notification(bot: Bot, commit: str | None = None) -> None:
-    """Send startup notification to active step-plan thread or first admin."""
-    if not ALLOWED_USER_IDS and not getattr(bot_module.config, "ALLOWED_CHAT_IDS", set()):
-        return
-
-    try:
-        target_chat_id: int | None = None
-        target_thread_id: int | None = None
-        try:
-            state = bot_module._load_step_plan_state()  # noqa: SLF001
-            if state.get("active"):
-                chat_id = int(state.get("chat_id") or 0)
-                if chat_id:
-                    target_chat_id = chat_id
-                    target_thread_id = state.get("message_thread_id")
-        except Exception:
-            logging.debug("Could not resolve step-plan notification target", exc_info=True)
-
-        if target_chat_id is None:
-            try:
-                latest_scope_target = bot_module._latest_scope_target()  # noqa: SLF001
-                if latest_scope_target:
-                    target_chat_id, target_thread_id = latest_scope_target
-            except Exception:
-                logging.debug("Could not resolve latest scope notification target", exc_info=True)
-
-        if target_chat_id is None and ALLOWED_USER_IDS:
-            target_chat_id = min(ALLOWED_USER_IDS)
-        if target_chat_id is None and bot_module.config.ALLOWED_CHAT_IDS:
-            target_chat_id = min(bot_module.config.ALLOWED_CHAT_IDS)
-        if target_chat_id is None:
-            return
-
-        lines = ["🚀 <b>Bot restarted</b>\n"]
-        lines.append(f"📦 Version: <code>{VERSION}</code>")
-        if commit:
-            lines.append(f"📦 Commit: <code>{commit}</code>")
-        lines.append("\n⏳ Starting up...")
-        startup_message = "\n".join(lines)
-
-        try:
-            kwargs = {"chat_id": target_chat_id, "text": startup_message, "parse_mode": "HTML"}
-            if target_thread_id is not None:
-                kwargs["message_thread_id"] = target_thread_id
-            await bot.send_message(**kwargs)
-            _startup_notice_sent_at[(target_chat_id, target_thread_id)] = datetime.now(timezone.utc)
-            logging.info("Sent startup notification to chat=%s thread=%s", target_chat_id, target_thread_id)
-        except Exception as e:
-            logging.warning("Failed to send startup notification: %s", e)
-
-    except Exception as e:
-        logging.warning("Could not send startup notification: %s", e)
+    """Keep restart details in logs without posting Telegram startup notices."""
+    del bot
+    _startup_notice_sent_at.clear()
+    logging.info("Bot restarted at version=%s commit=%s", VERSION, commit or "unknown")
 
 
 async def send_ready_notification(bot: Bot) -> None:
-    """Send ready notification when polling loop is started."""
-    if not ALLOWED_USER_IDS and not getattr(bot_module.config, "ALLOWED_CHAT_IDS", set()):
-        return
+    """Resume queued work once polling starts without posting Telegram notices."""
     try:
-        target_chat_id: int | None = None
-        target_thread_id: int | None = None
-        try:
-            state = bot_module._load_step_plan_state()  # noqa: SLF001
-            if state.get("active"):
-                chat_id = int(state.get("chat_id") or 0)
-                if chat_id:
-                    target_chat_id = chat_id
-                    target_thread_id = state.get("message_thread_id")
-        except Exception:
-            logging.debug("Could not resolve step-plan ready notification target", exc_info=True)
-
-        if target_chat_id is None:
-            try:
-                latest_scope_target = bot_module._latest_scope_target()  # noqa: SLF001
-                if latest_scope_target:
-                    target_chat_id, target_thread_id = latest_scope_target
-            except Exception:
-                logging.debug("Could not resolve latest scope ready target", exc_info=True)
-
-        if target_chat_id is None and ALLOWED_USER_IDS:
-            target_chat_id = min(ALLOWED_USER_IDS)
-        if target_chat_id is None and bot_module.config.ALLOWED_CHAT_IDS:
-            target_chat_id = min(bot_module.config.ALLOWED_CHAT_IDS)
-        if target_chat_id is None:
-            return
-
-        startup_sent_at = _startup_notice_sent_at.get((target_chat_id, target_thread_id))
-        now_utc = datetime.now(timezone.utc)
-        if startup_sent_at and (now_utc - startup_sent_at).total_seconds() < 300:
-            logging.info(
-                "Skipping ready notification for chat=%s thread=%s because startup notice was just sent",
-                target_chat_id,
-                target_thread_id,
-            )
-        else:
-            kwargs = {"chat_id": target_chat_id, "text": "💬 Ready to accept messages."}
-            if target_thread_id is not None:
-                kwargs["message_thread_id"] = target_thread_id
-            await bot.send_message(**kwargs)
-            logging.info("Sent ready notification to chat=%s thread=%s", target_chat_id, target_thread_id)
+        _startup_notice_sent_at.clear()
         await auto_resume_step_plan_after_restart(bot)
     except Exception as e:
-        logging.warning("Could not send ready notification: %s", e)
+        logging.warning("Could not finish restart-ready hook: %s", e)
 
 
 async def replay_queued_turns_once(bot: Bot) -> int:

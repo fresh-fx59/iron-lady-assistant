@@ -664,6 +664,7 @@ class TaskManager:
     def _task_provider(self, task: BackgroundTask):
         if self._provider_manager is None:
             return None
+        self._ensure_task_provider_scope(task)
         return self._provider_manager.get_provider(self._task_scope_key(task))
 
     def _task_subprocess_env(self, task: BackgroundTask) -> dict[str, str] | None:
@@ -677,10 +678,45 @@ class TaskManager:
             return False
         return bool(error_text) and self._provider_manager.is_rate_limit_error(error_text)
 
+    def _ensure_task_provider_scope(self, task: BackgroundTask) -> None:
+        if self._provider_manager is None:
+            return
+
+        scope_key = self._task_scope_key(task)
+        current_provider = self._provider_manager.get_provider(scope_key)
+        current_cli = getattr(current_provider, "cli", None)
+        if current_cli == task.provider_cli:
+            return
+
+        matched_provider = None
+        for provider in getattr(self._provider_manager, "providers", []):
+            if getattr(provider, "cli", None) == task.provider_cli or getattr(provider, "name", None) == task.provider_cli:
+                matched_provider = provider
+                break
+
+        if matched_provider is None:
+            logger.warning(
+                "Background task %s could not align provider scope for provider_cli=%s",
+                task.id,
+                task.provider_cli,
+            )
+            return
+
+        self._provider_manager.set_provider(scope_key, matched_provider.name)
+        logger.info(
+            "Aligned background task %s scope %s from provider_cli=%s to provider=%s (cli=%s)",
+            task.id,
+            scope_key,
+            current_cli,
+            matched_provider.name,
+            matched_provider.cli,
+        )
+
     def _advance_task_provider(self, task: BackgroundTask) -> bool:
         if self._provider_manager is None:
             return False
 
+        self._ensure_task_provider_scope(task)
         scope_key = self._task_scope_key(task)
         next_provider = self._provider_manager.advance(scope_key)
         if next_provider is None:

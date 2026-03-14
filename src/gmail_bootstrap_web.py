@@ -171,7 +171,7 @@ def _phase_label(session: GmailBootstrapSession) -> str:
     labels = {
         "cloud_auth_pending": "Google sign-in needed",
         "cloud_auth_granted": "Preparing your Google Cloud project",
-        "oauth_manual_pending": "Manual Google Cloud step needed",
+        "oauth_manual_pending": "Gmail OAuth setup needed",
         "credentials_uploaded": "Finishing Gmail authorization",
         "gmail_auth_pending": "Waiting for Gmail authorization callback",
         "completed": "Gmail connected",
@@ -186,7 +186,7 @@ def _phase_message(session: GmailBootstrapSession) -> str:
     if session.phase == "cloud_auth_granted":
         return "Google sign-in succeeded. The wizard is preparing your Google Cloud project."
     if session.phase == "oauth_manual_pending":
-        return "Automatic setup is done. Complete the one Google Cloud Console checkpoint, then upload the downloaded credentials file."
+        return "Create the OAuth client in Google Cloud Console, then upload client_secret.json to continue Gmail authorization."
     if session.phase == "credentials_uploaded":
         return "Credentials were uploaded. The wizard is starting Gmail account authorization."
     if session.phase == "gmail_auth_pending":
@@ -412,7 +412,7 @@ def _render_session_html(base_url: str, session: GmailBootstrapSession) -> str:
         lines.append(
             f"<p class='actions'><strong>Next action:</strong> <a href='{auth_url}'>Continue with Google sign-in</a></p>"
         )
-    if not oauth_credentials:
+    if not oauth_credentials and session.phase in {"cloud_auth_pending", "failed"}:
         google_callback_uri = f"{session.callback_base_url}/gmail/bootstrap/google/callback"
         lines.extend(
             [
@@ -466,7 +466,7 @@ async def _landing(request: web.Request) -> web.Response:
     body = (
         "<div class='card'>"
         "<h1>Connect Gmail</h1>"
-        "<p>This browser-first wizard creates a local bootstrap session on your own host.</p>"
+        "<p>This browser-first wizard starts a Gmail-only setup session on your own host.</p>"
         f"<form method='post' action='{base_url}/gmail/bootstrap/start'>"
         "<label>Project ID<input name='project_id' required value='ila-gmail-demo'></label>"
         "<label>Project Name<input name='project_name' required value='Iron Lady Assistant Gmail'></label>"
@@ -495,7 +495,7 @@ async def _start_session(request: web.Request) -> web.Response:
     if not project_id:
         raise web.HTTPBadRequest(text="project_id is required")
 
-    session = store.start_session(
+    created = store.start_session(
         project_id=project_id,
         project_name=project_name,
         redirect_uri=f"{callback_base_url}/gmail/oauth/callback",
@@ -504,17 +504,27 @@ async def _start_session(request: web.Request) -> web.Response:
         telegram_chat_id=int(telegram_chat_id_raw) if telegram_chat_id_raw else None,
         telegram_thread_id=int(telegram_thread_id_raw) if telegram_thread_id_raw else None,
     )
+    artifact_dir = _session_artifact_dir(created.session_id)
+    checklist_path = artifact_dir / "MANUAL_CHECKLIST.md"
+    checklist_path.write_text(
+        build_manual_checklist(
+            project_id=created.project_id,
+            project_name=created.project_name,
+            redirect_uri=created.redirect_uri,
+            oauth_client_name=created.oauth_client_name,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    session = store.record_project_bootstrap(
+        session_id=created.session_id,
+        manual_console_url="https://console.cloud.google.com/apis/credentials",
+        manual_checklist_path=str(checklist_path),
+    )
+    if session is None:
+        raise web.HTTPInternalServerError(text="Failed to initialize Gmail setup session.")
     if request.content_type == "application/json":
         return web.json_response(_session_payload(callback_base_url, session), status=201)
-    oauth_credentials = _bootstrap_oauth_credentials()
-    if oauth_credentials:
-        client_id, _ = oauth_credentials
-        raise web.HTTPFound(
-            location=build_google_auth_url(
-                session=session,
-                client_id=client_id,
-            )
-        )
     raise web.HTTPFound(location=f"/gmail/bootstrap/session/{session.session_id}")
 
 

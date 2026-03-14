@@ -103,7 +103,7 @@ class GmailBootstrapStateStore:
                 session_id=str(uuid.uuid4()),
                 created_at=now,
                 updated_at=now,
-                phase="cloud_auth_pending",
+                phase="oauth_manual_pending",
                 project_id=project_id,
                 project_name=project_name,
                 redirect_uri=redirect_uri,

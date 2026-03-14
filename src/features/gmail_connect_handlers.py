@@ -168,17 +168,10 @@ async def cmd_gmail_connect(
         "Gmail setup is ready.",
         "",
         "1. Open the setup page.",
-        "2. Continue with Google sign-in.",
-        "3. Complete the Google Cloud manual step and upload the credentials file.",
-        "4. Return here for final confirmation.",
+        "2. Complete the Google Cloud OAuth client step shown on the page.",
+        "3. Upload client_secret.json and enter your Gmail account.",
+        "4. Finish Gmail authorization and return here for confirmation.",
     ]
-    if not session.get("google_auth_url"):
-        lines.extend(
-            [
-                "",
-                "Note: the bootstrap Google OAuth client is not configured yet, so the page will show the missing prerequisite.",
-            ]
-        )
     kb = InlineKeyboardBuilder()
     kb.button(text="Open Gmail Setup", url=session_url)
     await message.answer("\n".join(lines), reply_markup=kb.as_markup())

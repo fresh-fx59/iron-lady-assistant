@@ -16,7 +16,7 @@ def test_start_session_persists_browser_first_bootstrap_state(tmp_path) -> None:
         telegram_thread_id=456,
     )
 
-    assert session.phase == "cloud_auth_pending"
+    assert session.phase == "oauth_manual_pending"
     assert session.project_id == "ila-demo-project"
     assert session.telegram_chat_id == 123
     assert session.telegram_thread_id == 456

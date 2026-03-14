@@ -130,6 +130,9 @@ TIMEOUT="${TIMEOUT:-300}"
 read -rp "Metrics port (press Enter for 9101): " METRICS_PORT
 METRICS_PORT="${METRICS_PORT:-9101}"
 
+read -rp "Browser takeover public base URL (optional, e.g. https://your-host.example/browser-takeover): " BROWSER_TAKEOVER_PUBLIC_BASE_URL
+BROWSER_TAKEOVER_PUBLIC_BASE_URL="${BROWSER_TAKEOVER_PUBLIC_BASE_URL:-}"
+
 read -rp "Run recurring schedules in a separate scheduler service? [y/N]: " EXTERNAL_SCHEDULER
 EXTERNAL_SCHEDULER="${EXTERNAL_SCHEDULER:-N}"
 
@@ -161,6 +164,7 @@ DEFAULT_MODEL=$DEFAULT_MODEL
 CLAUDE_WORKING_DIR=$WORKING_DIR
 MAX_RESPONSE_TIMEOUT=$TIMEOUT
 METRICS_PORT=$METRICS_PORT
+BROWSER_TAKEOVER_PUBLIC_BASE_URL=$BROWSER_TAKEOVER_PUBLIC_BASE_URL
 EMBEDDED_SCHEDULER_ENABLED=$([[ "$EXTERNAL_SCHEDULER" =~ ^[Yy]$ ]] && echo 0 || echo 1)
 SCHEDULER_NOTIFY_CHAT_ID=$SCHEDULER_NOTIFY_CHAT_ID
 SCHEDULER_NOTIFY_THREAD_ID=$SCHEDULER_NOTIFY_THREAD_ID
@@ -292,6 +296,12 @@ echo -e "  ${BOLD}Start the bot:${NC}      ./run.sh"
 echo -e "  ${BOLD}Open Telegram:${NC}      Search for your bot by its username"
 echo -e "  ${BOLD}Send a message:${NC}     Say hello and start chatting!"
 echo ""
+if [ -n "$BROWSER_TAKEOVER_PUBLIC_BASE_URL" ]; then
+    echo -e "  ${BOLD}Browser takeover:${NC}  python3 -m src.browser_takeover setup"
+    echo -e "                     python3 -m src.browser_takeover serve --host 0.0.0.0 --port 18792"
+    echo -e "                     (uses BROWSER_TAKEOVER_PUBLIC_BASE_URL from .env)"
+    echo ""
+fi
 echo -e "  ${BOLD}Bot commands:${NC}"
 echo "    /start   — Welcome message"
 echo "    /new     — Start a fresh conversation"

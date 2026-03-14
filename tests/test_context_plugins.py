@@ -206,5 +206,5 @@ def test_browser_takeover_manifest_exposes_remote_bridge_commands() -> None:
 
     assert manifest["tier"] == "extended"
     assert "browser extension" in manifest["triggers"]
-    assert "python3 -m src.browser_takeover setup --public-base-url" in manifest["instructions"]
+    assert "BROWSER_TAKEOVER_PUBLIC_BASE_URL=https://YOUR-HOST/browser-takeover python3 -m src.browser_takeover setup" in manifest["instructions"]
     assert "python3 -m src.browser_takeover targets --format json" in manifest["instructions"]

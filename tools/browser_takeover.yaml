@@ -16,11 +16,11 @@ instructions: |
   - Install/update the unpacked extension and print setup instructions:
     `python3 -m src.browser_takeover setup`
   - Same as above, but for a browser running on another machine:
-    `python3 -m src.browser_takeover setup --public-base-url https://YOUR-HOST/browser-takeover`
+    `BROWSER_TAKEOVER_PUBLIC_BASE_URL=https://YOUR-HOST/browser-takeover python3 -m src.browser_takeover setup`
   - Start the relay locally:
     `python3 -m src.browser_takeover serve`
   - Start the relay for remote browser access:
-    `python3 -m src.browser_takeover serve --host 0.0.0.0 --port 18792 --public-base-url https://YOUR-HOST/browser-takeover`
+    `BROWSER_TAKEOVER_PUBLIC_BASE_URL=https://YOUR-HOST/browser-takeover python3 -m src.browser_takeover serve --host 0.0.0.0 --port 18792`
   - List attached tabs:
     `python3 -m src.browser_takeover targets --format json`
   - Navigate an attached tab:
@@ -45,6 +45,7 @@ instructions: |
   - The relay process runs on the assistant host and exposes HTTP + websocket endpoints protected by a bearer token.
   - For a browser on another machine, the relay must be reachable over an external `http(s)` URL; the extension automatically converts it to `ws(s)`.
   - Public path prefixes like `https://host/browser-takeover` are supported directly by the relay.
+  - Persist `BROWSER_TAKEOVER_PUBLIC_BASE_URL` in `.env` on the host for stable guided deployment.
 
   Safety:
   - Only act on tabs that the user intentionally attached.

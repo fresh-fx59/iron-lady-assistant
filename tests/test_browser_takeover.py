@@ -47,6 +47,23 @@ def test_build_setup_payload_prefers_public_base_url(tmp_path: Path, monkeypatch
     assert payload["relay_ws_url"] == "wss://ila.example/browser"
 
 
+def test_build_setup_payload_uses_env_public_base_url(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    bundled = tmp_path / "bundled"
+    bundled.mkdir()
+    (bundled / "manifest.json").write_text('{"manifest_version":3}', encoding="utf-8")
+    (bundled / "background.js").write_text("console.log('ok')\n", encoding="utf-8")
+
+    monkeypatch.setattr(browser_takeover, "_default_state_root", lambda: tmp_path / "state")
+    monkeypatch.setattr(browser_takeover, "_repo_root", lambda: tmp_path / "repo")
+    monkeypatch.setattr(browser_takeover, "_bundled_extension_dir", lambda: bundled)
+    monkeypatch.setenv("BROWSER_TAKEOVER_PUBLIC_BASE_URL", "https://ila.example/browser-takeover")
+
+    payload = browser_takeover.build_setup_payload()
+
+    assert payload["relay_url"] == "https://ila.example/browser-takeover"
+    assert payload["relay_ws_url"] == "wss://ila.example/browser-takeover"
+
+
 def test_main_targets_reports_relay_errors(monkeypatch: pytest.MonkeyPatch, capsys) -> None:
     monkeypatch.setattr(browser_takeover, "_request_json", lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("relay down")))
 

@@ -169,17 +169,67 @@ Remote personal-computer path:
 
 ```bash
 cd /home/claude-developer/iron-lady-assistant
-python3 -m src.browser_takeover setup --public-base-url https://YOUR-HOST/browser-takeover
-python3 -m src.browser_takeover serve --host 0.0.0.0 --port 18792 --public-base-url https://YOUR-HOST/browser-takeover
+export BROWSER_TAKEOVER_PUBLIC_BASE_URL=https://YOUR-HOST/browser-takeover
+python3 -m src.browser_takeover setup
+python3 -m src.browser_takeover serve --host 0.0.0.0 --port 18792
 ```
 
 Notes:
-- `--public-base-url` is for the browser extension running on another machine; it must be an externally reachable `http(s)` URL that forwards to the relay
+- `BROWSER_TAKEOVER_PUBLIC_BASE_URL` (or `--public-base-url`) is for the browser extension running on another machine; it must be an externally reachable `http(s)` URL that forwards to the relay
 - Path prefixes such as `https://YOUR-HOST/browser-takeover` are supported directly by the relay, so reverse proxies do not need to strip the prefix
 - The extension converts that URL to `ws(s)` automatically for the live bridge
 - The relay token is required for both the extension websocket and CLI calls
 - Once a tab is attached, you can inspect it with `python3 -m src.browser_takeover targets`
 - High-level commands currently available: `navigate`, `snapshot`, `click`, `type`, `wait-selector`, `wait-text`, and raw `cdp`
+
+### Guided Host Wiring (Remote Browser)
+
+1. Persist relay URL in `.env`:
+
+```bash
+BROWSER_TAKEOVER_PUBLIC_BASE_URL=https://YOUR-HOST/browser-takeover
+```
+
+2. Run relay as a service on the host (example unit):
+
+```ini
+[Unit]
+Description=Iron Lady Browser Takeover Relay
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=claude-developer
+WorkingDirectory=/home/claude-developer/iron-lady-assistant
+EnvironmentFile=/home/claude-developer/iron-lady-assistant/.env
+ExecStart=/home/claude-developer/iron-lady-assistant/venv/bin/python3 -m src.browser_takeover serve --host 127.0.0.1 --port 18792
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
+```
+
+3. Reverse-proxy `https://YOUR-HOST/browser-takeover` to `http://127.0.0.1:18792` without stripping the prefix.
+
+Nginx example:
+
+```nginx
+location /browser-takeover/ {
+    proxy_pass http://127.0.0.1:18792;
+    proxy_http_version 1.1;
+    proxy_set_header Upgrade $http_upgrade;
+    proxy_set_header Connection "upgrade";
+    proxy_set_header Host $host;
+}
+```
+
+4. On the assistant host, refresh extension config and print install steps:
+
+```bash
+python3 -m src.browser_takeover setup
+```
 
 ### Alternative: Manual Setup
 

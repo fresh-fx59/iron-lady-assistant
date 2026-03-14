@@ -16,10 +16,12 @@ from urllib.parse import parse_qsl, urlencode, urljoin, urlparse, urlunparse
 from urllib import error, request
 
 from aiohttp import ClientSession, WSMsgType, web
+from dotenv import load_dotenv
 
 
 DEFAULT_PORT = 18792
 DEFAULT_HOST = "127.0.0.1"
+PUBLIC_BASE_URL_ENV = "BROWSER_TAKEOVER_PUBLIC_BASE_URL"
 
 
 def _default_state_root() -> Path:
@@ -31,6 +33,9 @@ def _default_state_root() -> Path:
 
 def _repo_root() -> Path:
     return Path(__file__).resolve().parent.parent
+
+
+load_dotenv(dotenv_path=_repo_root() / ".env", override=False)
 
 
 def _state_dir() -> Path:
@@ -83,18 +88,29 @@ class RelayState:
 RELAY_STATE_KEY = web.AppKey("relay_state", RelayState)
 
 
+def _env_public_base_url() -> str:
+    raw = os.environ.get(PUBLIC_BASE_URL_ENV, "")
+    if not raw.strip():
+        return ""
+    return _normalize_public_base_url(raw)
+
+
 def _load_settings() -> RelaySettings:
     path = _config_path()
     path.parent.mkdir(parents=True, exist_ok=True)
     if path.exists():
         raw = json.loads(path.read_text(encoding="utf-8"))
+        file_public_base_url = str(raw.get("public_base_url") or "")
         return RelaySettings(
             host=str(raw.get("host") or DEFAULT_HOST),
             port=int(raw.get("port") or DEFAULT_PORT),
             token=str(raw.get("token") or ""),
-            public_base_url=str(raw.get("public_base_url") or ""),
+            public_base_url=file_public_base_url or _env_public_base_url(),
         )
-    settings = RelaySettings(token=secrets.token_urlsafe(24))
+    settings = RelaySettings(
+        token=secrets.token_urlsafe(24),
+        public_base_url=_env_public_base_url(),
+    )
     _save_settings(settings)
     return settings
 

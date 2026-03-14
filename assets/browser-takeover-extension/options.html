@@ -1,0 +1,25 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>ILA Browser Takeover</title>
+    <style>
+      body { font-family: system-ui, sans-serif; max-width: 760px; margin: 32px auto; padding: 0 16px; }
+      label { display: block; margin-top: 16px; font-size: 14px; }
+      input { width: 100%; max-width: 360px; padding: 10px; margin-top: 6px; }
+      button { margin-top: 16px; padding: 10px 14px; }
+      code { font-family: ui-monospace, monospace; }
+      #status { margin-top: 12px; color: #444; white-space: pre-wrap; }
+    </style>
+  </head>
+  <body>
+    <h1>ILA Browser Takeover</h1>
+    <p>Run <code>python3 -m src.browser_takeover setup</code>, then copy the relay port and token here.</p>
+    <label>Relay port <input id="port" inputmode="numeric" /></label>
+    <label>Relay token <input id="token" /></label>
+    <button id="save" type="button">Save</button>
+    <div id="status"></div>
+    <script type="module" src="options.js"></script>
+  </body>
+  </html>

@@ -27,5 +27,4 @@ instructions: |
   - If a local browser fails to launch on Linux because of missing shared libraries, keep the wrapper usage the same and switch to a remote provider rather than inventing a second browser stack
 
 setup: |
-  npm install
-  npx agent-browser install
+  python3 -m src.ozon_browser setup

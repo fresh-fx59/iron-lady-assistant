@@ -97,6 +97,35 @@ Notes:
 - If local Linux browser launch fails because of missing shared libraries, keep using the same wrapper but switch to a remote `agent-browser` provider such as `--provider browseruse`, `--provider kernel`, or `--provider browserbase`
 - The final purchase step is intentionally separate and requires `--confirm`
 
+### MacBook Pro Setup (CDP Path)
+
+Start with the repo-local setup helper so the wrapper tells you which path to use on the current machine:
+
+```bash
+cd /home/claude-developer/iron-lady-assistant
+python3 -m src.ozon_browser setup
+```
+
+Then follow the recommended path.
+
+On macOS, the simplest path is to run your normal Chrome and let the wrapper attach over CDP instead of trying to reproduce the Linux host-installer flow.
+
+```bash
+cd /home/claude-developer/iron-lady-assistant
+npm install
+./scripts/start_ozon_chrome_macos.sh
+python3 -m src.ozon_browser --cdp 9222 --session ozon login
+python3 -m src.ozon_browser --cdp 9222 --session ozon orders
+```
+
+Notes:
+- `scripts/install_agent_browser_host.sh` is Linux-only; do not use it on macOS
+- If `npm` is missing, install Node.js 18+ first, for example with `brew install node`
+- The Mac helper looks for `Google Chrome.app`, `Google Chrome for Testing.app`, or `Chromium.app`
+- The Chrome profile stays separate from your main browser profile under `~/.local/state/iron-lady-assistant/ozon-browser/`
+- After Chrome opens, complete Ozon login manually once; later commands reuse that profile
+- You can keep using the same CDP session for `search`, `prepare-buy`, and `place-order --confirm`
+
 ### Lower-Detection Manual Login Path
 
 If Ozon blocks the default Playwright-launched session, try a more normal browser launch and attach over CDP:

@@ -4,6 +4,7 @@ import argparse
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 from dataclasses import dataclass
@@ -21,6 +22,7 @@ ORDER_URL_CANDIDATES = (
     "https://www.ozon.ru/my/orders",
     "https://www.ozon.ru/my/",
 )
+SETUP_FORMATS = ("text", "json")
 
 
 def _default_state_root() -> Path:
@@ -48,6 +50,18 @@ class BrowserConfig:
 
 class BrowserCommandError(RuntimeError):
     pass
+
+
+@dataclass
+class SetupStatus:
+    ok: bool
+    platform: str
+    recommended_path: str
+    repo_root: Path
+    state_root: Path
+    checks: dict[str, bool]
+    commands: list[str]
+    notes: list[str]
 
 
 class OzonBrowser:
@@ -421,6 +435,143 @@ def _click_by_text_script(candidates: list[str]) -> str:
 """.strip()
 
 
+def inspect_setup(repo_root: Path | None = None, platform_name: str | None = None) -> SetupStatus:
+    repo = (repo_root or Path(__file__).resolve().parent.parent).resolve()
+    platform_key = platform_name or sys.platform
+    state_root = _default_state_root() / "iron-lady-assistant" / "ozon-browser"
+    scripts_dir = repo / "scripts"
+
+    checks = {
+        "node": shutil.which("node") is not None,
+        "npm": shutil.which("npm") is not None,
+        "npx": shutil.which("npx") is not None,
+        "repo_agent_browser": (repo / "node_modules" / ".bin" / "agent-browser").exists(),
+        "playwright_cache": (Path.home() / ".cache" / "ms-playwright").exists(),
+        "linux_host_installer": (scripts_dir / "install_agent_browser_host.sh").exists(),
+        "linux_manual_cdp": (scripts_dir / "start_ozon_chrome_display.sh").exists(),
+        "macos_manual_cdp": (scripts_dir / "start_ozon_chrome_macos.sh").exists(),
+    }
+
+    commands = [f"cd {repo}"]
+    notes = [
+        f"Ozon browser state root: {state_root}",
+        "The setup command is inspection-only; it does not launch Chrome or modify root-owned packages.",
+    ]
+
+    if platform_key == "darwin":
+        recommended_path = "macos_cdp"
+        if not checks["repo_agent_browser"]:
+            commands.append("npm install")
+        commands.extend(
+            [
+                "./scripts/start_ozon_chrome_macos.sh",
+                "python3 -m src.ozon_browser --cdp 9222 --session ozon login",
+                "python3 -m src.ozon_browser --cdp 9222 --session ozon orders",
+            ]
+        )
+        notes.append("Recommended path on macOS: launch a normal Chrome profile and attach over CDP.")
+        ok = checks["node"] and checks["npm"] and checks["npx"] and checks["macos_manual_cdp"]
+        return SetupStatus(
+            ok=ok,
+            platform=platform_key,
+            recommended_path=recommended_path,
+            repo_root=repo,
+            state_root=state_root,
+            checks=checks,
+            commands=commands,
+            notes=notes,
+        )
+
+    if platform_key.startswith("linux"):
+        if checks["repo_agent_browser"] and checks["playwright_cache"]:
+            recommended_path = "linux_manual_cdp"
+            commands.extend(
+                [
+                    "./scripts/start_ozon_chrome_display.sh",
+                    "python3 -m src.ozon_browser --cdp 9222 --session ozon login",
+                    "python3 -m src.ozon_browser --cdp 9222 --session ozon orders",
+                ]
+            )
+            notes.append("Repo-local agent-browser assets are present, so the manual Chrome + CDP path is the shortest route.")
+            ok = checks["node"] and checks["npm"] and checks["npx"] and checks["linux_manual_cdp"]
+        else:
+            recommended_path = "linux_host_prepare"
+            commands.extend(
+                [
+                    "bash scripts/install_agent_browser_host.sh",
+                    "./scripts/start_ozon_chrome_display.sh",
+                    "python3 -m src.ozon_browser --cdp 9222 --session ozon login",
+                    "python3 -m src.ozon_browser --cdp 9222 --session ozon orders",
+                ]
+            )
+            notes.append("Repo-local browser bits are incomplete, so start with the host installer before manual Chrome + CDP attach.")
+            ok = (
+                checks["node"]
+                and checks["npm"]
+                and checks["npx"]
+                and checks["linux_host_installer"]
+                and checks["linux_manual_cdp"]
+            )
+        return SetupStatus(
+            ok=ok,
+            platform=platform_key,
+            recommended_path=recommended_path,
+            repo_root=repo,
+            state_root=state_root,
+            checks=checks,
+            commands=commands,
+            notes=notes,
+        )
+
+    recommended_path = "unsupported_platform"
+    notes.append(f"Unsupported platform for the built-in Ozon setup helpers: {platform_key}")
+    return SetupStatus(
+        ok=False,
+        platform=platform_key,
+        recommended_path=recommended_path,
+        repo_root=repo,
+        state_root=state_root,
+        checks=checks,
+        commands=commands,
+        notes=notes,
+    )
+
+
+def _setup_to_payload(status: SetupStatus) -> dict[str, Any]:
+    return {
+        "ok": status.ok,
+        "platform": status.platform,
+        "recommended_path": status.recommended_path,
+        "repo_root": str(status.repo_root),
+        "state_root": str(status.state_root),
+        "checks": status.checks,
+        "commands": status.commands,
+        "notes": status.notes,
+    }
+
+
+def _format_setup_text(status: SetupStatus) -> str:
+    lines = [
+        f"platform: {status.platform}",
+        f"recommended_path: {status.recommended_path}",
+        f"ok: {'yes' if status.ok else 'no'}",
+        f"repo_root: {status.repo_root}",
+        f"state_root: {status.state_root}",
+        "",
+        "checks:",
+    ]
+    for key in sorted(status.checks):
+        lines.append(f"- {key}: {'yes' if status.checks[key] else 'no'}")
+    lines.extend(["", "next_commands:"])
+    for command in status.commands:
+        lines.append(f"- {command}")
+    if status.notes:
+        lines.extend(["", "notes:"])
+        for note in status.notes:
+            lines.append(f"- {note}")
+    return "\n".join(lines)
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Ozon automation wrapper built on top of agent-browser.")
     parser.add_argument("--provider", help="agent-browser provider: browseruse, kernel, browserbase, ios")
@@ -437,6 +588,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--headed", action="store_true", help="Show the browser window instead of headless mode.")
     parser.add_argument("--max-output", type=int, default=12000)
     subparsers = parser.add_subparsers(dest="command", required=True)
+
+    setup_parser = subparsers.add_parser("setup", help="Inspect local Ozon browser prerequisites and print the recommended path.")
+    setup_parser.add_argument("--format", choices=SETUP_FORMATS, default="text")
 
     subparsers.add_parser("login", help="Open the Ozon account page for manual login.")
     subparsers.add_parser("orders", help="Fetch current order statuses from the logged-in Ozon session.")
@@ -487,6 +641,14 @@ def _resolve_config(args: argparse.Namespace) -> BrowserConfig:
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
+    if args.command == "setup":
+        status = inspect_setup()
+        if args.format == "json":
+            print(json.dumps(_setup_to_payload(status), ensure_ascii=False, indent=2))
+        else:
+            print(_format_setup_text(status))
+        return 0
+
     ozon = OzonBrowser(_resolve_config(args))
 
     try:

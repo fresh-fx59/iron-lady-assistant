@@ -3,6 +3,7 @@ from pathlib import Path
 
 import pytest
 
+from src import ozon_browser
 from src.ozon_browser import (
     BrowserCommandError,
     BrowserConfig,
@@ -209,3 +210,72 @@ def test_main_accepts_headed_before_subcommand(
     assert rc == 0
     assert seen["headed"] is True
     assert '"headed": true' in capsys.readouterr().out
+
+
+def test_inspect_setup_prefers_macos_cdp_path(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    scripts = tmp_path / "scripts"
+    scripts.mkdir()
+    (scripts / "start_ozon_chrome_macos.sh").write_text("#!/usr/bin/env bash\n", encoding="utf-8")
+
+    monkeypatch.setattr(ozon_browser, "_default_state_root", lambda: tmp_path / "state")
+    monkeypatch.setattr(
+        ozon_browser.shutil,
+        "which",
+        lambda name: f"/usr/bin/{name}" if name in {"node", "npm", "npx"} else None,
+    )
+
+    status = ozon_browser.inspect_setup(repo_root=tmp_path, platform_name="darwin")
+
+    assert status.recommended_path == "macos_cdp"
+    assert status.ok is True
+    assert "./scripts/start_ozon_chrome_macos.sh" in status.commands
+    assert "python3 -m src.ozon_browser --cdp 9222 --session ozon login" in status.commands
+
+
+def test_inspect_setup_prefers_linux_host_prepare_when_browser_bits_missing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    scripts = tmp_path / "scripts"
+    scripts.mkdir()
+    (scripts / "install_agent_browser_host.sh").write_text("#!/usr/bin/env bash\n", encoding="utf-8")
+    (scripts / "start_ozon_chrome_display.sh").write_text("#!/usr/bin/env bash\n", encoding="utf-8")
+
+    monkeypatch.setattr(ozon_browser, "_default_state_root", lambda: tmp_path / "state")
+    monkeypatch.setattr(
+        ozon_browser.shutil,
+        "which",
+        lambda name: f"/usr/bin/{name}" if name in {"node", "npm", "npx"} else None,
+    )
+    monkeypatch.setattr(ozon_browser.Path, "home", classmethod(lambda cls: tmp_path / "home"))
+
+    status = ozon_browser.inspect_setup(repo_root=tmp_path, platform_name="linux")
+
+    assert status.recommended_path == "linux_host_prepare"
+    assert "bash scripts/install_agent_browser_host.sh" in status.commands
+    assert "./scripts/start_ozon_chrome_display.sh" in status.commands
+
+
+def test_main_setup_json_reports_recommended_path(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys
+) -> None:
+    monkeypatch.setattr(
+        ozon_browser,
+        "inspect_setup",
+        lambda *args, **kwargs: ozon_browser.SetupStatus(
+            ok=True,
+            platform="darwin",
+            recommended_path="macos_cdp",
+            repo_root=tmp_path,
+            state_root=tmp_path / "state",
+            checks={"node": True},
+            commands=["cd /tmp/demo", "./scripts/start_ozon_chrome_macos.sh"],
+            notes=["demo"],
+        ),
+    )
+
+    rc = main(["setup", "--format", "json"])
+
+    assert rc == 0
+    payload = capsys.readouterr().out
+    assert '"recommended_path": "macos_cdp"' in payload
+    assert '"commands": [' in payload

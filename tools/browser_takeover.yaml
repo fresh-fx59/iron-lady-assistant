@@ -38,6 +38,7 @@ instructions: |
   - The browser extension runs in the user's Chrome browser and attaches to a specific tab when the toolbar button is clicked.
   - The relay process runs on the assistant host and exposes HTTP + websocket endpoints protected by a bearer token.
   - For a browser on another machine, the relay must be reachable over an external `http(s)` URL; the extension automatically converts it to `ws(s)`.
+  - Public path prefixes like `https://host/browser-takeover` are supported directly by the relay.
 
   Safety:
   - Only act on tabs that the user intentionally attached.

@@ -180,6 +180,16 @@ def _public_http_base_url(settings: RelaySettings) -> str:
     return _normalize_public_base_url(settings.public_base_url) if settings.public_base_url else ""
 
 
+def _public_path_prefix(settings: RelaySettings) -> str:
+    base = _public_http_base_url(settings)
+    if not base:
+        return ""
+    path = urlparse(base).path.rstrip("/")
+    if not path or path == "/":
+        return ""
+    return path
+
+
 def _client_base_url(settings: RelaySettings) -> str:
     host = settings.host
     if host in {"0.0.0.0", "::"}:
@@ -344,11 +354,17 @@ async def _extension_ws(req: web.Request) -> web.StreamResponse:
 
 def create_app(settings: RelaySettings | None = None) -> web.Application:
     app = web.Application()
-    app[RELAY_STATE_KEY] = RelayState(settings=settings or _load_settings())
-    app.router.add_get("/healthz", _health)
-    app.router.add_get("/targets", _targets)
-    app.router.add_post("/cdp", _cdp)
-    app.router.add_get("/extension", _extension_ws)
+    state_settings = settings or _load_settings()
+    app[RELAY_STATE_KEY] = RelayState(settings=state_settings)
+    prefixes = [""]
+    public_prefix = _public_path_prefix(state_settings)
+    if public_prefix:
+        prefixes.append(public_prefix)
+    for prefix in prefixes:
+        app.router.add_get(f"{prefix}/healthz", _health)
+        app.router.add_get(f"{prefix}/targets", _targets)
+        app.router.add_post(f"{prefix}/cdp", _cdp)
+        app.router.add_get(f"{prefix}/extension", _extension_ws)
     return app
 
 

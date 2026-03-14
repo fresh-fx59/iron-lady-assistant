@@ -185,6 +185,26 @@ async def test_targets_returns_attached_tabs(tmp_path: Path, monkeypatch: pytest
 
 
 @pytest.mark.asyncio
+async def test_targets_accept_public_path_prefix(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(browser_takeover, "_default_state_root", lambda: tmp_path / "state")
+    settings = browser_takeover.RelaySettings(token="secret", public_base_url="https://ila.example/browser-takeover")
+    app = browser_takeover.create_app(settings)
+    app[browser_takeover.RELAY_STATE_KEY].tabs[9] = browser_takeover.AttachedTab(
+        tab_id=9, title="Prefixed", url="https://example.com", attached=True
+    )
+    server = TestServer(app)
+    client = TestClient(server)
+    await client.start_server()
+    try:
+        resp = await client.get("/browser-takeover/targets", headers={"Authorization": "Bearer secret"})
+        assert resp.status == 200
+        payload = await resp.json()
+        assert payload["targets"][0]["tab_id"] == 9
+    finally:
+        await client.close()
+
+
+@pytest.mark.asyncio
 async def test_cdp_requires_connected_extension(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(browser_takeover, "_default_state_root", lambda: tmp_path / "state")
     settings = browser_takeover.RelaySettings(token="secret")

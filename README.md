@@ -167,6 +167,7 @@ python3 -m src.browser_takeover serve --host 0.0.0.0 --port 18792 --public-base-
 
 Notes:
 - `--public-base-url` is for the browser extension running on another machine; it must be an externally reachable `http(s)` URL that forwards to the relay
+- Path prefixes such as `https://YOUR-HOST/browser-takeover` are supported directly by the relay, so reverse proxies do not need to strip the prefix
 - The extension converts that URL to `ws(s)` automatically for the live bridge
 - The relay token is required for both the extension websocket and CLI calls
 - Once a tab is attached, you can inspect it with `python3 -m src.browser_takeover targets`

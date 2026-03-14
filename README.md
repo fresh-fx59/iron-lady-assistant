@@ -284,6 +284,12 @@ GitHub Actions deploys can restart services independently via repo variables:
 
 If all three are unset or false, pushes still deploy code to disk but do not restart any service.
 
+The same workflow also supports manual `workflow_dispatch` runs in GitHub Actions. Each restart target can be set to `inherit`, `true`, or `false` for that run:
+
+- `inherit` — use the repo variable value
+- `true` — force a restart for that service on this run
+- `false` — skip restarting that service on this run
+
 When `RESTART_MAIN_APP_ON_PUSH=true`, deploy restart is drain-aware:
 
 - new interactive requests are queued durably while the deploy barrier is draining;

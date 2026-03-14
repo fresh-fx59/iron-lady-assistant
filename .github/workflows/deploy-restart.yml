@@ -4,6 +4,35 @@ on:
   push:
     branches:
       - main
+  workflow_dispatch:
+    inputs:
+      restart_main_app:
+        description: Restart telegram-bot.service
+        required: false
+        default: inherit
+        type: choice
+        options:
+          - inherit
+          - true
+          - false
+      restart_scheduler:
+        description: Restart telegram-scheduler.service
+        required: false
+        default: inherit
+        type: choice
+        options:
+          - inherit
+          - true
+          - false
+      restart_proxy:
+        description: Restart telegram-proxy.service
+        required: false
+        default: inherit
+        type: choice
+        options:
+          - inherit
+          - true
+          - false
 
 jobs:
   deploy:
@@ -11,6 +40,29 @@ jobs:
     timeout-minutes: 5
 
     steps:
+      - name: Resolve Restart Flags
+        id: restart_flags
+        run: |
+          restart_main_app="${{ vars.RESTART_MAIN_APP_ON_PUSH }}"
+          restart_scheduler="${{ vars.RESTART_SCHEDULER_ON_PUSH }}"
+          restart_proxy="${{ vars.RESTART_PROXY_ON_PUSH }}"
+
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            if [ "${{ inputs.restart_main_app }}" != "inherit" ]; then
+              restart_main_app="${{ inputs.restart_main_app }}"
+            fi
+            if [ "${{ inputs.restart_scheduler }}" != "inherit" ]; then
+              restart_scheduler="${{ inputs.restart_scheduler }}"
+            fi
+            if [ "${{ inputs.restart_proxy }}" != "inherit" ]; then
+              restart_proxy="${{ inputs.restart_proxy }}"
+            fi
+          fi
+
+          echo "restart_main_app=${restart_main_app}" >> "$GITHUB_OUTPUT"
+          echo "restart_scheduler=${restart_scheduler}" >> "$GITHUB_OUTPUT"
+          echo "restart_proxy=${restart_proxy}" >> "$GITHUB_OUTPUT"
+
       - name: Protected Deploy with Rollback
         uses: appleboy/ssh-action@v1.0.0
         with:
@@ -29,7 +81,7 @@ jobs:
             chmod +x ./deploy.sh
 
             # Run protected deploy with independently-controlled restart flags.
-            export RESTART_MAIN_APP="${{ vars.RESTART_MAIN_APP_ON_PUSH }}"
-            export RESTART_SCHEDULER="${{ vars.RESTART_SCHEDULER_ON_PUSH }}"
-            export RESTART_PROXY="${{ vars.RESTART_PROXY_ON_PUSH }}"
+            export RESTART_MAIN_APP="${{ steps.restart_flags.outputs.restart_main_app }}"
+            export RESTART_SCHEDULER="${{ steps.restart_flags.outputs.restart_scheduler }}"
+            export RESTART_PROXY="${{ steps.restart_flags.outputs.restart_proxy }}"
             bash ./deploy.sh

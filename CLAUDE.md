@@ -1,6 +1,6 @@
 # Claude Code as Telegram Assistant
 
-**Current version: `0.32.0`** — defined in `src/config.py` as `VERSION`.
+**Current version: `0.50.1`** — defined in `src/config.py` as `VERSION`.
 
 Telegram bot that bridges messages to Claude Code's `--print` mode via subprocess, providing a conversational AI assistant through Telegram.
 
@@ -232,6 +232,8 @@ Optional GitHub repo variables:
 - `RESTART_MAIN_APP_ON_PUSH` - truthy value to restart `telegram-bot.service`
 - `RESTART_SCHEDULER_ON_PUSH` - truthy value to restart `telegram-scheduler.service`
 - `RESTART_PROXY_ON_PUSH` - truthy value to restart `telegram-proxy.service`
+
+The deploy workflow also exposes manual `workflow_dispatch` inputs for each service restart flag. Each input accepts `inherit`, `true`, or `false`; `inherit` falls back to the corresponding repo variable, while `true` and `false` override it for that run only.
 
 **Setup SSH key for passwordless deploy:**
 ```bash

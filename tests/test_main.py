@@ -9,9 +9,71 @@ from src import main
 
 
 @pytest.mark.asyncio
-async def test_send_startup_notification_does_not_send_message(monkeypatch) -> None:
+async def test_send_startup_notification_sends_message_to_latest_private_chat(monkeypatch) -> None:
     bot = AsyncMock()
     monkeypatch.setattr(main, "ALLOWED_USER_IDS", {12345})
+    monkeypatch.setattr(main, "ALLOWED_CHAT_IDS", set())
+    session_manager = type(
+        "SessionManagerStub",
+        (),
+        {
+            "sessions": {
+                "group": type(
+                    "SessionStub",
+                    (),
+                    {
+                        "chat_id": -100321,
+                        "message_thread_id": 77,
+                        "last_activity_at": "2026-03-14T12:00:00+00:00",
+                    },
+                )(),
+                "private": type(
+                    "SessionStub",
+                    (),
+                    {
+                        "chat_id": 12345,
+                        "message_thread_id": None,
+                        "last_activity_at": "2026-03-14T12:05:00+00:00",
+                    },
+                )(),
+            }
+        },
+    )()
+    monkeypatch.setattr(main.bot_module, "session_manager", session_manager, raising=False)
+
+    await main.send_startup_notification(bot, commit="abc12345")
+
+    bot.send_message.assert_awaited_once()
+    kwargs = bot.send_message.await_args.kwargs
+    assert kwargs["chat_id"] == 12345
+    assert kwargs["message_thread_id"] is None
+    assert "🚀 Bot restarted" in kwargs["text"]
+    assert "abc12345" in kwargs["text"]
+
+
+@pytest.mark.asyncio
+async def test_send_startup_notification_skips_group_or_thread_targets(monkeypatch) -> None:
+    bot = AsyncMock()
+    monkeypatch.setattr(main, "ALLOWED_USER_IDS", {12345})
+    monkeypatch.setattr(main, "ALLOWED_CHAT_IDS", {-100321})
+    session_manager = type(
+        "SessionManagerStub",
+        (),
+        {
+            "sessions": {
+                "group": type(
+                    "SessionStub",
+                    (),
+                    {
+                        "chat_id": -100321,
+                        "message_thread_id": 77,
+                        "last_activity_at": "2026-03-14T12:05:00+00:00",
+                    },
+                )(),
+            }
+        },
+    )()
+    monkeypatch.setattr(main.bot_module, "session_manager", session_manager, raising=False)
 
     await main.send_startup_notification(bot, commit="abc12345")
 

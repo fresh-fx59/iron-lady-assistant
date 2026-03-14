@@ -14,6 +14,7 @@ from .config import (
     BOT_TOKEN,
     METRICS_PORT,
     ALLOWED_USER_IDS,
+    ALLOWED_CHAT_IDS,
     VERSION,
     MEMORY_DIR,
     TELEGRAM_REQUEST_TIMEOUT_SECONDS,
@@ -110,11 +111,42 @@ def ensure_worklog_git_hook() -> None:
         logging.warning("Could not configure git hooksPath: %s", exc)
 
 
+def _latest_private_chat_target() -> tuple[int, None] | None:
+    """Best-effort target for startup notices in authorized direct chats only."""
+    rows: list[tuple[datetime, int]] = []
+    for session in bot_module.session_manager.sessions.values():  # noqa: SLF001
+        chat_id = int(getattr(session, "chat_id", 0) or 0)
+        if chat_id <= 0 or getattr(session, "message_thread_id", None) is not None:
+            continue
+        if chat_id not in ALLOWED_USER_IDS and chat_id not in ALLOWED_CHAT_IDS:
+            continue
+        raw_last = str(getattr(session, "last_activity_at", "") or "")
+        try:
+            last_at = datetime.fromisoformat(raw_last)
+            if last_at.tzinfo is None:
+                last_at = last_at.replace(tzinfo=timezone.utc)
+        except Exception:
+            last_at = datetime.min.replace(tzinfo=timezone.utc)
+        rows.append((last_at, chat_id))
+    if not rows:
+        return None
+    rows.sort(key=lambda row: row[0], reverse=True)
+    return rows[0][1], None
+
+
 async def send_startup_notification(bot: Bot, commit: str | None = None) -> None:
-    """Keep restart details in logs without posting Telegram startup notices."""
-    del bot
     _startup_notice_sent_at.clear()
     logging.info("Bot restarted at version=%s commit=%s", VERSION, commit or "unknown")
+    target = _latest_private_chat_target()
+    if target is None:
+        return
+    chat_id, message_thread_id = target
+    await bot.send_message(
+        chat_id=chat_id,
+        text=f"🚀 Bot restarted\nVersion: {VERSION}\nCommit: {commit or 'unknown'}",
+        message_thread_id=message_thread_id,
+    )
+    _startup_notice_sent_at[(chat_id, message_thread_id)] = datetime.now(timezone.utc)
 
 
 async def send_ready_notification(bot: Bot) -> None:

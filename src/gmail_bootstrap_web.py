@@ -455,6 +455,19 @@ def _render_session_html(base_url: str, session: GmailBootstrapSession) -> str:
     checklist_text = _manual_checklist_text(session)
     if checklist_text:
         lines.append(_render_markdown_checklist(checklist_text))
+    if session.phase in {"completed", "failed", "gmail_auth_pending"}:
+        gmail_api_url = (
+            "https://console.developers.google.com/apis/api/gmail.googleapis.com/overview"
+            f"?project={session.project_id}"
+        )
+        lines.append(
+            "<div class='checklist'>"
+            "<h2>Gmail API Requirement</h2>"
+            "<p>If sending/listing Gmail fails with <code>accessNotConfigured</code>, "
+            "enable Gmail API for this project and retry.</p>"
+            f"<p><a href='{gmail_api_url}' target='_blank' rel='noopener noreferrer'>Enable Gmail API for this project</a></p>"
+            "</div>"
+        )
     show_upload_form = session.phase == "oauth_manual_pending" or (
         session.phase == "failed" and checklist_text is not None
     )

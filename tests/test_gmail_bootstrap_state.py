@@ -94,3 +94,24 @@ def test_failed_state_is_persisted(tmp_path) -> None:
     assert failed is not None
     assert failed.phase == "failed"
     assert failed.failure_reason == "consent_screen_blocked"
+
+
+def test_record_telegram_notification_persists_last_notification_key(tmp_path) -> None:
+    store = GmailBootstrapStateStore(tmp_path / "gmail_bootstrap_sessions.json")
+    session = store.start_session(
+        project_id="ila-demo-project",
+        project_name="ILA Demo Project",
+        redirect_uri="https://bot.example.com/gmail/callback",
+        callback_base_url="https://bot.example.com",
+        oauth_client_name="ILA Gmail OAuth",
+        telegram_chat_id=123,
+        telegram_thread_id=None,
+    )
+
+    updated = store.record_telegram_notification(
+        session_id=session.session_id,
+        notification_key="oauth_manual_pending",
+    )
+
+    assert updated is not None
+    assert updated.last_telegram_notification_key == "oauth_manual_pending"

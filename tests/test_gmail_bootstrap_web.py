@@ -2,8 +2,11 @@ from __future__ import annotations
 
 from urllib.parse import parse_qs, urlparse
 
+import pytest
+
 from src.features.gmail_bootstrap_state import GmailBootstrapSession
 from src.gmail_bootstrap_web import (
+    _notify_telegram_for_session,
     _extract_first_url,
     _render_session_html,
     _validate_credentials_json,
@@ -128,3 +131,38 @@ def test_render_session_html_for_google_auth_failure_omits_upload_form() -> None
 
     assert "Google sign-in was cancelled or denied" in html
     assert "Upload Credentials and Continue" not in html
+
+
+@pytest.mark.asyncio
+async def test_notify_telegram_for_session_deduplicates_by_notification_key(tmp_path, monkeypatch) -> None:
+    from src.features.gmail_bootstrap_state import GmailBootstrapStateStore
+
+    store = GmailBootstrapStateStore(tmp_path / "gmail_bootstrap_sessions.json")
+    session = store.start_session(
+        project_id="ila-demo-project",
+        project_name="ILA Demo Project",
+        redirect_uri="https://bot.example.com/gmail/oauth/callback",
+        callback_base_url="https://bot.example.com",
+        oauth_client_name="ILA Gmail OAuth",
+        telegram_chat_id=123,
+        telegram_thread_id=456,
+    )
+    session = store.record_project_bootstrap(
+        session_id=session.session_id,
+        project_number="1234567890",
+        manual_console_url="https://console.cloud.google.com/apis/credentials",
+    )
+    sent: list[str] = []
+
+    async def fake_send_telegram_update(session_obj, text: str) -> None:
+        sent.append(text)
+
+    monkeypatch.setattr("src.gmail_bootstrap_web._send_telegram_update", fake_send_telegram_update)
+
+    await _notify_telegram_for_session(store, session)
+    refreshed = store.get(session.session_id)
+    assert refreshed is not None
+    assert refreshed.last_telegram_notification_key == "oauth_manual_pending"
+
+    await _notify_telegram_for_session(store, refreshed)
+    assert len(sent) == 1

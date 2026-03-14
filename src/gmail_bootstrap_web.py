@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlencode
 
+from aiogram import Bot
 from aiohttp import ClientSession, web
 
 from . import config
@@ -229,6 +230,67 @@ def _manual_checklist_text(session: GmailBootstrapSession) -> str | None:
     )
 
 
+def _notification_key(session: GmailBootstrapSession) -> str:
+    if session.phase == "failed":
+        return f"failed:{session.failure_reason or 'unknown'}"
+    return session.phase
+
+
+async def _send_telegram_update(session: GmailBootstrapSession, text: str) -> None:
+    if session.telegram_chat_id is None:
+        return
+    bot = Bot(token=config.BOT_TOKEN)
+    try:
+        kwargs: dict[str, Any] = {
+            "chat_id": session.telegram_chat_id,
+            "text": text,
+        }
+        if session.telegram_thread_id is not None:
+            kwargs["message_thread_id"] = session.telegram_thread_id
+        await bot.send_message(**kwargs)
+    finally:
+        await bot.session.close()
+
+
+async def _notify_telegram_for_session(
+    store: GmailBootstrapStateStore,
+    session: GmailBootstrapSession | None,
+) -> None:
+    if session is None:
+        return
+    notification_key = _notification_key(session)
+    if session.last_telegram_notification_key == notification_key:
+        return
+
+    text: str | None = None
+    if session.phase == "cloud_auth_granted":
+        text = "Gmail setup: Google sign-in complete. Preparing the Google Cloud project now."
+    elif session.phase == "oauth_manual_pending":
+        text = (
+            "Gmail setup: automatic project setup is complete. "
+            "Open the setup page, complete the Google Cloud Console step, and upload client_secret.json."
+        )
+    elif session.phase == "gmail_auth_pending":
+        account = session.gmail_account_email or "your Gmail account"
+        text = (
+            f"Gmail setup: credentials uploaded. Finish the Google authorization page for {account}, "
+            "then the bot will confirm when connection is complete."
+        )
+    elif session.phase == "completed":
+        account = session.gmail_account_email or "unknown account"
+        text = f"Gmail setup complete: {account} is now connected to the bot."
+    elif session.phase == "failed":
+        text = f"Gmail setup needs attention: {_friendly_failure_message(session.failure_reason)}"
+
+    if text is None:
+        return
+    await _send_telegram_update(session, text)
+    store.record_telegram_notification(
+        session_id=session.session_id,
+        notification_key=notification_key,
+    )
+
+
 def _render_session_html(base_url: str, session: GmailBootstrapSession) -> str:
     urls = build_session_urls(base_url=base_url, session_id=session.session_id)
     phase_label = _phase_label(session)
@@ -397,7 +459,8 @@ async def _google_callback(request: web.Request) -> web.Response:
         raise web.HTTPFound(location=f"/gmail/bootstrap/session/{session_id}")
     userinfo = await _fetch_userinfo(access_token=access_token)
     email = str(userinfo.get("email", "")).strip() or "unknown"
-    store.record_cloud_auth(session_id=session_id, account_email=email)
+    cloud_session = store.record_cloud_auth(session_id=session_id, account_email=email)
+    await _notify_telegram_for_session(store, cloud_session)
     try:
         bootstrap_result = await bootstrap_gcp_project(
             access_token=access_token,
@@ -405,7 +468,8 @@ async def _google_callback(request: web.Request) -> web.Response:
             project_name=session.project_name,
         )
     except Exception as exc:
-        store.record_failed(session_id=session_id, reason=f"gcp_bootstrap_failed:{exc}")
+        failed_session = store.record_failed(session_id=session_id, reason=f"gcp_bootstrap_failed:{exc}")
+        await _notify_telegram_for_session(store, failed_session)
     else:
         artifact_dir = _session_artifact_dir(session_id)
         checklist_path = artifact_dir / "MANUAL_CHECKLIST.md"
@@ -419,12 +483,13 @@ async def _google_callback(request: web.Request) -> web.Response:
             + "\n",
             encoding="utf-8",
         )
-        store.record_project_bootstrap(
+        project_session = store.record_project_bootstrap(
             session_id=session_id,
             project_number=bootstrap_result["project_number"],
             manual_console_url=bootstrap_result["manual_console_url"],
             manual_checklist_path=str(checklist_path),
         )
+        await _notify_telegram_for_session(store, project_session)
     raise web.HTTPFound(location=f"/gmail/bootstrap/session/{session_id}")
 
 
@@ -545,12 +610,14 @@ async def _upload_credentials(request: web.Request) -> web.Response:
             gmail_account_email=gmail_account_email,
             redirect_uri=gog_redirect_uri,
         )
-        store.record_gmail_auth_started_for_account(
+        auth_started_session = store.record_gmail_auth_started_for_account(
             session_id=session_id,
             gmail_account_email=gmail_account_email,
         )
+        await _notify_telegram_for_session(store, auth_started_session)
     except Exception as exc:
-        store.record_failed(session_id=session_id, reason=f"gog_remote_start_failed:{exc}")
+        failed_session = store.record_failed(session_id=session_id, reason=f"gog_remote_start_failed:{exc}")
+        await _notify_telegram_for_session(store, failed_session)
         raise web.HTTPFound(location=f"/gmail/bootstrap/session/{session_id}")
     raise web.HTTPFound(location=auth_url)
 
@@ -562,11 +629,13 @@ async def _gog_callback(request: web.Request) -> web.Response:
     if session is None:
         raise web.HTTPNotFound(text="Unknown bootstrap session.")
     if not session.gmail_account_email:
-        store.record_failed(session_id=session_id, reason="missing_gmail_account_email")
+        failed_session = store.record_failed(session_id=session_id, reason="missing_gmail_account_email")
+        await _notify_telegram_for_session(store, failed_session)
         raise web.HTTPFound(location=f"/gmail/bootstrap/session/{session_id}")
     error = request.query.get("error", "").strip()
     if error:
-        store.record_failed(session_id=session_id, reason=f"gmail_auth_error:{error}")
+        failed_session = store.record_failed(session_id=session_id, reason=f"gmail_auth_error:{error}")
+        await _notify_telegram_for_session(store, failed_session)
         raise web.HTTPFound(location=f"/gmail/bootstrap/session/{session_id}")
     auth_url = f"{request.scheme}://{request.host}{request.path_qs}"
     try:
@@ -576,12 +645,13 @@ async def _gog_callback(request: web.Request) -> web.Response:
             auth_url=auth_url,
         )
     except Exception as exc:
-        store.record_failed(session_id=session_id, reason=f"gog_remote_finish_failed:{exc}")
+        result_session = store.record_failed(session_id=session_id, reason=f"gog_remote_finish_failed:{exc}")
     else:
-        store.record_completed(
+        result_session = store.record_completed(
             session_id=session_id,
             gmail_account_email=session.gmail_account_email,
         )
+    await _notify_telegram_for_session(store, result_session)
     raise web.HTTPFound(location=f"/gmail/bootstrap/session/{session_id}")
 
 

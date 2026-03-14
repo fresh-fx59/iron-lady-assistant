@@ -62,20 +62,31 @@ async def bootstrap_gcp_project(
     project_name: str,
     required_services: Sequence[str] = DEFAULT_REQUIRED_SERVICES,
 ) -> dict[str, str]:
-    create_payload = await _request_json(
-        method="POST",
-        url="https://cloudresourcemanager.googleapis.com/v3/projects",
-        access_token=access_token,
-        json_body={"projectId": project_id, "displayName": project_name},
-    )
-    op_name = str(create_payload.get("name", "")).strip()
-    if not op_name:
-        raise RuntimeError("Project creation did not return an operation name.")
-    project_operation = await _poll_operation(
-        access_token=access_token,
-        operation_url=f"https://cloudresourcemanager.googleapis.com/v3/{op_name}",
-    )
-    project = dict(project_operation.get("response") or {})
+    try:
+        create_payload = await _request_json(
+            method="POST",
+            url="https://cloudresourcemanager.googleapis.com/v3/projects",
+            access_token=access_token,
+            json_body={"projectId": project_id, "displayName": project_name},
+        )
+    except RuntimeError as exc:
+        message = str(exc).lower()
+        if "already exists" not in message and "alreadyexists" not in message:
+            raise
+        project = await _request_json(
+            method="GET",
+            url=f"https://cloudresourcemanager.googleapis.com/v3/projects/{project_id}",
+            access_token=access_token,
+        )
+    else:
+        op_name = str(create_payload.get("name", "")).strip()
+        if not op_name:
+            raise RuntimeError("Project creation did not return an operation name.")
+        project_operation = await _poll_operation(
+            access_token=access_token,
+            operation_url=f"https://cloudresourcemanager.googleapis.com/v3/{op_name}",
+        )
+        project = dict(project_operation.get("response") or {})
     project_resource_name = str(project.get("name", "")).strip()
     if not project_resource_name.startswith("projects/"):
         raise RuntimeError(f"Unexpected project response: {project}")

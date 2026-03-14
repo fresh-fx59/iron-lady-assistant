@@ -45,6 +45,7 @@ class GmailBootstrapSession:
     credentials_path: str | None = None
     gmail_account_email: str | None = None
     connected_at: str | None = None
+    last_telegram_notification_key: str | None = None
     failure_reason: str | None = None
 
 
@@ -251,6 +252,23 @@ class GmailBootstrapStateStore:
                 return None
             session.failure_reason = reason
             session.phase = "failed"
+            session.updated_at = _now_iso()
+            sessions[session_id] = session
+            self._save_all_unlocked(sessions)
+            return session
+
+    def record_telegram_notification(
+        self,
+        *,
+        session_id: str,
+        notification_key: str,
+    ) -> GmailBootstrapSession | None:
+        with self._lock:
+            sessions = self._load_all_unlocked()
+            session = sessions.get(session_id)
+            if session is None:
+                return None
+            session.last_telegram_notification_key = notification_key
             session.updated_at = _now_iso()
             sessions[session_id] = session
             self._save_all_unlocked(sessions)

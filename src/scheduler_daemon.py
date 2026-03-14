@@ -12,6 +12,7 @@ from .config import (
     SCHEDULER_NOTIFY_THREAD_ID,
     TELEGRAM_REQUEST_TIMEOUT_SECONDS,
 )
+from .providers import ProviderManager
 from .scheduler import ScheduleManager
 from .tasks import TaskManager
 
@@ -25,7 +26,7 @@ async def main() -> None:
         token=BOT_TOKEN,
         session=AiohttpSession(timeout=TELEGRAM_REQUEST_TIMEOUT_SECONDS),
     )
-    task_manager = TaskManager(bot)
+    task_manager = TaskManager(bot, provider_manager=ProviderManager())
     schedule_manager = ScheduleManager(
         task_manager,
         MEMORY_DIR / "schedules.db",

@@ -384,7 +384,11 @@ async def initialize_runtime(bot: Bot) -> tuple[object, object]:
     from .scheduler import ScheduleManager
 
     bot_module.lifecycle_store.acknowledge_process_restart()  # noqa: SLF001
-    task_manager = TaskManager(bot, lifecycle_store=bot_module.lifecycle_store)
+    task_manager = TaskManager(
+        bot,
+        lifecycle_store=bot_module.lifecycle_store,
+        provider_manager=bot_module.provider_manager,
+    )
     schedule_manager = ScheduleManager(
         task_manager,
         MEMORY_DIR / "schedules.db",

@@ -1,6 +1,7 @@
 import asyncio
 from datetime import datetime
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
@@ -342,6 +343,84 @@ async def test_execute_task_treats_codex2_as_codex_family(monkeypatch) -> None:
     assert captured["cli_name"] == "codex2"
     assert task.status == TaskStatus.COMPLETED
     assert task.response == "ok"
+
+
+@pytest.mark.asyncio
+async def test_execute_task_falls_back_to_next_provider_on_usage_limit(monkeypatch) -> None:
+    bot = AsyncMock()
+    provider_manager = SimpleNamespace()
+    scope_state = {"123:main": 0}
+    providers = [
+        SimpleNamespace(name="codex", cli="codex", model=None, resume_arg=None),
+        SimpleNamespace(name="codex2", cli="codex2", model=None, resume_arg=None),
+    ]
+
+    def _get_provider(scope_key: str):
+        return providers[scope_state[scope_key]]
+
+    def _advance(scope_key: str):
+        next_idx = scope_state[scope_key] + 1
+        if next_idx >= len(providers):
+            return None
+        scope_state[scope_key] = next_idx
+        return providers[next_idx]
+
+    provider_manager.get_provider = _get_provider
+    provider_manager.advance = _advance
+    provider_manager.is_rate_limit_error = lambda text: "usage limit" in (text or "").lower()
+    provider_manager.subprocess_env = lambda _provider: {"FAKE_PROVIDER_ENV": "1"}
+
+    manager = TaskManager(bot, provider_manager=provider_manager)
+    task = BackgroundTask(
+        id="task-codex-fallback",
+        chat_id=123,
+        message_thread_id=None,
+        user_id=123,
+        prompt="x",
+        model="gpt-5-codex",
+        session_id="sess-1",
+        provider_cli="codex",
+        status=TaskStatus.RUNNING,
+        created_at=datetime.now(),
+    )
+
+    attempts: list[tuple[str, dict[str, str] | None]] = []
+
+    async def fake_stream_codex_message(**kwargs):
+        attempts.append((kwargs["cli_name"], kwargs.get("subprocess_env")))
+        if len(attempts) == 1:
+            yield bridge.StreamEvent(
+                event_type=bridge.StreamEventType.RESULT,
+                response=bridge.ClaudeResponse(
+                    text="You've hit your usage limit.",
+                    session_id="sess-1",
+                    is_error=True,
+                    cost_usd=0.0,
+                ),
+            )
+            return
+
+        yield bridge.StreamEvent(
+            event_type=bridge.StreamEventType.RESULT,
+            response=bridge.ClaudeResponse(
+                text="ok-after-provider-fallback",
+                session_id="sess-2",
+                is_error=False,
+                cost_usd=0.0,
+            ),
+        )
+
+    monkeypatch.setattr("src.tasks.bridge.stream_codex_message", fake_stream_codex_message)
+
+    await manager._execute_task(task)  # noqa: SLF001
+
+    assert attempts == [
+        ("codex", {"FAKE_PROVIDER_ENV": "1"}),
+        ("codex2", {"FAKE_PROVIDER_ENV": "1"}),
+    ]
+    assert task.provider_cli == "codex2"
+    assert task.status == TaskStatus.COMPLETED
+    assert task.response == "ok-after-provider-fallback"
 
 
 @pytest.mark.asyncio

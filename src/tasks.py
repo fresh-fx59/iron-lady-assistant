@@ -117,10 +117,17 @@ class TaskManager:
         "codex process was interrupted by service restart",
     )
 
-    def __init__(self, bot: Bot, observers: Sequence[TaskObserver] | None = None, lifecycle_store: object | None = None):
+    def __init__(
+        self,
+        bot: Bot,
+        observers: Sequence[TaskObserver] | None = None,
+        lifecycle_store: object | None = None,
+        provider_manager: object | None = None,
+    ):
         self.bot = bot
         self._observers = list(observers or [])
         self._lifecycle_store = lifecycle_store
+        self._provider_manager = provider_manager
         self.tasks: dict[str, BackgroundTask] = {}
         self._queue: list[BackgroundTask] = []
         self._running_tasks: set[str] = set()
@@ -440,6 +447,7 @@ class TaskManager:
         task: BackgroundTask,
     ) -> tuple[bridge.ClaudeResponse | None, ToolTimeoutRecord | None, list[str]]:
         process_handle: dict = {}
+        subprocess_env = self._task_subprocess_env(task)
         if task.provider_cli.startswith("codex"):
             stream = bridge.stream_codex_message(
                 prompt=task.prompt,
@@ -449,6 +457,7 @@ class TaskManager:
                 cli_name=task.provider_cli,
                 working_dir=config.CLAUDE_WORKING_DIR,
                 process_handle=process_handle,
+                subprocess_env=subprocess_env,
             )
         else:
             stream = bridge.stream_message(
@@ -457,6 +466,7 @@ class TaskManager:
                 model=task.model,
                 working_dir=config.CLAUDE_WORKING_DIR,
                 process_handle=process_handle,
+                subprocess_env=subprocess_env,
             )
 
         try:
@@ -520,6 +530,15 @@ class TaskManager:
                             task.session_id = None
                         await asyncio.sleep(0.3)
                         continue
+                    if (
+                        response
+                        and response.is_error
+                        and self._is_fallback_rate_limit_error(response.text)
+                    ):
+                        if self._advance_task_provider(task):
+                            task.session_id = None
+                            await asyncio.sleep(0.3)
+                            continue
                     break
 
                 logger.warning(
@@ -638,6 +657,47 @@ class TaskManager:
             metrics.BG_TASKS_RUNNING.set(len(self._running_tasks))
             metrics.BG_TASKS_ACTIVE.set(len(self.tasks))
             await self._notify_observers(task)
+
+    def _task_scope_key(self, task: BackgroundTask) -> str:
+        return make_scope_key(task.chat_id, task.message_thread_id)
+
+    def _task_provider(self, task: BackgroundTask):
+        if self._provider_manager is None:
+            return None
+        return self._provider_manager.get_provider(self._task_scope_key(task))
+
+    def _task_subprocess_env(self, task: BackgroundTask) -> dict[str, str] | None:
+        provider = self._task_provider(task)
+        if provider is None:
+            return None
+        return self._provider_manager.subprocess_env(provider)
+
+    def _is_fallback_rate_limit_error(self, error_text: str | None) -> bool:
+        if self._provider_manager is None:
+            return False
+        return bool(error_text) and self._provider_manager.is_rate_limit_error(error_text)
+
+    def _advance_task_provider(self, task: BackgroundTask) -> bool:
+        if self._provider_manager is None:
+            return False
+
+        scope_key = self._task_scope_key(task)
+        next_provider = self._provider_manager.advance(scope_key)
+        if next_provider is None:
+            return False
+
+        logger.warning(
+            "Background task %s falling back from provider_cli=%s to provider=%s (cli=%s)",
+            task.id,
+            task.provider_cli,
+            getattr(next_provider, "name", "unknown"),
+            next_provider.cli,
+        )
+        task.provider_cli = next_provider.cli
+        task.resume_arg = getattr(next_provider, "resume_arg", None)
+        if task.provider_cli.startswith("codex") and getattr(next_provider, "model", None):
+            task.model = next_provider.model
+        return True
 
     async def _typing_loop(self, task: BackgroundTask) -> None:
         send_failures = 0

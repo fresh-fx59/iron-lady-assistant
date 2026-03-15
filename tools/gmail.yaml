@@ -1,5 +1,5 @@
 name: gmail
-description: Manage Gmail via the `gog` CLI (read/search, send, delete) with OAuth.
+description: Manage Gmail via the internal `gmail-gateway` service (gateway-only path).
 tier: extended
 risky: true
 triggers:
@@ -9,7 +9,7 @@ triggers:
 - send via gmail
 - delete gmail
 instructions: |
-  # Gmail (via `gog`)
+  # Gmail (via `gmail-gateway`)
 
   Use this tool when the user explicitly asks to interact with Gmail.
 
@@ -23,35 +23,20 @@ instructions: |
   - If recipient or target message is ambiguous, ask a clarifying question first.
   - Prefer listing/searching first, then acting on a specific message ID.
 
-  Preferred setup (current product flow):
-  - Ask the user to run `/gmail_connect` in Telegram.
-  - The bot starts the Gmail bootstrap web flow and returns a ready setup URL.
-  - The user completes Google sign-in, the one Google Cloud Console checkpoint, and uploads `client_secret.json` on the setup page.
-  - Use `/gmail_status` to inspect current phase or the final connected account.
+  Runtime mode:
+  - This repository now treats `gmail-gateway` as the primary and only Gmail execution path.
+  - Do not route Gmail actions through direct `gog gmail ...` commands for normal operations.
 
-  CLI/operator fallback:
-  - `python -m src.gmail_setup_tool doctor`
-  - `python -m src.gmail_setup_tool self-hosted-doctor`
-  - `python -m src.gmail_setup_tool authorize --account you@gmail.com --services gmail --remote`
-  - `gog auth list`
-
-  Shared host-level OAuth credentials are now optional operator provisioning only:
-  - `GOG_OAUTH_CREDENTIALS_PATH=/secure/path/google-oauth-client.json`
-  - `GOG_OAUTH_CREDENTIALS_JSON=...`
-  - Do not present shared OAuth as the primary end-user onboarding path unless explicitly requested.
-
-  Quick command discovery (run first if syntax is uncertain):
-  - `gog gmail --help`
-  - `gog gmail messages --help`
+  Setup checks:
+  - `python -m src.gmail_gateway.http --help`
+  - `python -m src.gmail_gateway_cli --help`
 
   Common flows:
-  - Read recent inbox: `gog gmail search "in:inbox newer_than:7d" --max 20 --account you@gmail.com`
-  - Search by sender/subject: `gog gmail messages search "in:inbox from:alice@example.com" --max 20 --account you@gmail.com`
-  - Send email: `gog gmail send --to bob@example.com --subject "Subject" --body "Text" --account you@gmail.com`
-  - Send with body file: `gog gmail send --to bob@example.com --subject "Subject" --body-file ./message.txt --account you@gmail.com`
-
-  Delete/trash:
-  - Check available command in help first (`delete` vs `trash` can differ by version).
-  - Then execute delete/trash for explicit message IDs only.
-  - Example pattern: `gog gmail messages <delete-or-trash> <messageId> --account you@gmail.com`
-setup: 'Ensure command is available: python -m src.gmail_setup_tool --help'
+  - Account status: `python -m src.gmail_gateway_cli account-get --account you@gmail.com`
+  - Connect account: `python -m src.gmail_gateway_cli account-connect --account you@gmail.com --redirect-url https://example.com/done`
+  - Search: `python -m src.gmail_gateway_cli search --account you@gmail.com --query "in:inbox newer_than:7d" --page-size 20`
+  - Read: `python -m src.gmail_gateway_cli read --account you@gmail.com --message-id <messageId>`
+  - Send: `python -m src.gmail_gateway_cli send --account you@gmail.com --to bob@example.com --subject "Subject" --body "Text"`
+  - Trash: `python -m src.gmail_gateway_cli trash --account you@gmail.com --message-id <messageId>`
+  - Delete: `python -m src.gmail_gateway_cli delete --account you@gmail.com --message-id <messageId>`
+setup: 'Ensure gateway is available: python -m src.gmail_gateway.http --help'

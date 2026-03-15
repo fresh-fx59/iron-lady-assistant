@@ -6,7 +6,24 @@ from ..sessions import make_scope_key
 
 
 def thread_id(message: Any) -> int | None:
-    return getattr(message, "message_thread_id", None)
+    direct = getattr(message, "message_thread_id", None)
+    if isinstance(direct, int):
+        return direct
+
+    reply = getattr(message, "reply_to_message", None)
+    reply_thread = getattr(reply, "message_thread_id", None)
+    if isinstance(reply_thread, int):
+        return reply_thread
+
+    # Telegram occasionally omits `message_thread_id` on replies to the
+    # topic starter service message. In that narrow case the starter message id
+    # is the topic id, so recover it instead of collapsing to `chat:main`.
+    if getattr(message, "is_topic_message", False) and getattr(reply, "forum_topic_created", None):
+        reply_message_id = getattr(reply, "message_id", None)
+        if isinstance(reply_message_id, int):
+            return reply_message_id
+
+    return None
 
 
 def scope_key(chat_id: int, message_thread_id: int | None = None) -> str:

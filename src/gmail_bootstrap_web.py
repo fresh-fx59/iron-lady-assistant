@@ -170,6 +170,11 @@ def _html_page(title: str, body: str) -> str:
         ".muted{color:#5b544c;}"
         ".checklist{background:#f8f4eb;border:1px solid #d8ccb8;border-radius:8px;padding:16px;margin-top:18px;}"
         ".actions a{display:inline-block;margin-right:10px;margin-top:8px;}"
+        ".steps{margin:18px 0 10px 0;padding-left:20px;}"
+        ".steps li{margin:10px 0;}"
+        ".step-state{display:inline-block;margin-left:8px;padding:2px 8px;border-radius:999px;font-size:12px;"
+        "font-family:'Trebuchet MS',sans-serif;background:#e9dfca;color:#4d4438;}"
+        ".step-state.active{background:#2b5f45;color:#fff;}"
         "</style></head><body>"
         f"{body}</body></html>"
     )
@@ -277,11 +282,11 @@ def _render_markdown_checklist(markdown_text: str) -> str:
             continue
         if line.startswith("# "):
             close_lists()
-            chunks.append(f"<h3>{html.escape(line[2:])}</h3>")
+            chunks.append(f"<h3>{_render_inline_text(line[2:])}</h3>")
             continue
         if line.startswith("## "):
             close_lists()
-            chunks.append(f"<h3>{html.escape(line[3:])}</h3>")
+            chunks.append(f"<h3>{_render_inline_text(line[3:])}</h3>")
             continue
         if re.match(r"^\d+\.\s", line):
             if in_ul:
@@ -290,7 +295,7 @@ def _render_markdown_checklist(markdown_text: str) -> str:
             if not in_ol:
                 chunks.append("<ol>")
                 in_ol = True
-            chunks.append(f"<li>{html.escape(re.sub(r'^\\d+\\.\\s+', '', line))}</li>")
+            chunks.append(f"<li>{_render_inline_text(re.sub(r'^\\d+\\.\\s+', '', line))}</li>")
             continue
         if line.startswith("- "):
             if in_ol:
@@ -299,10 +304,10 @@ def _render_markdown_checklist(markdown_text: str) -> str:
             if not in_ul:
                 chunks.append("<ul>")
                 in_ul = True
-            chunks.append(f"<li>{html.escape(line[2:])}</li>")
+            chunks.append(f"<li>{_render_inline_text(line[2:])}</li>")
             continue
         close_lists()
-        chunks.append(f"<p>{html.escape(line)}</p>")
+        chunks.append(f"<p>{_render_inline_text(line)}</p>")
 
     close_lists()
     chunks.append("</div>")
@@ -331,6 +336,36 @@ def _manual_checklist_text(session: GmailBootstrapSession) -> str | None:
         redirect_uri=session.redirect_uri,
         oauth_client_name=session.oauth_client_name,
     )
+
+
+def _render_inline_text(text: str) -> str:
+    escaped = html.escape(text)
+    code_fragments: list[str] = []
+
+    def _store_code_fragment(match: re.Match[str]) -> str:
+        value = match.group(1)
+        if value.startswith("http://") or value.startswith("https://"):
+            fragment = (
+                "<code>"
+                f"<a href='{value}' target='_blank' rel='noopener noreferrer'>{value}</a>"
+                "</code>"
+            )
+        else:
+            fragment = f"<code>{value}</code>"
+        code_fragments.append(fragment)
+        return f"__CODE_FRAGMENT_{len(code_fragments) - 1}__"
+
+    escaped = re.sub(r"`([^`]+)`", _store_code_fragment, escaped)
+    linked = re.sub(
+        r"(https?://[^\s<]+)",
+        lambda m: (
+            f"<a href='{m.group(1)}' target='_blank' rel='noopener noreferrer'>{m.group(1)}</a>"
+        ),
+        escaped,
+    )
+    for idx, fragment in enumerate(code_fragments):
+        linked = linked.replace(f"__CODE_FRAGMENT_{idx}__", fragment)
+    return linked
 
 
 def _notification_key(session: GmailBootstrapSession) -> str:
@@ -399,6 +434,38 @@ def _render_session_html(base_url: str, session: GmailBootstrapSession) -> str:
     phase_label = _phase_label(session)
     phase_message = _phase_message(session)
     oauth_credentials = _bootstrap_oauth_credentials()
+    google_auth_url: str | None = None
+    if oauth_credentials:
+        client_id, _ = oauth_credentials
+        google_auth_url = build_google_auth_url(
+            session=session,
+            client_id=client_id,
+        )
+
+    credentials_url = f"https://console.cloud.google.com/apis/credentials?project={session.project_id}"
+    gmail_api_url = (
+        "https://console.developers.google.com/apis/api/gmail.googleapis.com/overview"
+        f"?project={session.project_id}"
+    )
+    oauth_consent_url = f"https://console.cloud.google.com/apis/credentials/consent?project={session.project_id}"
+    project_selector_url = f"https://console.cloud.google.com/home/dashboard?project={session.project_id}"
+    checklist_text = _manual_checklist_text(session)
+    upload_ready = session.phase in {"oauth_manual_pending", "credentials_uploaded", "gmail_auth_pending", "completed"}
+    can_upload_credentials = session.phase == "oauth_manual_pending" or (
+        session.phase == "failed" and checklist_text is not None
+    )
+    can_retry_gmail_auth = (
+        session.phase in {"failed", "gmail_auth_pending", "credentials_uploaded"}
+        and bool(session.gmail_account_email)
+        and bool(session.credentials_path)
+    )
+    step_states = {
+        "1": "active" if session.phase in {"cloud_auth_pending", "cloud_auth_granted", "failed"} else "done",
+        "2": "active" if session.phase in {"oauth_manual_pending", "failed"} else ("done" if upload_ready else "pending"),
+        "3": "active" if can_upload_credentials else ("done" if session.phase in {"credentials_uploaded", "gmail_auth_pending", "completed"} else "pending"),
+        "4": "active" if can_retry_gmail_auth or session.phase == "gmail_auth_pending" else ("done" if session.phase == "completed" else "pending"),
+    }
+
     lines = [
         "<div class='card'>",
         f"<h1>Gmail Connect Session</h1>",
@@ -407,6 +474,42 @@ def _render_session_html(base_url: str, session: GmailBootstrapSession) -> str:
         f"<p><strong>Redirect URI:</strong> <code>{session.redirect_uri}</code></p>",
         f"<p class='muted'><strong>Session:</strong> <code>{session.session_id}</code></p>",
         f"<p class='muted'><strong>Status API:</strong> <a href='{urls['status_url']}'>{urls['status_url']}</a></p>",
+        "<h2>Guided Setup Steps</h2>",
+        "<ol class='steps'>",
+        (
+            "<li><strong>Sign in with Google</strong>"
+            f"<span class='step-state{' active' if step_states['1'] == 'active' else ''}'>{step_states['1']}</span>"
+            "<br>Use the setup account that can access or create Google Cloud projects."
+            + (
+                f"<br><a href='{google_auth_url}'>Open Google sign-in</a>"
+                if google_auth_url
+                else ""
+            )
+            + "</li>"
+        ),
+        (
+            "<li><strong>Complete Google Cloud Console checkpoint</strong>"
+            f"<span class='step-state{' active' if step_states['2'] == 'active' else ''}'>{step_states['2']}</span>"
+            "<br>Open the same project, make sure Gmail API is enabled, and configure OAuth consent + OAuth client."
+            f"<br><a href='{project_selector_url}' target='_blank' rel='noopener noreferrer'>Open project dashboard</a>"
+            f" | <a href='{gmail_api_url}' target='_blank' rel='noopener noreferrer'>Enable Gmail API</a>"
+            f" | <a href='{oauth_consent_url}' target='_blank' rel='noopener noreferrer'>Open OAuth consent</a>"
+            f" | <a href='{credentials_url}' target='_blank' rel='noopener noreferrer'>Open Credentials</a>"
+            "</li>"
+        ),
+        (
+            "<li><strong>Upload <code>client_secret.json</code></strong>"
+            f"<span class='step-state{' active' if step_states['3'] == 'active' else ''}'>{step_states['3']}</span>"
+            "<br>Download credentials from Google Cloud Console and upload them in the form below."
+            "</li>"
+        ),
+        (
+            "<li><strong>Finish Gmail authorization</strong>"
+            f"<span class='step-state{' active' if step_states['4'] == 'active' else ''}'>{step_states['4']}</span>"
+            "<br>Approve Gmail permissions in Google; if it fails after a config change, use Retry Gmail Authorization."
+            "</li>"
+        ),
+        "</ol>",
     ]
     if session.manual_console_url:
         lines.append(
@@ -420,14 +523,9 @@ def _render_session_html(base_url: str, session: GmailBootstrapSession) -> str:
         lines.append(f"<p><strong>Connected Gmail:</strong> <code>{session.gmail_account_email}</code></p>")
     if session.connected_at:
         lines.append(f"<p><strong>Connected at:</strong> <code>{session.connected_at}</code></p>")
-    if oauth_credentials and session.phase in {"cloud_auth_pending", "failed"}:
-        client_id, _ = oauth_credentials
-        auth_url = build_google_auth_url(
-            session=session,
-            client_id=client_id,
-        )
+    if google_auth_url and session.phase in {"cloud_auth_pending", "failed"}:
         lines.append(
-            f"<p class='actions'><strong>Next action:</strong> <a href='{auth_url}'>Continue with Google sign-in</a></p>"
+            f"<p class='actions'><strong>Next action:</strong> <a href='{google_auth_url}'>Continue with Google sign-in</a></p>"
         )
     if not oauth_credentials and session.phase in {"cloud_auth_pending", "failed"}:
         google_callback_uri = f"{session.callback_base_url}/gmail/bootstrap/google/callback"
@@ -452,14 +550,9 @@ def _render_session_html(base_url: str, session: GmailBootstrapSession) -> str:
                 "</form>",
             ]
         )
-    checklist_text = _manual_checklist_text(session)
     if checklist_text:
         lines.append(_render_markdown_checklist(checklist_text))
     if session.phase in {"completed", "failed", "gmail_auth_pending"}:
-        gmail_api_url = (
-            "https://console.developers.google.com/apis/api/gmail.googleapis.com/overview"
-            f"?project={session.project_id}"
-        )
         lines.append(
             "<div class='checklist'>"
             "<h2>Gmail API Requirement</h2>"
@@ -468,10 +561,7 @@ def _render_session_html(base_url: str, session: GmailBootstrapSession) -> str:
             f"<p><a href='{gmail_api_url}' target='_blank' rel='noopener noreferrer'>Enable Gmail API for this project</a></p>"
             "</div>"
         )
-    show_upload_form = session.phase == "oauth_manual_pending" or (
-        session.phase == "failed" and checklist_text is not None
-    )
-    if show_upload_form:
+    if can_upload_credentials:
         lines.extend(
             [
                 "<h2>Finish Gmail OAuth</h2>",
@@ -483,11 +573,6 @@ def _render_session_html(base_url: str, session: GmailBootstrapSession) -> str:
                 "</form>",
             ]
         )
-    can_retry_gmail_auth = (
-        session.phase in {"failed", "gmail_auth_pending", "credentials_uploaded"}
-        and bool(session.gmail_account_email)
-        and bool(session.credentials_path)
-    )
     if can_retry_gmail_auth:
         lines.extend(
             [

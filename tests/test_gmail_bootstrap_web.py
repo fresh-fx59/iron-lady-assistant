@@ -157,6 +157,51 @@ def test_render_session_html_includes_manual_checklist_and_upload_form(tmp_path)
     assert "Manual Google Cloud Console checkpoint" in html
 
 
+def test_render_session_html_includes_guided_steps_section() -> None:
+    session = GmailBootstrapSession(
+        session_id="sess-1",
+        created_at="2026-03-13T10:00:00+00:00",
+        updated_at="2026-03-13T10:00:00+00:00",
+        phase="oauth_manual_pending",
+        project_id="ila-demo-project",
+        project_name="ILA Demo Project",
+        redirect_uri="https://bot.example.com/gmail/bootstrap/gog/callback/sess-1",
+        callback_base_url="https://bot.example.com",
+        oauth_client_name="ILA Gmail OAuth",
+    )
+
+    html = _render_session_html("https://bot.example.com", session)
+
+    assert "Guided Setup Steps" in html
+    assert "Enable Gmail API" in html
+    assert "Open OAuth consent" in html
+
+
+def test_render_session_html_renders_checklist_urls_as_clickable_links(tmp_path) -> None:
+    checklist_path = tmp_path / "MANUAL_CHECKLIST.md"
+    checklist_path.write_text(
+        "## Manual Google Cloud Console checkpoint\n"
+        "1. Enable Gmail API: `https://console.developers.google.com/apis/api/gmail.googleapis.com/overview?project=ila-demo-project`.\n",
+        encoding="utf-8",
+    )
+    session = GmailBootstrapSession(
+        session_id="sess-1",
+        created_at="2026-03-13T10:00:00+00:00",
+        updated_at="2026-03-13T10:00:00+00:00",
+        phase="oauth_manual_pending",
+        project_id="ila-demo-project",
+        project_name="ILA Demo Project",
+        redirect_uri="https://bot.example.com/gmail/bootstrap/gog/callback/sess-1",
+        callback_base_url="https://bot.example.com",
+        oauth_client_name="ILA Gmail OAuth",
+        manual_checklist_path=str(checklist_path),
+    )
+
+    html = _render_session_html("https://bot.example.com", session)
+
+    assert "<code><a href='https://console.developers.google.com/apis/api/gmail.googleapis.com/overview?project=ila-demo-project'" in html
+
+
 def test_render_session_html_manual_console_link_opens_new_tab() -> None:
     session = GmailBootstrapSession(
         session_id="sess-1",

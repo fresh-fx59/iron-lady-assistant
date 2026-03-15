@@ -6,7 +6,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-VERSION: str = "0.51.1"
+VERSION: str = "0.51.2"
 
 # ── Bot token (required) ────────────────────────────────────
 BOT_TOKEN: str = os.getenv("TELEGRAM_BOT_TOKEN", "")
@@ -250,3 +250,11 @@ GMAIL_GATEWAY_TIMEOUT_SECONDS: float = max(
     1.0,
     float(os.getenv("GMAIL_GATEWAY_TIMEOUT_SECONDS", "15")),
 )
+GMAIL_GATEWAY_GOOGLE_CLIENT_ID: str = os.getenv(
+    "GMAIL_GATEWAY_GOOGLE_CLIENT_ID",
+    GMAIL_BOOTSTRAP_GOOGLE_CLIENT_ID,
+).strip()
+GMAIL_GATEWAY_GOOGLE_CLIENT_SECRET: str = os.getenv(
+    "GMAIL_GATEWAY_GOOGLE_CLIENT_SECRET",
+    GMAIL_BOOTSTRAP_GOOGLE_CLIENT_SECRET,
+).strip()

@@ -218,6 +218,66 @@ async def test_send_rejects_same_idempotency_key_with_different_payload(tmp_path
         await server.close()
 
 
+async def test_send_refreshes_access_token_on_401_and_retries(tmp_path: Path, monkeypatch) -> None:
+    from src import config
+    from src.gmail_gateway.gmail_api import GmailApiError
+
+    monkeypatch.setattr(config, "GMAIL_GATEWAY_GOOGLE_CLIENT_ID", "client-id")
+    monkeypatch.setattr(config, "GMAIL_GATEWAY_GOOGLE_CLIENT_SECRET", "client-secret")
+
+    class _RefreshingApi(_FakeGmailApi):
+        def __init__(self) -> None:
+            super().__init__()
+            self.send_attempts = 0
+
+        async def send_message(self, *, access_token: str, to: list[str], subject: str, body_text: str) -> str:
+            self.send_attempts += 1
+            if self.send_attempts == 1:
+                raise GmailApiError(
+                    status=401,
+                    reason="invalidCredentials",
+                    message="Expired access token",
+                    retryable=False,
+                )
+            assert access_token == "new-access-token"
+            return "gmail-msg-refreshed"
+
+        async def refresh_access_token(
+            self,
+            *,
+            refresh_token: str,
+            client_id: str,
+            client_secret: str,
+        ) -> tuple[str, str | None]:
+            assert refresh_token == "refresh-token"
+            assert client_id == "client-id"
+            assert client_secret == "client-secret"
+            return "new-access-token", None
+
+    api = _RefreshingApi()
+    app, server, client = await _client(tmp_path, gmail_api=api)
+    _connect_account_for_send(app)
+    try:
+        resp = await client.post(
+            "/v1/messages/send",
+            json={
+                "account_id": "acc-1",
+                "to": ["bob@example.com"],
+                "subject": "Hello",
+                "body_text": "Refresh me",
+            },
+            headers={"Idempotency-Key": "idem-refresh-1"},
+        )
+        payload = await resp.json()
+        assert resp.status == 202
+        assert payload["status"] == "sent"
+        assert api.send_attempts == 2
+        assert app[AUTH_STORE_KEY].get_active_access_token(account_id="acc-1") == "new-access-token"
+    finally:
+        await client.close()
+        await server.close()
+
+
 async def test_read_search_and_trash_message_flow(tmp_path: Path) -> None:
     fake_api = _FakeGmailApi()
     app, server, client = await _client(tmp_path, gmail_api=fake_api)

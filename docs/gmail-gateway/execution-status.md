@@ -43,14 +43,18 @@ Last updated: 2026-03-15
 11. Step 3 observability slice:
    - Added middleware-based request counters and structured request logs in gateway HTTP service.
    - Added `GET /internal/metrics` for local counter inspection.
+12. Step 4 OAuth refresh slice:
+   - Added access-token refresh exchange in Gmail API client (`oauth2.googleapis.com/token`).
+   - Added automatic single retry on 401 with refresh-token rotation in gateway handlers.
+   - Persisted rotated access token in auth store.
 
 ## Validations Run
 
-- `pytest -q tests/gmail_gateway` -> 17 passed
+- `pytest -q tests/gmail_gateway` -> 18 passed
 - `python -m compileall -q src/gmail_gateway` -> success
 
 ## Next Slice (auto-continue target)
 
 1. Wire `GmailGatewayClient` into assistant runtime as the only Gmail path (no legacy fallback).
-2. Implement OAuth token refresh exchange (access-token renewal) instead of static callback-provided token usage.
-3. Add persistent metrics export path (Prometheus-style or equivalent) beyond in-process counters.
+2. Add persistent metrics export path (Prometheus-style or equivalent) beyond in-process counters.
+3. Add integration tests that hit real Gmail test tenant (stage ladder prerequisite).

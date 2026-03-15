@@ -131,6 +131,43 @@ class GmailApiClient:
             )
         return message_id
 
+    async def refresh_access_token(
+        self,
+        *,
+        refresh_token: str,
+        client_id: str,
+        client_secret: str,
+    ) -> tuple[str, str | None]:
+        payload = {
+            "client_id": client_id,
+            "client_secret": client_secret,
+            "refresh_token": refresh_token,
+            "grant_type": "refresh_token",
+        }
+        async with ClientSession(timeout=self._timeout) as session:
+            async with session.post(
+                "https://oauth2.googleapis.com/token",
+                data=payload,
+            ) as resp:
+                data: dict[str, Any] = await resp.json(content_type=None)
+                if resp.status >= 400:
+                    self._raise_error(status=resp.status, data=data)
+                token = str(data.get("access_token", "")).strip()
+                if not token:
+                    raise GmailApiError(
+                        status=502,
+                        reason="invalid_response",
+                        message="OAuth refresh response missing access_token",
+                        retryable=True,
+                    )
+                expires_in = data.get("expires_in")
+                expires_at = None
+                if isinstance(expires_in, int):
+                    from datetime import UTC, datetime, timedelta
+
+                    expires_at = (datetime.now(UTC) + timedelta(seconds=expires_in)).isoformat()
+                return token, expires_at
+
     async def search_messages(
         self,
         *,

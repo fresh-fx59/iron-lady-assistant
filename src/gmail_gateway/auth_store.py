@@ -29,6 +29,14 @@ class ConnectSession:
     completed_at: str | None
 
 
+@dataclass(frozen=True)
+class TokenBundle:
+    token_id: str
+    access_token: str
+    refresh_token: str | None
+    expires_at: str | None
+
+
 class AuthStore:
     def __init__(self, db_path: Path) -> None:
         self._db_path = db_path
@@ -141,10 +149,14 @@ class AuthStore:
             )
 
     def get_active_access_token(self, *, account_id: str) -> str | None:
+        bundle = self.get_active_token_bundle(account_id=account_id)
+        return bundle.access_token if bundle else None
+
+    def get_active_token_bundle(self, *, account_id: str) -> TokenBundle | None:
         with self._connect() as con:
             row = con.execute(
                 """
-                SELECT access_token_ciphertext
+                SELECT token_id, access_token_ciphertext, refresh_token_ciphertext, expires_at
                 FROM gateway_oauth_tokens
                 WHERE account_id = ?
                 ORDER BY updated_at DESC
@@ -154,12 +166,40 @@ class AuthStore:
             ).fetchone()
         if row is None:
             return None
-        raw = row["access_token_ciphertext"]
-        if raw is None:
+        access = row["access_token_ciphertext"]
+        if access is None:
             return None
-        if isinstance(raw, bytes):
-            return raw.decode("utf-8")
-        return str(raw)
+        refresh = row["refresh_token_ciphertext"]
+        access_token = access.decode("utf-8") if isinstance(access, bytes) else str(access)
+        refresh_token = None
+        if refresh is not None:
+            refresh_token = refresh.decode("utf-8") if isinstance(refresh, bytes) else str(refresh)
+        return TokenBundle(
+            token_id=str(row["token_id"]),
+            access_token=access_token,
+            refresh_token=refresh_token,
+            expires_at=str(row["expires_at"]) if row["expires_at"] else None,
+        )
+
+    def rotate_access_token(
+        self,
+        *,
+        token_id: str,
+        access_token: str,
+        expires_at: str | None,
+    ) -> None:
+        now = self._now_iso()
+        with self._connect() as con:
+            con.execute(
+                """
+                UPDATE gateway_oauth_tokens
+                SET access_token_ciphertext = ?,
+                    expires_at = ?,
+                    updated_at = ?
+                WHERE token_id = ?
+                """,
+                (self._token_ciphertext(access_token), expires_at, now, token_id),
+            )
 
     def get_account_auth_state(self, *, account_id: str) -> AccountAuthState | None:
         with self._connect() as con:

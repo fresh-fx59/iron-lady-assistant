@@ -53,11 +53,13 @@ def reset_session_manager():
     """Ensure session manager state is clean between tests."""
     try:
         from src import bot
+        from src import telegram_status_throttle
 
         bot.session_manager.sessions.clear()
         bot._chat_states.clear()
         bot._error_counts.clear()
         bot._recent_outbound_by_scope.clear()
+        telegram_status_throttle._chat_status_windows.clear()  # noqa: SLF001
 
         for path in (bot.resume_state_store._path, bot.steering_ledger_store._path, bot.lifecycle_store._path):
             if path.exists():

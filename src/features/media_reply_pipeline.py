@@ -4,6 +4,12 @@ import asyncio
 from time import monotonic
 from typing import Any, Callable
 
+from ..telegram_status_throttle import (
+    EphemeralStatusSuppressedError,
+    postpone_ephemeral_status_send,
+    send_ephemeral_status,
+)
+
 
 def format_audio_conversion_progress(elapsed_seconds: float) -> str:
     return (
@@ -171,17 +177,24 @@ async def send_audio_with_progress(
     try:
         await asyncio.sleep(0)
         try:
-            progress_message = await message.bot.send_message(
-                chat_id=message.chat.id,
-                message_thread_id=thread_id_fn(message),
-                text=format_audio_conversion_progress_fn(monotonic() - started_at),
-                parse_mode="HTML",
-            )
+            async def _send_progress_message():
+                return await message.bot.send_message(
+                    chat_id=message.chat.id,
+                    message_thread_id=thread_id_fn(message),
+                    text=format_audio_conversion_progress_fn(monotonic() - started_at),
+                    parse_mode="HTML",
+                )
+            progress_message = await send_ephemeral_status(message.chat.id, _send_progress_message)
             progress_message_id = progress_message.message_id
             progress_task = asyncio.create_task(
                 update_audio_conversion_progress_fn(message, progress_message_id, started_at)
             )
+        except EphemeralStatusSuppressedError:
+            logger.debug("Audio conversion progress suppressed by chat cooldown")
         except telegram_api_error_class as e:
+            retry_after = getattr(e, "retry_after", None)
+            if retry_after is not None:
+                await postpone_ephemeral_status_send(message.chat.id, retry_after)
             logger.debug("Audio conversion progress message failed: %s", e)
 
         if as_voice:
@@ -291,14 +304,19 @@ async def send_voice_transcription_progress_message(
     logger: Any,
 ) -> tuple[int | None, int | None]:
     try:
-        progress_message = await message.bot.send_message(
-            chat_id=message.chat.id,
-            message_thread_id=thread_id_fn(message),
-            text=format_voice_transcription_progress_fn(elapsed_seconds),
-            parse_mode="HTML",
-        )
+        async def _send_progress_message():
+            return await message.bot.send_message(
+                chat_id=message.chat.id,
+                message_thread_id=thread_id_fn(message),
+                text=format_voice_transcription_progress_fn(elapsed_seconds),
+                parse_mode="HTML",
+            )
+        progress_message = await send_ephemeral_status(message.chat.id, _send_progress_message)
         return progress_message.message_id, None
+    except EphemeralStatusSuppressedError:
+        return None, None
     except telegram_retry_after_class as e:
+        await postpone_ephemeral_status_send(message.chat.id, e.retry_after)
         logger.debug("Voice transcription progress rate-limited, retry in %ss", e.retry_after)
         return None, e.retry_after
     except telegram_api_error_class as e:

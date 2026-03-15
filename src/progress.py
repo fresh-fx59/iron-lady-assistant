@@ -10,6 +10,11 @@ from aiogram.types import Message
 from aiogram.exceptions import TelegramAPIError
 
 from . import config
+from .telegram_status_throttle import (
+    EphemeralStatusSuppressedError,
+    postpone_ephemeral_status_send,
+    send_ephemeral_status,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -22,8 +27,8 @@ _HEARTBEAT_MESSAGES = [
     "🔄 Nearly there...",
     "🔄 Working...",
 ]
-_HEARTBEAT_INTERVAL = 5.0  # Update every 5 seconds during heartbeat
-_AUDIO_PROGRESS_INTERVAL = 1.0
+_HEARTBEAT_INTERVAL = 15.0
+_AUDIO_PROGRESS_INTERVAL = 3.0
 _AUDIO_MEDIA_EXTENSIONS = (".mp3", ".ogg", ".opus", ".wav", ".m4a", ".aac", ".flac")
 _AUDIO_TTS_COMMAND_RE = re.compile(
     r"(?<![a-z0-9_.-])"
@@ -40,7 +45,12 @@ class ProgressReporter:
     activity when Claude is working on long-running tasks.
     """
 
-    def __init__(self, message: Message, debounce_seconds: float | None = None):
+    def __init__(
+        self,
+        message: Message,
+        debounce_seconds: float | None = None,
+        initial_delay_seconds: float | None = None,
+    ):
         self._message = message
         self._chat_id = message.chat.id
         self._message_thread_id = getattr(message, "message_thread_id", None)
@@ -48,6 +58,12 @@ class ProgressReporter:
         self._debounce_seconds = (
             config.PROGRESS_DEBOUNCE_SECONDS if debounce_seconds is None else debounce_seconds
         )
+        self._initial_delay_seconds = (
+            config.TELEGRAM_PROGRESS_INITIAL_DELAY_SECONDS
+            if initial_delay_seconds is None
+            else max(0.0, initial_delay_seconds)
+        )
+        self._started_at = monotonic()
 
         self._progress_message_id: int | None = None
         self._history: deque[str] = deque(maxlen=5)  # Keep last ~5 actions
@@ -99,12 +115,17 @@ class ProgressReporter:
         """Show an initial working indicator before the first tool event arrives."""
         if self._progress_message_id is not None:
             return
+        if self._initial_delay_seconds > 0:
+            return
         text = "🔄 <b>Working...</b>"
         try:
-            self._progress_message_id = await self._send_progress_message(text)
+            self._progress_message_id = await self._send_progress_message(text, ephemeral=True)
             self._last_update_text = text
             self._start_heartbeat()
+        except EphemeralStatusSuppressedError:
+            return
         except TelegramAPIError as e:
+            await self._register_ephemeral_send_failure(e)
             logger.warning("Failed to send initial progress message: %s", e)
 
     def _is_audio_conversion_action(self, tool_name: str, tool_input: str | None) -> bool:
@@ -154,8 +175,11 @@ class ProgressReporter:
 
         if self._progress_message_id is None:
             try:
-                self._progress_message_id = await self._send_progress_message(text)
+                self._progress_message_id = await self._send_progress_message(text, ephemeral=True)
+            except EphemeralStatusSuppressedError:
+                return
             except TelegramAPIError as e:
+                await self._register_ephemeral_send_failure(e)
                 logger.warning("Failed to send audio progress message: %s", e)
             return
 
@@ -180,13 +204,16 @@ class ProgressReporter:
         except asyncio.CancelledError:
             pass
 
-    async def _send_progress_message(self, text: str) -> int:
-        msg = await self._bot.send_message(
-            chat_id=self._chat_id,
-            message_thread_id=self._message_thread_id,
-            text=text,
-            parse_mode="HTML",
-        )
+    async def _send_progress_message(self, text: str, *, ephemeral: bool = False) -> int:
+        async def _send() -> Message:
+            return await self._bot.send_message(
+                chat_id=self._chat_id,
+                message_thread_id=self._message_thread_id,
+                text=text,
+                parse_mode="HTML",
+            )
+
+        msg = await (send_ephemeral_status(self._chat_id, _send) if ephemeral else _send())
         return msg.message_id
 
     async def _fallback_after_edit_failure(self, text: str, error: TelegramAPIError) -> bool:
@@ -194,7 +221,9 @@ class ProgressReporter:
             return False
 
         try:
-            new_message_id = await self._send_progress_message(text)
+            new_message_id = await self._send_progress_message(text, ephemeral=True)
+        except EphemeralStatusSuppressedError:
+            return False
         except TelegramAPIError:
             return False
 
@@ -206,6 +235,17 @@ class ProgressReporter:
     def _should_replace_message_after_edit_error(self, error: TelegramAPIError) -> bool:
         message = str(error).lower()
         return "flood control" in message or "too many requests" in message or "retry after" in message
+
+    async def _register_ephemeral_send_failure(self, error: TelegramAPIError) -> None:
+        retry_after = getattr(error, "retry_after", None)
+        if retry_after is not None:
+            await postpone_ephemeral_status_send(self._chat_id, float(retry_after))
+            return
+
+        message = str(error).lower()
+        retry_match = re.search(r"retry in (\d+)", message)
+        if retry_match:
+            await postpone_ephemeral_status_send(self._chat_id, float(retry_match.group(1)))
 
     def _format_tool_action(self, tool_name: str, tool_input: str | None) -> str:
         """Format a tool action into a human-readable line."""
@@ -258,6 +298,14 @@ class ProgressReporter:
             if not self._dirty:
                 return
 
+            if self._progress_message_id is None and self._initial_delay_seconds > 0:
+                elapsed = monotonic() - self._started_at
+                remaining = self._initial_delay_seconds - elapsed
+                if remaining > 0:
+                    await asyncio.sleep(remaining)
+                    if self._shutdown:
+                        return
+
             # Build the message text
             if self._history:
                 lines = list(self._history)
@@ -276,8 +324,11 @@ class ProgressReporter:
             if self._progress_message_id is None:
                 # Send new message
                 try:
-                    self._progress_message_id = await self._send_progress_message(text)
+                    self._progress_message_id = await self._send_progress_message(text, ephemeral=True)
+                except EphemeralStatusSuppressedError:
+                    return
                 except TelegramAPIError as e:
+                    await self._register_ephemeral_send_failure(e)
                     logger.warning("Failed to send progress message: %s", e)
             else:
                 # Edit existing message

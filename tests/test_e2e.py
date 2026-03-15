@@ -305,7 +305,7 @@ class TestProgressReportingLifecycle:
         """Progress message should be sent, updated, then deleted."""
         from src.progress import ProgressReporter
 
-        reporter = ProgressReporter(mock_message, debounce_seconds=0)
+        reporter = ProgressReporter(mock_message, debounce_seconds=0, initial_delay_seconds=0)
 
         # Report a tool
         await reporter.report_tool("Read", "/tmp/file.txt")
@@ -332,7 +332,7 @@ class TestProgressReportingLifecycle:
         from src.progress import ProgressReporter
 
         mock_message.message_thread_id = 77
-        reporter = ProgressReporter(mock_message, debounce_seconds=0)
+        reporter = ProgressReporter(mock_message, debounce_seconds=0, initial_delay_seconds=0)
 
         await reporter.show_working()
         kwargs = mock_message.bot.send_message.await_args_list[0].kwargs
@@ -346,7 +346,7 @@ class TestProgressReportingLifecycle:
         from src.progress import ProgressReporter
 
         monkeypatch.setattr("src.progress._AUDIO_PROGRESS_INTERVAL", 0.01)
-        reporter = ProgressReporter(mock_message, debounce_seconds=0)
+        reporter = ProgressReporter(mock_message, debounce_seconds=0, initial_delay_seconds=0)
 
         await reporter.show_working()
         await reporter.report_tool("Bash", 'sag -v Clawd -o /tmp/voice-reply.mp3 "hello"')
@@ -368,7 +368,7 @@ class TestProgressReportingLifecycle:
         from src.progress import ProgressReporter
 
         monkeypatch.setattr("src.progress._AUDIO_PROGRESS_INTERVAL", 0.01)
-        reporter = ProgressReporter(mock_message, debounce_seconds=0)
+        reporter = ProgressReporter(mock_message, debounce_seconds=0, initial_delay_seconds=0)
 
         await reporter.show_working()
         await reporter.report_tool(
@@ -391,7 +391,7 @@ class TestProgressReportingLifecycle:
         from src.progress import ProgressReporter
 
         monkeypatch.setattr("src.progress._AUDIO_PROGRESS_INTERVAL", 0.01)
-        reporter = ProgressReporter(mock_message, debounce_seconds=0)
+        reporter = ProgressReporter(mock_message, debounce_seconds=0, initial_delay_seconds=0)
 
         await reporter.show_working()
         await reporter.report_tool("Bash", 'sag -v Clawd -o /tmp/voice-reply.mp3 "hello"')
@@ -416,7 +416,7 @@ class TestProgressReportingLifecycle:
         from src.progress import ProgressReporter
 
         monkeypatch.setattr("src.progress._AUDIO_PROGRESS_INTERVAL", 0.01)
-        reporter = ProgressReporter(mock_message, debounce_seconds=0)
+        reporter = ProgressReporter(mock_message, debounce_seconds=0, initial_delay_seconds=0)
 
         await reporter.show_working()
         await reporter.report_tool("Bash", 'echo "tts notes saved to /tmp/report.wav"')
@@ -427,8 +427,8 @@ class TestProgressReportingLifecycle:
 
         await reporter.finish()
 
-    async def test_progress_falls_back_to_new_message_when_edit_is_rate_limited(self, mock_message):
-        """Flood-controlled edits should fall back to a fresh progress message."""
+    async def test_progress_skips_extra_send_when_edit_is_rate_limited(self, mock_message):
+        """Flood-controlled edits should not create an extra transient status message."""
         from src.progress import ProgressReporter
 
         mock_message.bot.send_message.side_effect = [
@@ -440,15 +440,44 @@ class TestProgressReportingLifecycle:
             "Telegram server says - Flood control exceeded on method 'EditMessageText' in chat -1. Retry in 9 seconds."
         )
 
-        reporter = ProgressReporter(mock_message, debounce_seconds=0)
+        reporter = ProgressReporter(mock_message, debounce_seconds=0, initial_delay_seconds=0)
 
         await reporter.show_working()
         await reporter.report_tool("Read", "/tmp/file.txt")
         await asyncio.sleep(0.05)
 
-        assert mock_message.bot.send_message.await_count == 2
+        assert mock_message.bot.send_message.await_count == 1
+        assert mock_message.bot.edit_message_text.await_count == 1
 
         await reporter.finish()
+
+    async def test_progress_show_working_waits_for_initial_delay_by_default(self, mock_message):
+        from src.progress import ProgressReporter
+
+        reporter = ProgressReporter(mock_message, debounce_seconds=0, initial_delay_seconds=5)
+
+        await reporter.show_working()
+
+        mock_message.bot.send_message.assert_not_called()
+        await reporter.finish()
+
+    async def test_progress_suppresses_second_ephemeral_message_in_same_chat(self, mock_message):
+        from src.progress import ProgressReporter
+
+        first_reporter = ProgressReporter(mock_message, debounce_seconds=0, initial_delay_seconds=0)
+        second_message = AsyncMock()
+        second_message.chat = mock_message.chat
+        second_message.bot = mock_message.bot
+        second_message.message_thread_id = 88
+        second_reporter = ProgressReporter(second_message, debounce_seconds=0, initial_delay_seconds=0)
+
+        await first_reporter.show_working()
+        await second_reporter.show_working()
+
+        assert mock_message.bot.send_message.await_count == 1
+
+        await first_reporter.finish()
+        await second_reporter.finish()
 
 
 # ── E2E Flow 8: Session persistence across restarts ──────────────

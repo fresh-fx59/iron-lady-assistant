@@ -611,9 +611,33 @@ def _command_args(message: Message, command: CommandObject | None = None) -> str
     return parts[1].strip()
 
 
-def _build_augmented_prompt(raw_prompt: str) -> str:
+def _build_augmented_prompt(
+    raw_prompt: str,
+    *,
+    chat_id: int | None = None,
+    message_thread_id: int | None = None,
+    scope_key: str | None = None,
+    session: object | None = None,
+) -> str:
     """Compose prompt with memory, tools, and memory instructions."""
-    memory_context = _as_text(memory_manager.build_context(raw_prompt))
+    topic_label = getattr(session, "topic_label", None) if session is not None else None
+    logger.info(
+        "Memory context target resolved: scope=%s chat=%s thread=%s topic=%r prompt_len=%d",
+        scope_key or "(global)",
+        chat_id,
+        message_thread_id,
+        topic_label,
+        len(raw_prompt),
+    )
+    memory_context = _as_text(
+        memory_manager.build_context(
+            raw_prompt,
+            chat_id=chat_id,
+            message_thread_id=message_thread_id,
+            scope_key=scope_key,
+            topic_label=topic_label,
+        )
+    )
     tool_context = _as_text(context_plugins.build_context(raw_prompt))
     memory_instructions = _as_text(memory_manager.build_instructions())
 
@@ -1480,12 +1504,21 @@ async def _run_claude(
     override_text: str | None = None,
     observed_tools: list[str] | None = None,
 ) -> bridge.ClaudeResponse | None:
+    thread_id = _thread_id(message)
+    scope_key = _scope_key(message.chat.id, thread_id)
+    build_prompt = lambda raw_prompt: _build_augmented_prompt(
+        raw_prompt,
+        chat_id=message.chat.id,
+        message_thread_id=thread_id,
+        scope_key=scope_key,
+        session=session,
+    )
     return await _provider_runtime.run_claude(
         message,
         state,
         session,
         progress,
-        build_augmented_prompt=_build_augmented_prompt,
+        build_augmented_prompt=build_prompt,
         subprocess_env=subprocess_env,
         override_text=override_text,
         observed_tools=observed_tools,
@@ -1505,12 +1538,21 @@ async def _run_codex(
     override_text: str | None = None,
     observed_tools: list[str] | None = None,
 ) -> bridge.ClaudeResponse | None:
+    thread_id = _thread_id(message)
+    scope_key = _scope_key(message.chat.id, thread_id)
+    build_prompt = lambda raw_prompt: _build_augmented_prompt(
+        raw_prompt,
+        chat_id=message.chat.id,
+        message_thread_id=thread_id,
+        scope_key=scope_key,
+        session=session,
+    )
     return await _provider_runtime.run_codex(
         message,
         state,
         session,
         progress,
-        build_augmented_prompt=_build_augmented_prompt,
+        build_augmented_prompt=build_prompt,
         codex_working_dir=_codex_working_dir,
         model=model,
         session_id=session_id,

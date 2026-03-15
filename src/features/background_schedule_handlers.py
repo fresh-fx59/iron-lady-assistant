@@ -37,7 +37,13 @@ async def cmd_bg(
     session = session_manager.get(chat_id, thread_id)
     provider = current_provider_fn(scope_key_fn(chat_id, thread_id))
     task_model, session_id, provider_cli, resume_arg = task_backend_fn(session, provider)
-    full_prompt = build_augmented_prompt_fn(prompt)
+    full_prompt = build_augmented_prompt_fn(
+        prompt,
+        chat_id=chat_id,
+        message_thread_id=thread_id,
+        scope_key=scope_key_fn(chat_id, thread_id),
+        session=session,
+    )
 
     try:
         task_id = await task_manager.submit(
@@ -201,7 +207,13 @@ async def cmd_schedule_every(
     session = session_manager.get(chat_id, thread_id)
     provider = current_provider_fn(scope_key_fn(chat_id, thread_id))
     task_model, session_id, provider_cli, resume_arg = task_backend_fn(session, provider)
-    full_prompt = build_augmented_prompt_fn(task_text)
+    full_prompt = build_augmented_prompt_fn(
+        task_text,
+        chat_id=chat_id,
+        message_thread_id=thread_id,
+        scope_key=scope_key_fn(chat_id, thread_id),
+        session=session,
+    )
 
     schedule_id = await schedule_manager.create_every(
         chat_id=chat_id,
@@ -371,7 +383,13 @@ async def cmd_schedule_weekly(
     session = session_manager.get(chat_id, thread_id)
     provider = current_provider_fn(scope_key_fn(chat_id, thread_id))
     task_model, session_id, provider_cli, resume_arg = task_backend_fn(session, provider)
-    full_prompt = build_augmented_prompt_fn(task_text)
+    full_prompt = build_augmented_prompt_fn(
+        task_text,
+        chat_id=chat_id,
+        message_thread_id=thread_id,
+        scope_key=scope_key_fn(chat_id, thread_id),
+        session=session,
+    )
 
     try:
         schedule_id = await schedule_manager.create_weekly(
@@ -448,7 +466,13 @@ async def cmd_schedule_daily(
     session = session_manager.get(chat_id, thread_id)
     provider = current_provider_fn(scope_key_fn(chat_id, thread_id))
     task_model, session_id, provider_cli, resume_arg = task_backend_fn(session, provider)
-    full_prompt = build_augmented_prompt_fn(task_text)
+    full_prompt = build_augmented_prompt_fn(
+        task_text,
+        chat_id=chat_id,
+        message_thread_id=thread_id,
+        scope_key=scope_key_fn(chat_id, thread_id),
+        session=session,
+    )
 
     try:
         schedule_id = await schedule_manager.create_daily(

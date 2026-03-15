@@ -923,7 +923,15 @@ class MemoryManager:
 
     # ── Context building ─────────────────────────────────────
 
-    def build_context(self, user_message: str) -> str:
+    def build_context(
+        self,
+        user_message: str,
+        *,
+        chat_id: int | None = None,
+        message_thread_id: int | None = None,
+        scope_key: str | None = None,
+        topic_label: str | None = None,
+    ) -> str:
         """Read memory and return XML context block to prepend to the prompt.
 
         Returns empty string if all memory is empty/default.
@@ -954,7 +962,14 @@ class MemoryManager:
             sections.append("<relevant_facts>\n" + "\n".join(lines) + "\n</relevant_facts>")
 
         # Episodic — search by keywords from user message
-        episodes = self.search_episodes(user_message, limit=5)
+        episodes = self.search_episodes(
+            user_message,
+            limit=5,
+            chat_id=chat_id,
+            message_thread_id=message_thread_id,
+            scope_key=scope_key,
+            topic_label=topic_label,
+        )
         if episodes:
             lines = [f"- {e['timestamp'][:10]}: {e['summary']}" for e in episodes]
             sections.append("<recent_episodes>\n" + "\n".join(lines) + "\n</recent_episodes>")
@@ -1466,37 +1481,126 @@ class MemoryManager:
         finally:
             con.close()
 
-    def search_episodes(self, query: str, limit: int = 5) -> list[dict]:
-        """Search episodes via FTS5. Falls back to recent episodes if no query match."""
+    def search_episodes(
+        self,
+        query: str,
+        limit: int = 5,
+        *,
+        chat_id: int | None = None,
+        message_thread_id: int | None = None,
+        scope_key: str | None = None,
+        topic_label: str | None = None,
+    ) -> list[dict]:
+        """Search episodes via FTS5 with optional scope/topic isolation.
+
+        When scope metadata is provided, retrieval stays inside that scope and does
+        not fall back to unrelated global episodes.
+        """
         self._ensure_storage()
         keywords = self._extract_keywords(query)
+        topic_keywords = self._extract_keywords(topic_label or "")
+        normalized_topic_label = (topic_label or "").strip().lower()
+        scoped_lookup = any(value is not None for value in (chat_id, message_thread_id, scope_key)) or bool(
+            (topic_label or "").strip()
+        )
 
         con = self._connect()
         con.row_factory = sqlite3.Row
         try:
             rows: list[sqlite3.Row] = []
+            where_parts: list[str] = []
+            params: list[object] = []
+
+            if scope_key:
+                where_parts.append("w.scope_key = ?")
+                params.append(scope_key)
+            else:
+                if chat_id is not None:
+                    where_parts.append("e.chat_id = ?")
+                    params.append(chat_id)
+                if message_thread_id is None:
+                    where_parts.append("w.message_thread_id IS NULL")
+                elif message_thread_id is not None:
+                    where_parts.append("w.message_thread_id = ?")
+                    params.append(message_thread_id)
+
+            topic_clause = ""
+            topic_params: list[object] = []
+            if normalized_topic_label:
+                topic_clause = " AND LOWER(COALESCE(w.topic_label, '')) = ?"
+                topic_params.append(normalized_topic_label)
+            elif topic_keywords:
+                topic_clause = " AND (" + " OR ".join("LOWER(COALESCE(w.topic_label, '')) LIKE ?" for _ in topic_keywords) + ")"
+                topic_params.extend([f"%{token}%" for token in topic_keywords])
+
+            where_sql = ""
+            if where_parts:
+                where_sql = "WHERE " + " AND ".join(where_parts)
 
             if keywords:
                 fts_query = " OR ".join(keywords)
                 try:
-                    rows = con.execute(
-                        "SELECT e.* FROM episodes e "
-                        "JOIN episodes_fts f ON e.id = f.rowid "
-                        "WHERE episodes_fts MATCH ? "
-                        "ORDER BY rank LIMIT ?",
-                        (fts_query, limit),
-                    ).fetchall()
+                    if scoped_lookup:
+                        rows = con.execute(
+                            """
+                            SELECT DISTINCT e.*
+                            FROM episodes e
+                            JOIN episodes_fts f ON e.id = f.rowid
+                            LEFT JOIN worklog_sessions w ON w.episode_id = e.id
+                            """
+                            + where_sql
+                            + ((" AND " if where_sql else "WHERE ") + "episodes_fts MATCH ?")
+                            + topic_clause
+                            + """
+                            ORDER BY rank, e.timestamp DESC
+                            LIMIT ?
+                            """,
+                            (*params, fts_query, *topic_params, limit),
+                        ).fetchall()
+                    else:
+                        rows = con.execute(
+                            "SELECT e.* FROM episodes e "
+                            "JOIN episodes_fts f ON e.id = f.rowid "
+                            "WHERE episodes_fts MATCH ? "
+                            "ORDER BY rank LIMIT ?",
+                            (fts_query, limit),
+                        ).fetchall()
                 except sqlite3.OperationalError:
                     # FTS query syntax error — fall back to recent
                     pass
 
-            # Fallback: most recent episodes
+            # Scoped fallback: stay inside the active scope/topic.
             if not rows:
-                rows = con.execute(
-                    "SELECT * FROM episodes ORDER BY timestamp DESC LIMIT ?",
-                    (limit,),
-                ).fetchall()
+                if scoped_lookup:
+                    rows = con.execute(
+                        """
+                        SELECT DISTINCT e.*
+                        FROM episodes e
+                        LEFT JOIN worklog_sessions w ON w.episode_id = e.id
+                        """
+                        + where_sql
+                        + topic_clause
+                        + """
+                        ORDER BY e.timestamp DESC
+                        LIMIT ?
+                        """,
+                        (*params, *topic_params, limit),
+                    ).fetchall()
+                else:
+                    rows = con.execute(
+                        "SELECT * FROM episodes ORDER BY timestamp DESC LIMIT ?",
+                        (limit,),
+                    ).fetchall()
 
+            logger.info(
+                "Episode search resolved: scope=%s chat=%s thread=%s topic=%r keywords=%s results=%d",
+                scope_key or "(global)",
+                chat_id,
+                message_thread_id,
+                topic_label,
+                keywords,
+                len(rows),
+            )
             return [dict(r) for r in rows]
         finally:
             con.close()

@@ -81,6 +81,69 @@ def test_build_context_groups_relevant_facts_by_type(tmp_path: Path) -> None:
     assert "feature_apply_commit_push_verify_preference" in context
 
 
+def test_search_episodes_scoped_fallback_avoids_unrelated_recent_topic(tmp_path: Path) -> None:
+    manager = MemoryManager(tmp_path / "memory")
+    manager.add_episode(
+        chat_id=42,
+        message_thread_id=7,
+        scope_key="42:7",
+        summary="Fix browser takeover context bleed",
+        topics=["context"],
+    )
+    manager.add_episode(
+        chat_id=42,
+        message_thread_id=8,
+        scope_key="42:8",
+        summary="Plan a weekend trip to Prague",
+        topics=["travel"],
+    )
+
+    episodes = manager.search_episodes(
+        "totally unrelated query",
+        chat_id=42,
+        message_thread_id=7,
+        scope_key="42:7",
+    )
+
+    assert len(episodes) == 1
+    assert episodes[0]["summary"] == "Fix browser takeover context bleed"
+
+
+def test_search_episodes_same_scope_prefers_matching_topic_label(tmp_path: Path) -> None:
+    manager = MemoryManager(tmp_path / "memory")
+    manager.add_episode(
+        chat_id=42,
+        message_thread_id=7,
+        scope_key="42:7",
+        session_type="codex",
+        session_id="sess-alpha",
+        topic_label="Alpha topic",
+        summary="Implement alpha context isolation",
+        topics=["context"],
+    )
+    manager.add_episode(
+        chat_id=42,
+        message_thread_id=7,
+        scope_key="42:7",
+        session_type="codex",
+        session_id="sess-beta",
+        topic_label="Beta topic",
+        summary="Implement beta notifications",
+        topics=["notifications"],
+    )
+
+    episodes = manager.search_episodes(
+        "unmatched query",
+        chat_id=42,
+        message_thread_id=7,
+        scope_key="42:7",
+        topic_label="Alpha topic",
+    )
+
+    assert len(episodes) == 1
+    assert episodes[0]["summary"] == "Implement alpha context isolation"
+
+
 def test_build_instructions_require_sql_memory_manager() -> None:
     manager = MemoryManager(Path("memory"))
     instructions = manager.build_instructions()

@@ -91,6 +91,9 @@ Last updated: 2026-03-15
 - `pytest -q tests/gmail_gateway/test_canary_guardrails.py` -> pass
 - `pytest -q tests/test_gmail_gateway_command_handlers.py` -> pass
 - `python -m compileall -q src/gmail_gateway` -> success
+- Stage live probe attempt (2026-03-15): blocked in current runtime
+  - `http://127.0.0.1:8791/health` unavailable
+  - `GMAIL_GATEWAY_REAL_BASE_URL` / `GMAIL_GATEWAY_REAL_ACCOUNT_ID` not set
 
 ## Next Slice (auto-continue target)
 

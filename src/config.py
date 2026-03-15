@@ -6,7 +6,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-VERSION: str = "0.50.7"
+VERSION: str = "0.50.8"
 
 # ── Bot token (required) ────────────────────────────────────
 BOT_TOKEN: str = os.getenv("TELEGRAM_BOT_TOKEN", "")
@@ -242,9 +242,6 @@ GMAIL_BOOTSTRAP_AUTOSTART: bool = (
 )
 
 # ── Gmail gateway service ────────────────────────────────
-GMAIL_GATEWAY_ENABLED: bool = (
-    os.getenv("GMAIL_GATEWAY_ENABLED", "1").strip().lower() in {"1", "true", "yes"}
-)
 GMAIL_GATEWAY_BASE_URL: str = os.getenv(
     "GMAIL_GATEWAY_BASE_URL",
     "http://127.0.0.1:8791",

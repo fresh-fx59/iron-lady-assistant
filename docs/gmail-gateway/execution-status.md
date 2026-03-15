@@ -27,10 +27,9 @@ Last updated: 2026-03-15
 7. Assistant-side gateway client abstraction:
    - Added `src/gmail_gateway_client.py` async client with typed error handling.
    - Added gateway runtime flags in `src/config.py`:
-     - `GMAIL_GATEWAY_ENABLED`
      - `GMAIL_GATEWAY_BASE_URL`
      - `GMAIL_GATEWAY_TIMEOUT_SECONDS`
-   - Default now enabled (`GMAIL_GATEWAY_ENABLED=1`) to enforce gateway-first behavior.
+   - Gateway is now the only supported runtime path.
 8. Gmail tool routing replacement:
    - Added `src/gmail_gateway_cli.py` for gateway operations from CLI/tooling.
    - Updated `tools/gmail.yaml` to use gateway-only commands (legacy direct `gog gmail` path removed from primary tool instructions).

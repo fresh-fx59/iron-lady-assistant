@@ -25,6 +25,12 @@ logger = logging.getLogger(__name__)
 _RESPONSE_STATUS_RE = re.compile(r"overall status:\s*[`']?(ok|warn|critical|error|failed)[`']?", re.IGNORECASE)
 _NATIVE_SCHEDULE_HEADER = "[[SCHEDULE_NATIVE]]"
 _SCHEDULE_DELIVER_MARKER = "[[SCHEDULE_DELIVER]]"
+_RATE_LIMIT_ERROR_RE = re.compile(
+    r"(usage limit|rate limit|quota exceeded|too many requests|over capacity|429)",
+    re.IGNORECASE,
+)
+_TRY_AGAIN_AT_RE = re.compile(r"try again at\s+(.+?)(?:[.]|$)", re.IGNORECASE)
+_ORDINAL_DAY_RE = re.compile(r"(\d{1,2})(st|nd|rd|th)\b", re.IGNORECASE)
 _NO_UPDATE = object()
 
 
@@ -838,17 +844,26 @@ class ScheduleManager:
 
     async def on_task_finished(self, task: BackgroundTask) -> None:
         run = await asyncio.to_thread(self._find_run_row_by_background_task_id, task.id)
+        status_value = getattr(task.status, "value", str(task.status))
+        rate_limit_retry_at = None
+        if run and status_value == "failed":
+            rate_limit_retry_at = self._scheduled_retry_at_for_rate_limit(task.error, task.completed_at)
         await asyncio.to_thread(
             self._update_run_for_background_task,
             task.id,
-            task.status.value,
+            "deferred_rate_limited" if rate_limit_retry_at else status_value,
             task.started_at.isoformat() if task.started_at else None,
             task.completed_at.isoformat() if task.completed_at else None,
             task.error,
             self._preview_text(task.response),
         )
         if run:
-            status_value = getattr(task.status, "value", str(task.status))
+            if rate_limit_retry_at:
+                await asyncio.to_thread(
+                    self._defer_schedule_next_run,
+                    run["schedule_id"],
+                    rate_limit_retry_at.isoformat(),
+                )
             finished_at = task.completed_at.astimezone().strftime("%Y-%m-%d %H:%M:%S") if task.completed_at else "unknown"
             detail = task.error or self._preview_text(task.response, 220) or "No detail"
             planned_for = datetime.fromisoformat(run["planned_for"]).astimezone().strftime("%Y-%m-%d %H:%M:%S")
@@ -857,15 +872,27 @@ class ScheduleManager:
                 run["schedule_id"],
                 run["id"],
             )
+            event_kind = "deferred_rate_limited" if rate_limit_retry_at else status_value
+            header = (
+                "⏸️ <b>Scheduled run deferred (rate limited)</b>\n"
+                if rate_limit_retry_at
+                else f"{self._status_emoji(status_value)} <b>Scheduled run {html.escape(status_value)}</b>\n"
+            )
+            retry_line = (
+                f"\n<b>Next attempt:</b> {rate_limit_retry_at.astimezone().strftime('%Y-%m-%d %H:%M:%S')}"
+                if rate_limit_retry_at
+                else ""
+            )
             await self._notify_schedule_event(
-                status_value,
+                event_kind,
                 (
-                    f"{self._status_emoji(status_value)} <b>Scheduled run {html.escape(status_value)}</b>\n"
+                    f"{header}"
                     f"<b>Schedule:</b> <code>{run['schedule_id'][:8]}</code>\n"
                     f"<b>Planned:</b> {planned_for}\n"
                     f"<b>Finished:</b> {finished_at}\n"
                     f"<b>Target:</b> {self._format_schedule_target(run['chat_id'], run['message_thread_id'])}\n"
                     f"<b>Result:</b> {html.escape(detail)}"
+                    f"{retry_line}"
                 ),
                 previous_run=previous_run,
                 current_response=task.response,
@@ -1131,6 +1158,17 @@ class ScheduleManager:
                 (background_task_id,),
             )
 
+    def _defer_schedule_next_run(self, schedule_id: str, next_run_at: str) -> None:
+        with self._connect() as con:
+            con.execute(
+                """
+                UPDATE scheduled_tasks
+                SET next_run_at = ?
+                WHERE id = ? AND next_run_at < ?
+                """,
+                (next_run_at, schedule_id, next_run_at),
+            )
+
     def _complete_run_by_id(
         self,
         schedule_id: str,
@@ -1303,7 +1341,44 @@ class ScheduleManager:
             "cancelled": "🚫",
             "submission_failed": "❌",
             "failed_recovered": "⚠️",
+            "deferred_rate_limited": "⏸️",
         }.get(status, "ℹ️")
+
+    @classmethod
+    def _scheduled_retry_at_for_rate_limit(
+        cls,
+        error_text: str | None,
+        completed_at: datetime | None,
+    ) -> datetime | None:
+        if not error_text or not cls._is_rate_limit_error(error_text):
+            return None
+        return cls._parse_retry_at(error_text) or ((completed_at or datetime.now(timezone.utc)) + timedelta(hours=1))
+
+    @staticmethod
+    def _is_rate_limit_error(error_text: str | None) -> bool:
+        return bool(error_text) and bool(_RATE_LIMIT_ERROR_RE.search(error_text))
+
+    @classmethod
+    def _parse_retry_at(cls, error_text: str) -> datetime | None:
+        match = _TRY_AGAIN_AT_RE.search(error_text or "")
+        if not match:
+            return None
+        cleaned = cls._clean_retry_at_text(match.group(1))
+        if not cleaned:
+            return None
+        local_tz = datetime.now().astimezone().tzinfo or timezone.utc
+        for fmt in ("%b %d, %Y %I:%M %p", "%B %d, %Y %I:%M %p"):
+            try:
+                parsed = datetime.strptime(cleaned, fmt)
+                return parsed.replace(tzinfo=local_tz).astimezone(timezone.utc)
+            except ValueError:
+                continue
+        return None
+
+    @staticmethod
+    def _clean_retry_at_text(raw_value: str) -> str:
+        compact = " ".join((raw_value or "").split()).rstrip(".")
+        return _ORDINAL_DAY_RE.sub(r"\1", compact)
 
     def _build_schedule_feedback_title(self, schedule: ScheduledTask, planned_for: datetime) -> str:
         return (
@@ -1580,7 +1655,7 @@ class ScheduleManager:
                     or self._normalize_detail(previous_run["response_preview"]) != self._normalize_detail(current_response)
                 )
             return previous_signal in {"warn", "critical"}
-        if event_kind in {"failed", "cancelled", "submission_failed", "failed_recovered"}:
+        if event_kind in {"failed", "cancelled", "submission_failed", "failed_recovered", "deferred_rate_limited"}:
             if previous_run is None:
                 return True
             return (

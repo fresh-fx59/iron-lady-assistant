@@ -550,6 +550,64 @@ async def test_schedule_run_updated_when_background_task_finishes(tmp_path) -> N
 
 
 @pytest.mark.asyncio
+async def test_schedule_rate_limit_failure_defers_next_run_until_retry_time(tmp_path) -> None:
+    stub = _StubTaskManager()
+    notifier = AsyncMock()
+    manager = ScheduleManager(
+        stub,
+        tmp_path / "schedules.db",
+        notification_bot=notifier,
+        notification_chat_id=-100123,
+        notification_thread_id=77,
+        notify_level="all",
+    )
+    sid = await manager.create_every(
+        chat_id=42,
+        user_id=7,
+        prompt="scheduled prompt",
+        interval_minutes=1,
+        model="gpt-5-codex",
+        provider_cli="codex",
+    )
+    past = (datetime.now(timezone.utc) - timedelta(minutes=1)).isoformat()
+    await asyncio.to_thread(manager._update_next_run, sid, past)  # noqa: SLF001
+
+    await manager._run_due_once()  # noqa: SLF001
+    background_task_id = stub.submissions[0]["task_id"]
+    started_at = datetime.now(timezone.utc)
+    completed_at = datetime.now(timezone.utc)
+    error_text = (
+        "You've hit your usage limit. To get more access now, send a request to your admin "
+        "or try again at Mar 17th, 2026 1:36 PM."
+    )
+    finished_task = type(
+        "FinishedTask",
+        (),
+        {
+            "id": background_task_id,
+            "status": type("TaskStatusValue", (), {"value": "failed"})(),
+            "started_at": started_at,
+            "completed_at": completed_at,
+            "error": error_text,
+            "response": error_text,
+        },
+    )()
+
+    await manager.on_task_finished(finished_task)
+
+    updated_run = (await manager.list_runs_for_chat(42, schedule_id=sid))[0]
+    assert updated_run.status == "deferred_rate_limited"
+    schedule = (await manager.list_for_chat(42))[0]
+    expected_retry = datetime(2026, 3, 17, 13, 36, tzinfo=completed_at.astimezone().tzinfo).astimezone(timezone.utc)
+    assert schedule.next_run_at == expected_retry
+    assert schedule.current_status is None
+    assert notifier.send_message.await_count == 2
+    notification_text = notifier.send_message.await_args_list[-1].kwargs["text"]
+    assert "Scheduled run deferred (rate limited)" in notification_text
+    assert "Next attempt:" in notification_text
+
+
+@pytest.mark.asyncio
 async def test_create_weekly_schedule(tmp_path) -> None:
     manager = ScheduleManager(_StubTaskManager(), tmp_path / "schedules.db")
 

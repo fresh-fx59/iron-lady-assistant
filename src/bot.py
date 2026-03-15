@@ -203,6 +203,8 @@ def _format_schedule_run_status(run) -> str:  # noqa: ANN001
         return "submission failed"
     if run.status == "failed_recovered":
         return "failed after restart"
+    if run.status == "deferred_rate_limited":
+        return "deferred until quota reset"
     if run.status == "submitted":
         return "queued"
     return run.status.replace("_", " ")

@@ -6,7 +6,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-VERSION: str = "0.51.9"
+VERSION: str = "0.51.11"
 
 # ── Bot token (required) ────────────────────────────────────
 BOT_TOKEN: str = os.getenv("TELEGRAM_BOT_TOKEN", "")
@@ -105,6 +105,15 @@ SCOPE_SNAPSHOT_COMPLETED_HASHES_LIMIT: int = int(
     os.getenv("SCOPE_SNAPSHOT_COMPLETED_HASHES_LIMIT", "20")
 )
 PROGRESS_DEBOUNCE_SECONDS: float = float(os.getenv("PROGRESS_DEBOUNCE_SECONDS", "3.0"))
+TELEGRAM_PROGRESS_INITIAL_DELAY_SECONDS: float = float(
+    os.getenv("TELEGRAM_PROGRESS_INITIAL_DELAY_SECONDS", "8.0")
+)
+TELEGRAM_STATUS_MESSAGE_COOLDOWN_SECONDS: float = float(
+    os.getenv("TELEGRAM_STATUS_MESSAGE_COOLDOWN_SECONDS", "8.0")
+)
+TELEGRAM_BACKGROUND_STATUS_MESSAGE_COOLDOWN_SECONDS: float = float(
+    os.getenv("TELEGRAM_BACKGROUND_STATUS_MESSAGE_COOLDOWN_SECONDS", "45.0")
+)
 VOICE_TRANSCRIPTION_MAX_CONCURRENCY: int = max(
     1,
     int(os.getenv("VOICE_TRANSCRIPTION_MAX_CONCURRENCY", "1")),

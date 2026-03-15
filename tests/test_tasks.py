@@ -41,6 +41,73 @@ async def test_typing_loop_sends_fallback_when_chat_action_fails() -> None:
 
 
 @pytest.mark.asyncio
+async def test_notify_started_uses_ephemeral_status_throttle(monkeypatch) -> None:
+    bot = AsyncMock()
+    manager = TaskManager(bot)
+    task = BackgroundTask(
+        id="task-start",
+        chat_id=123,
+        message_thread_id=77,
+        user_id=123,
+        prompt="x",
+        model="sonnet",
+        session_id=None,
+        status=TaskStatus.RUNNING,
+        created_at=datetime.now(),
+        feedback_title="🔄 <b>Working...</b>",
+    )
+
+    call_args = {}
+
+    async def fake_send_ephemeral_status(chat_id, sender, *, minimum_interval_seconds=None):  # noqa: ANN001, ARG001
+        call_args["chat_id"] = chat_id
+        call_args["minimum_interval_seconds"] = minimum_interval_seconds
+        return await sender()
+
+    monkeypatch.setattr("src.tasks.send_ephemeral_status", fake_send_ephemeral_status)
+    monkeypatch.setattr("src.tasks.config.TELEGRAM_BACKGROUND_STATUS_MESSAGE_COOLDOWN_SECONDS", 45.0)
+
+    await manager._notify_started(task)  # noqa: SLF001
+
+    assert call_args == {"chat_id": 123, "minimum_interval_seconds": 45.0}
+    bot.send_message.assert_awaited_once_with(
+        chat_id=123,
+        message_thread_id=77,
+        text="🔄 <b>Working...</b>",
+        parse_mode="HTML",
+    )
+
+
+@pytest.mark.asyncio
+async def test_send_ephemeral_feedback_returns_false_when_suppressed(monkeypatch) -> None:
+    bot = AsyncMock()
+    manager = TaskManager(bot)
+    task = BackgroundTask(
+        id="task-suppressed",
+        chat_id=123,
+        message_thread_id=77,
+        user_id=123,
+        prompt="x",
+        model="sonnet",
+        session_id=None,
+        status=TaskStatus.RUNNING,
+        created_at=datetime.now(),
+    )
+
+    async def fake_send_ephemeral_status(chat_id, sender, *, minimum_interval_seconds=None):  # noqa: ANN001, ARG001
+        from src.telegram_status_throttle import EphemeralStatusSuppressedError
+
+        raise EphemeralStatusSuppressedError()
+
+    monkeypatch.setattr("src.tasks.send_ephemeral_status", fake_send_ephemeral_status)
+
+    sent = await manager._send_ephemeral_feedback(task, text="⏳ Still working...")  # noqa: SLF001
+
+    assert sent is False
+    bot.send_message.assert_not_called()
+
+
+@pytest.mark.asyncio
 async def test_execute_task_stream_result_does_not_raise_typeerror(monkeypatch) -> None:
     bot = AsyncMock()
     manager = TaskManager(bot)

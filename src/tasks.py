@@ -14,6 +14,7 @@ from aiogram import Bot
 from . import bridge, config, metrics
 from .formatter import markdown_to_html, split_message, strip_html
 from .media import extract_media_directives, send_media, strip_tool_directive_lines
+from .telegram_status_throttle import EphemeralStatusSuppressedError, send_ephemeral_status
 from .sessions import make_scope_key
 
 logger = logging.getLogger(__name__)
@@ -756,12 +757,11 @@ class TaskManager:
                 )
                 if not fallback_sent or send_failures % 6 == 0:
                     try:
-                        await self.bot.send_message(
-                            chat_id=task.chat_id,
-                            message_thread_id=task.message_thread_id,
+                        if await self._send_ephemeral_feedback(
+                            task,
                             text="⏳ Still working...",
-                        )
-                        fallback_sent = True
+                        ):
+                            fallback_sent = True
                     except Exception as notify_exc:
                         logger.warning(
                             "Fallback progress notification failed for task %s: %s",
@@ -775,14 +775,34 @@ class TaskManager:
             return
         try:
             title = task.feedback_title or "🔄 <b>Working...</b>"
-            await self.bot.send_message(
-                chat_id=task.chat_id,
-                message_thread_id=task.message_thread_id,
-                text=title,
-                parse_mode="HTML",
-            )
+            await self._send_ephemeral_feedback(task, text=title, parse_mode="HTML")
         except Exception as exc:
             logger.warning("Failed to notify task start for %s: %s", task.id, exc)
+
+    async def _send_ephemeral_feedback(
+        self,
+        task: BackgroundTask,
+        *,
+        text: str,
+        parse_mode: str | None = None,
+    ) -> bool:
+        async def _send():
+            return await self.bot.send_message(
+                chat_id=task.chat_id,
+                message_thread_id=task.message_thread_id,
+                text=text,
+                parse_mode=parse_mode,
+            )
+
+        try:
+            await send_ephemeral_status(
+                task.chat_id,
+                _send,
+                minimum_interval_seconds=config.TELEGRAM_BACKGROUND_STATUS_MESSAGE_COOLDOWN_SECONDS,
+            )
+        except EphemeralStatusSuppressedError:
+            return False
+        return True
 
     async def _notify_observers(self, task: BackgroundTask) -> None:
         for observer in self._observers:

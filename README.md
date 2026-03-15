@@ -369,6 +369,8 @@ All settings are in the `.env` file. Edit it anytime and restart the bot.
 | `CLAUDE_WORKING_DIR` | No | — | Working directory for Claude |
 | `IDLE_TIMEOUT` | No | `120` | Seconds without output before timeout |
 | `PROGRESS_DEBOUNCE_SECONDS` | No | `3.0` | Min seconds between progress updates |
+| `TELEGRAM_PROGRESS_INITIAL_DELAY_SECONDS` | No | `8.0` | Delay before the bot posts a transient `Working...` status message |
+| `TELEGRAM_STATUS_MESSAGE_COOLDOWN_SECONDS` | No | `8.0` | Minimum gap between transient status-message sends per Telegram chat |
 | `VOICE_TRANSCRIPTION_MAX_CONCURRENCY` | No | `1` | Max number of concurrent whisper transcription jobs |
 | `VOICE_TRANSCRIPTION_THREADS` | No | `cpu_count / max_concurrency` | Threads passed to each `whisper-cli` process |
 | `METRICS_PORT` | No | `9101` | Prometheus metrics port (0 to disable) |
@@ -682,7 +684,7 @@ The bundled systemd units include the per-user npm bin path so `codex` CLIs inst
     ├── bridge.py         # Claude Code subprocess bridge
     ├── sessions.py       # Conversation session management
     ├── providers.py      # Provider fallback chain
-    ├── memory.py         # Persistent memory (YAML profile + SQLite episodes)
+    ├── memory.py         # Persistent memory (SQL profile/facts + SQLite episodes)
     ├── tools.py          # Backward-compatible shim to tools plugin
     ├── scheduler.py      # Persistent recurring schedule runner
     ├── scheduler_daemon.py # Standalone scheduler runtime

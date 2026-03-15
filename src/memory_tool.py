@@ -34,7 +34,7 @@ def _build_parser() -> argparse.ArgumentParser:
     upsert_cmd.add_argument("--updated", default=None)
     upsert_cmd.add_argument("--mode", choices=["replace", "append"], default="replace")
 
-    delete_cmd = sub.add_parser("delete", help="Delete fact by key.")
+    delete_cmd = sub.add_parser("delete", help="Soft-delete fact by key.")
     delete_cmd.add_argument("--key", required=True)
     delete_cmd.add_argument("--value", default=None)
 

@@ -12,7 +12,7 @@ Telegram bot that bridges messages to Claude Code's `--print` mode via subproces
 - **Streaming output** with idle timeout (default 120s) — checks if subprocess is still alive on timeout; only fails if process actually dies
 - **Live progress updates** show current Claude activity (Reading, Editing, Running commands, etc.) with heartbeat animation for long-running tasks
 - **Per-chat state** with asyncio.Lock prevents overlapping Claude invocations
-- **Persistent memory** — YAML profile + SQLite FTS5 episodic memory, injected as XML context before each message
+- **Persistent memory** — SQL-backed profile + facts + episodic memory in SQLite, injected as XML context before each message
 
 ## Project Structure
 
@@ -25,7 +25,7 @@ src/
 ├── main.py                 # Entry point, dispatcher setup, polling, metrics server
 ├── config.py               # Env vars: BOT_TOKEN, ALLOWED_USER_IDS, DEFAULT_MODEL, IDLE_TIMEOUT, MEMORY_DIR, TOOLS_DIR
 ├── bot.py                  # Telegram handlers: /start, /new, /model, /provider, /status, /memory, /tools, /rollback, /selfmod_apply, /schedule_*, /bg, /cancel
-├── memory.py               # Persistent memory: YAML profile + SQLite FTS5 episodic, context injection
+├── memory.py               # Persistent memory: SQL-backed profile/facts + SQLite FTS5 episodic, context injection
 ├── tools.py                # Backward-compatible shim to plugins/tools_plugin.py
 ├── tasks.py                # Background task manager with queue and completion notifications
 ├── scheduler.py            # Persistent recurring schedules, native command runs, LLM escalation on alerts
@@ -409,16 +409,16 @@ Persistent, global memory that makes the assistant smarter over time. Layered ar
 
 | Layer | Storage | Description |
 |-------|---------|-------------|
-| **Core** | `memory/user_profile.yaml` | User profile: name, timezone, communication style, languages |
-| **Semantic** | `memory/user_profile.yaml` | Typed facts with confidence scores (0.0–1.0), source (explicit/inferred), date |
-| **Episodic** | `memory/episodes.db` | Conversation summaries in SQLite with FTS5 full-text search |
+| **Core** | `memory/episodes.db` (`memory_profile`) | User profile: name, timezone, communication style, languages |
+| **Semantic** | `memory/episodes.db` (`memory_facts`) | Typed facts with confidence scores (0.0–1.0), source (explicit/inferred), soft-delete lifecycle |
+| **Episodic** | `memory/episodes.db` (`episodes` + FTS5) | Conversation summaries in SQLite with full-text search |
 | **Working** | In-context (`--resume`) | Current session state, handled by Claude Code natively |
 
 ### How it works
 
-1. **Before each message**: `MemoryManager.build_context()` reads YAML profile + selects relevant typed facts by keyword match, then searches SQLite FTS5 by keywords from the user's message
-2. **Memory instructions**: Absolute path to `user_profile.yaml` is appended so Claude edits YAML directly (without shell parsing commands)
-3. **REMEMBER/FORGET**: Claude updates the YAML file naturally — no special command parsing needed
+1. **Before each message**: `MemoryManager.build_context()` reads SQL profile/facts and selects relevant typed facts by keyword match, then searches SQLite FTS5 episodes by keywords from the user's message
+2. **Memory instructions**: `<memory_instructions>` explicitly tells the agent to use SQL-backed facts via `memory-manager`
+3. **REMEMBER/FORGET**: memory updates are done via structured SQL-backed operations (`list|upsert|delete|reclassify`)
 4. **REFLECT**: On `/new`, a background reflection resumes the active provider session, summarizes the conversation, and stores it as an episode in SQLite. Claude-compatible providers use the provider env; Codex-family providers resume via their Codex session.
 5. **RECALL**: FTS5 keyword search against the user's message surfaces relevant past episodes
 
@@ -440,7 +440,8 @@ Persistent, global memory that makes the assistant smarter over time. Layered ar
 
 [user message]
 <memory_instructions>
-Your profile + facts file: /absolute/path/to/memory/user_profile.yaml
+You have persistent memory. Facts are stored in SQL (no YAML profile file).
+Use the memory-manager tool to list/upsert/delete/reclassify facts.
 </memory_instructions>
 ```
 

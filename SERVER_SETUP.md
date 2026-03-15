@@ -19,8 +19,7 @@ Reproducible setup for Alex's server. Follow this if migrating to a new server.
 ├── claude-code-as-assistant/   # Telegram bot (git repo)
 │   ├── src/                    # Bot source code
 │   ├── memory/                 # Bot memory — gitignored, must be restored
-│   │   ├── user_profile.yaml   # User profile + semantic facts (YAML)
-│   │   └── episodes.db         # Episodic memory (SQLite FTS5)
+│   │   └── episodes.db         # Core profile + semantic facts + episodic memory (SQLite FTS5)
 │   ├── tools/                  # Custom tool definitions (YAML)
 │   ├── .deploy/                # Deploy state (gitignored)
 │   ├── .env                    # Bot secrets (gitignored)
@@ -54,10 +53,10 @@ Used by the Telegram bot. Injected as XML context before each Claude Code subpro
 
 | Layer | File | Description |
 |-------|------|-------------|
-| Core + Semantic | `memory/user_profile.yaml` | User profile, preferences, facts with confidence scores |
-| Episodic | `memory/episodes.db` | SQLite FTS5 — conversation summaries, keyword-searchable |
+| Core + Semantic | `memory/episodes.db` | SQL tables (`memory_profile`, `memory_facts`) for profile and typed facts |
+| Episodic | `memory/episodes.db` | SQLite FTS5 (`episodes`, `episodes_fts`) — conversation summaries, keyword-searchable |
 
-**Restore**: The bot creates these automatically on first run. `user_profile.yaml` starts empty and accumulates facts over time. Episodes build up from `/new` session reflections.
+**Restore**: The bot creates these automatically on first run. Facts and profile accumulate in SQL tables over time. Episodes build up from `/new` session reflections.
 
 **Backup strategy**: Back up `memory/` directory periodically. On a new server, copy it back before starting the bot.
 

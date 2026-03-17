@@ -208,3 +208,14 @@ def test_browser_takeover_manifest_exposes_remote_bridge_commands() -> None:
     assert "browser extension" in manifest["triggers"]
     assert "BROWSER_TAKEOVER_PUBLIC_BASE_URL=https://YOUR-HOST/browser-takeover python3 -m src.browser_takeover setup" in manifest["instructions"]
     assert "python3 -m src.browser_takeover targets --format json" in manifest["instructions"]
+
+
+def test_agent_browser_manifest_exposes_generic_wrapper_commands() -> None:
+    manifest_path = Path(__file__).resolve().parents[1] / "tools" / "agent-browser.yaml"
+    manifest = yaml.safe_load(manifest_path.read_text())
+
+    assert manifest["tier"] == "extended"
+    assert "vercel agent-browser" in manifest["triggers"]
+    assert "python3 -m src.agent_browser setup" in manifest["instructions"]
+    assert "python3 -m src.agent_browser raw -- find button Login click" in manifest["instructions"]
+    assert "browser_takeover" in manifest["instructions"]

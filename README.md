@@ -105,6 +105,23 @@ Notes:
 - If local Linux browser launch fails because of missing shared libraries, keep using the same wrapper but switch to a remote `agent-browser` provider such as `--provider browseruse`, `--provider kernel`, or `--provider browserbase`
 - The final purchase step is intentionally separate and requires `--confirm`
 
+## Generic Agent Browser Automation
+
+For non-Ozon browser tasks, use the repo-local generic wrapper around `agent-browser`:
+
+```bash
+cd /home/claude-developer/iron-lady-assistant
+python3 -m src.agent_browser setup
+python3 -m src.agent_browser open https://example.com
+python3 -m src.agent_browser snapshot
+python3 -m src.agent_browser click 'text=Sign in'
+```
+
+Notes:
+- State is stored under `~/.local/state/iron-lady-assistant/agent-browser/<session>/`
+- This path uses a dedicated automation browser session
+- If you need the user's real Chrome tab instead, use the browser takeover relay flow below
+
 ### MacBook Pro Setup (CDP Path)
 
 Start with the repo-local setup helper so the wrapper tells you which path to use on the current machine:

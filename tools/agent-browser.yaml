@@ -1,0 +1,62 @@
+name: agent-browser
+description: General browser automation via Vercel Labs' agent-browser using a dedicated automation browser session.
+tier: extended
+triggers:
+  - agent-browser
+  - agent browser
+  - vercel agent-browser
+  - browser automation
+  - automated browser
+instructions: |
+  # Agent Browser
+
+  Use this tool for general browser automation in a dedicated automation browser session managed by this repo.
+
+  Primary commands:
+  - Inspect local setup and recommended path:
+    `python3 -m src.agent_browser setup`
+  - Open a URL:
+    `python3 -m src.agent_browser open https://example.com`
+  - Read the current page snapshot:
+    `python3 -m src.agent_browser snapshot`
+  - Click an element:
+    `python3 -m src.agent_browser click '<selector-or-ref>'`
+  - Type text:
+    `python3 -m src.agent_browser type '<selector-or-ref>' 'text'`
+  - Fill an input:
+    `python3 -m src.agent_browser fill '<selector-or-ref>' 'value'`
+  - Wait for a selector:
+    `python3 -m src.agent_browser wait --selector '<selector>'`
+  - Wait for visible text:
+    `python3 -m src.agent_browser wait --text 'Ready'`
+  - Wait for time:
+    `python3 -m src.agent_browser wait --ms 3000`
+  - Read URL/title/text:
+    `python3 -m src.agent_browser get url`
+    `python3 -m src.agent_browser get title`
+    `python3 -m src.agent_browser get text '<selector-or-ref>'`
+  - Evaluate page JavaScript:
+    `python3 -m src.agent_browser eval 'JSON.stringify({title: document.title})'`
+  - Capture a screenshot:
+    `python3 -m src.agent_browser screenshot /tmp/page.png --full-page`
+  - Pass a raw command through to `agent-browser`:
+    `python3 -m src.agent_browser raw -- find button Login click`
+  - Close the session:
+    `python3 -m src.agent_browser close`
+
+  Operating model:
+  - State is stored under `~/.local/state/iron-lady-assistant/agent-browser/<session>/`.
+  - This path uses a dedicated automation browser, not the user's real Chrome tabs.
+  - Global passthrough flags are supported before the subcommand: `--session`, `--headed`, `--provider`, `--proxy`, `--cdp`, `--allowed-domains`, `--browser-arg`.
+  - If local browser launch is problematic, keep the same wrapper and switch providers with `--provider browseruse`, `--provider kernel`, or `--provider browserbase`.
+
+  When to use `browser_takeover` instead:
+  - The user wants automation in their already-open personal Chrome tab.
+  - The task depends on the user's live logged-in browser state/profile.
+  - The user explicitly mentions the extension, relay, attach-tab flow, or personal browser.
+
+  Safety:
+  - Prefer `snapshot`, `get`, or `screenshot` before mutating actions.
+  - Do not perform destructive actions, purchases, or final confirmations unless the user explicitly confirms in the current conversation.
+setup: |
+  python3 -m src.agent_browser setup

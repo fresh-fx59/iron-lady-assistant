@@ -142,13 +142,16 @@ class SessionManager:
         chat_id: int,
         message_thread_id: int | None,
         topic_label: str | None = None,
+        *,
+        replace_topic_label: bool = False,
     ) -> None:
         session = self.get(chat_id, message_thread_id)
         now_iso = datetime.now(timezone.utc).isoformat()
         session.last_activity_at = now_iso
         if topic_label and topic_label.strip():
             clean_label = topic_label.strip()
-            if session.topic_label != clean_label:
+            should_replace = replace_topic_label or session.topic_label is None
+            if should_replace and session.topic_label != clean_label:
                 session.topic_label = clean_label
                 if session.topic_started_at is None:
                     session.topic_started_at = now_iso

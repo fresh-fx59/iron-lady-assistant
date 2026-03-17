@@ -193,3 +193,19 @@ class TestMultipleSessionFields:
         data = json.loads((tmppath / "sessions.json").read_text())
         assert data["12345:99"]["topic_label"] == "Task A"
         assert data["12345:99"]["message_thread_id"] == 99
+
+    def test_thread_tracking_preserves_existing_topic_label_without_explicit_replace(self, tmppath):
+        manager = SessionManager()
+        manager.touch_thread(12345, 99, topic_label="Task A")
+        manager.touch_thread(12345, 99, topic_label="Latest user message")
+
+        data = json.loads((tmppath / "sessions.json").read_text())
+        assert data["12345:99"]["topic_label"] == "Task A"
+
+    def test_thread_tracking_allows_explicit_topic_label_replace(self, tmppath):
+        manager = SessionManager()
+        manager.touch_thread(12345, 99, topic_label="Task A")
+        manager.touch_thread(12345, 99, topic_label="Task B", replace_topic_label=True)
+
+        data = json.loads((tmppath / "sessions.json").read_text())
+        assert data["12345:99"]["topic_label"] == "Task B"

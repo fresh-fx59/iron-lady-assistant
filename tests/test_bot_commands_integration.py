@@ -453,6 +453,34 @@ def test_worklog_subprocess_env_includes_thread_scope_for_parallel_topics() -> N
     assert env["ILA_WORKLOG_PROVIDER"] == "codex"
 
 
+def test_touch_thread_context_does_not_overwrite_existing_topic_label_with_regular_message(mock_message) -> None:
+    from src.bot import _touch_thread_context, session_manager
+
+    mock_message.message_thread_id = 77
+    mock_message.text = "Regular follow-up inside the topic"
+    mock_message.forum_topic_created = None
+    mock_message.forum_topic_edited = None
+    session_manager.touch_thread(123456789, 77, topic_label="Real Topic", replace_topic_label=True)
+
+    _touch_thread_context(mock_message)
+
+    assert session_manager.get(123456789, 77).topic_label == "Real Topic"
+
+
+def test_touch_thread_context_updates_topic_label_from_explicit_topic_edit(mock_message) -> None:
+    from src.bot import _touch_thread_context, session_manager
+
+    mock_message.message_thread_id = 77
+    mock_message.text = None
+    mock_message.forum_topic_created = None
+    mock_message.forum_topic_edited = type("TopicEdit", (), {"name": "Renamed Topic"})()
+    session_manager.touch_thread(123456789, 77, topic_label="Old Topic", replace_topic_label=True)
+
+    _touch_thread_context(mock_message)
+
+    assert session_manager.get(123456789, 77).topic_label == "Renamed Topic"
+
+
 # ── Contract 4: /model command ───────────────────────────────────
 @pytest.mark.asyncio
 class TestModelCommand:

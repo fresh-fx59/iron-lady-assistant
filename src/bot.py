@@ -370,19 +370,19 @@ def _actor_id(message: Message) -> int:
     return _actor_id_impl(message)
 
 
-def _topic_label_from_message(message: Message, override_text: str | None = None) -> str | None:
+def _topic_label_from_message(message: Message, override_text: str | None = None) -> tuple[str | None, bool]:
     created = getattr(message, "forum_topic_created", None)
     if created and getattr(created, "name", None):
-        return str(created.name).strip()
+        return str(created.name).strip(), True
 
     edited = getattr(message, "forum_topic_edited", None)
     if edited and getattr(edited, "name", None):
-        return str(edited.name).strip()
+        return str(edited.name).strip(), True
 
     raw = (override_text or message.text or "").strip()
     if not raw or raw.startswith("/"):
-        return None
-    return raw.splitlines()[0][:120]
+        return None, False
+    return raw.splitlines()[0][:120], False
 
 
 def _touch_thread_context(message: Message, override_text: str | None = None) -> None:
@@ -390,10 +390,13 @@ def _touch_thread_context(message: Message, override_text: str | None = None) ->
     thread_id = _thread_id(message)
     if thread_id is None:
         return
+    session = session_manager.get(chat_id, thread_id)
+    topic_label, explicit = _topic_label_from_message(message, override_text=override_text)
     session_manager.touch_thread(
         chat_id=chat_id,
         message_thread_id=thread_id,
-        topic_label=_topic_label_from_message(message, override_text=override_text),
+        topic_label=topic_label if explicit or session.topic_label is None else None,
+        replace_topic_label=explicit,
     )
 
 

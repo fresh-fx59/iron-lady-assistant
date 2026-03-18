@@ -279,7 +279,9 @@ For voice messages, the bot now shows live transcription progress immediately af
 
 For photo messages, the bot runs best-effort local OCR (Tesseract) only when an image is uploaded and appends extracted text to the prompt when available; text-only turns never run OCR.
 
-Incoming Telegram `text`, `voice`, and `photo` updates are also logged with delivery metadata only (`chat/thread/message/user/content_type/length`, plus voice duration or photo count) so missed-message incidents can be diagnosed from `journalctl` without storing message contents in logs.
+For document attachments, the bot stores a local copy under `memory/incoming_media/`, appends file metadata and path to the prompt, and includes a best-effort text preview for common text files (and PDFs when `pdftotext` is installed). If you reply to an earlier message that had a file/photo attachment, that referenced attachment context is also appended to your new turn.
+
+Incoming Telegram `text`, `voice`, `photo`, and `document` updates are also logged with delivery metadata only (`chat/thread/message/user/content_type/length`, plus voice duration/photo count/document size) so missed-message incidents can be diagnosed from `journalctl` without storing message contents in logs.
 
 ## Codex Instance Helper
 

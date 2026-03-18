@@ -5,6 +5,7 @@ import html
 import inspect
 import json
 import logging
+import mimetypes
 import os
 import re
 import shutil
@@ -133,7 +134,14 @@ _CODEX_TRANSIENT_ERROR_PATTERNS = (
     re.compile(r"\b(etimedout|econnreset|connection reset)\b", re.IGNORECASE),
 )
 _IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png"}
+_TEXT_ATTACHMENT_EXTENSIONS = {
+    ".txt", ".md", ".markdown", ".rst", ".csv", ".tsv", ".json", ".jsonl", ".yaml", ".yml",
+    ".xml", ".html", ".htm", ".ini", ".cfg", ".conf", ".log", ".sql", ".py", ".js", ".ts",
+    ".tsx", ".jsx", ".java", ".go", ".rs", ".c", ".h", ".cpp", ".hpp", ".sh", ".toml",
+}
 _INCOMING_MEDIA_DIR = config.MEMORY_DIR / "incoming_media"
+_MAX_ATTACHMENT_PREVIEW_BYTES = 512 * 1024
+_MAX_ATTACHMENT_PREVIEW_CHARS = 8000
 _EMPTY_RESPONSE_FALLBACK_TEXT = (
     "I received an empty response from the provider. "
     "Please resend your last message."
@@ -172,6 +180,7 @@ def _message_log_context(message: Message) -> dict[str, object]:
     text = message.text or caption or ""
     voice = getattr(message, "voice", None)
     photo = getattr(message, "photo", None)
+    document = getattr(message, "document", None)
     return {
         "chat_id": message.chat.id,
         "thread_id": _thread_id(message),
@@ -182,6 +191,8 @@ def _message_log_context(message: Message) -> dict[str, object]:
         "has_caption": bool(caption),
         "voice_duration": getattr(voice, "duration", None) if voice else None,
         "photo_count": len(photo) if photo else 0,
+        "has_document": bool(document),
+        "document_size": getattr(document, "file_size", None) if document else None,
     }
 
 
@@ -234,7 +245,7 @@ def _format_active_schedule_summary(item) -> str:  # noqa: ANN001
 def _log_incoming_message(message: Message, route: str) -> None:
     ctx = _message_log_context(message)
     logger.info(
-        "Incoming %s message: chat=%s thread=%s message=%s user=%s type=%s text_len=%s caption=%s voice_duration=%s photo_count=%s",
+        "Incoming %s message: chat=%s thread=%s message=%s user=%s type=%s text_len=%s caption=%s voice_duration=%s photo_count=%s has_document=%s document_size=%s",
         route,
         ctx["chat_id"],
         ctx["thread_id"],
@@ -245,6 +256,8 @@ def _log_incoming_message(message: Message, route: str) -> None:
         ctx["has_caption"],
         ctx["voice_duration"],
         ctx["photo_count"],
+        ctx["has_document"],
+        ctx["document_size"],
     )
 
 
@@ -576,26 +589,133 @@ async def _download_photo_attachment(message: Message) -> str | None:
         return None
 
 
+def _text_preview_from_file(path: str, mime_type: str | None = None) -> str:
+    suffix = Path(path).suffix.lower()
+    guessed_mime = mime_type or mimetypes.guess_type(path)[0] or ""
+    if suffix != ".pdf" and suffix not in _TEXT_ATTACHMENT_EXTENSIONS and not guessed_mime.startswith("text/"):
+        return ""
+    if suffix == ".pdf":
+        pdftotext = shutil.which("pdftotext")
+        if not pdftotext:
+            return ""
+        result = subprocess.run(
+            [pdftotext, "-q", path, "-"],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode != 0:
+            return ""
+        text = result.stdout
+    else:
+        with open(path, "rb") as fh:
+            raw = fh.read(_MAX_ATTACHMENT_PREVIEW_BYTES + 1)
+        truncated_bytes = len(raw) > _MAX_ATTACHMENT_PREVIEW_BYTES
+        if truncated_bytes:
+            raw = raw[:_MAX_ATTACHMENT_PREVIEW_BYTES]
+        try:
+            text = raw.decode("utf-8")
+        except UnicodeDecodeError:
+            text = raw.decode("utf-8", errors="replace")
+        if truncated_bytes:
+            text += "\n...[truncated due to size]..."
+    normalized = text.strip()
+    if not normalized:
+        return ""
+    if len(normalized) > _MAX_ATTACHMENT_PREVIEW_CHARS:
+        normalized = f"{normalized[:_MAX_ATTACHMENT_PREVIEW_CHARS]}\n...[truncated]..."
+    return normalized
+
+
+async def _download_document_attachment(message: Message) -> dict[str, object] | None:
+    document = getattr(message, "document", None)
+    if not document:
+        return None
+    try:
+        tg_file = await message.bot.get_file(document.file_id)
+        file_name = getattr(document, "file_name", None) or Path(tg_file.file_path or "").name or "attachment.bin"
+        suffix = Path(file_name).suffix.lower() or Path(tg_file.file_path or "").suffix.lower() or ".bin"
+        _INCOMING_MEDIA_DIR.mkdir(parents=True, exist_ok=True)
+        target_path = _INCOMING_MEDIA_DIR / f"{message.chat.id}_{message.message_id}_{uuid4().hex[:8]}{suffix}"
+        await message.bot.download_file(tg_file.file_path, destination=target_path)
+        mime_type = getattr(document, "mime_type", None) or mimetypes.guess_type(file_name)[0]
+        preview_text = await asyncio.to_thread(_text_preview_from_file, str(target_path), mime_type)
+        return {
+            "path": str(target_path),
+            "file_name": file_name,
+            "mime_type": mime_type or "",
+            "size_bytes": int(getattr(document, "file_size", 0) or 0),
+            "preview_text": preview_text,
+        }
+    except Exception:
+        logger.exception("Failed to download document attachment for message %s", message.message_id)
+        return None
+
+
+async def _attachment_blocks_for_message(message: Message, *, relation: str = "current") -> list[str]:
+    blocks: list[str] = []
+    image_path = await _download_photo_attachment(message)
+    if image_path:
+        ocr_text = await asyncio.to_thread(extract_ocr_text, image_path)
+        image_block = (
+            "User attached an image.\n"
+            f"Local image path: {image_path}\n"
+            "Inspect this image when answering."
+        )
+        if relation != "current":
+            image_block = "User referenced an earlier image in this message.\n" + image_block
+        if ocr_text:
+            image_block += (
+                "\n"
+                "Local OCR text (best-effort; low-quality images may include misreads):\n"
+                f"{ocr_text}"
+            )
+        blocks.append(image_block)
+
+    document_info = await _download_document_attachment(message)
+    if document_info:
+        document_block_lines = [
+            "User attached a file.",
+            f"Filename: {document_info['file_name']}",
+            f"Local file path: {document_info['path']}",
+        ]
+        mime_type = str(document_info.get("mime_type") or "").strip()
+        if mime_type:
+            document_block_lines.append(f"MIME type: {mime_type}")
+        size_bytes = int(document_info.get("size_bytes") or 0)
+        if size_bytes > 0:
+            document_block_lines.append(f"Size bytes: {size_bytes}")
+        if relation != "current":
+            document_block_lines.insert(0, "User referenced an earlier file in this message.")
+        preview_text = str(document_info.get("preview_text") or "").strip()
+        if preview_text:
+            document_block_lines.extend(
+                [
+                    "Extracted text preview (best-effort):",
+                    preview_text,
+                ]
+            )
+        else:
+            document_block_lines.append(
+                "No local text preview extracted. Read the local file path directly when needed."
+            )
+        blocks.append("\n".join(document_block_lines))
+
+    return blocks
+
+
 async def _compose_incoming_prompt(message: Message, override_text: str | None = None) -> str:
     base_text = _message_base_text(message, override_text)
-    image_path = await _download_photo_attachment(message)
-    if not image_path:
+    blocks = await _attachment_blocks_for_message(message, relation="current")
+    reply = getattr(message, "reply_to_message", None)
+    if reply is not None:
+        blocks.extend(await _attachment_blocks_for_message(reply, relation="reply"))
+    if not blocks:
         return base_text
-    ocr_text = await asyncio.to_thread(extract_ocr_text, image_path)
-    attachment_block = (
-        "User attached an image.\n"
-        f"Local image path: {image_path}\n"
-        "Inspect this image when answering."
-    )
-    if ocr_text:
-        attachment_block += (
-            "\n"
-            "Local OCR text (best-effort; low-quality images may include misreads):\n"
-            f"{ocr_text}"
-        )
+    attachments_section = "\n\n".join(blocks)
     if base_text:
-        return f"{base_text}\n\n{attachment_block}"
-    return attachment_block
+        return f"{base_text}\n\n{attachments_section}"
+    return attachments_section
 
 
 def _inject_tool_request(prompt_text: str, tool_name: str) -> str:
@@ -1667,6 +1787,24 @@ async def handle_photo_message(message: Message) -> None:
     )
 
 
+@router.message(F.document)
+async def handle_document_message(message: Message) -> None:
+    if _should_ignore_passive_message(message):
+        logger.info("Ignoring document message in passive chat: chat=%s message=%s", message.chat.id, message.message_id)
+        return
+    await _message_media_handlers.handle_document_message(
+        message,
+        log_incoming_message_fn=_log_incoming_message,
+        logger=logger,
+        thread_id_fn=_thread_id,
+        handle_message_inner_fn=_handle_message_inner,
+        metrics=metrics,
+        scope_key_from_message_fn=_scope_key_from_message,
+        record_error_fn=_record_error,
+        build_rollback_suggestion_markup_fn=_build_rollback_suggestion_markup,
+    )
+
+
 @router.channel_post(F.text)
 async def handle_channel_post(message: Message) -> None:
     await handle_message(message)
@@ -1675,6 +1813,11 @@ async def handle_channel_post(message: Message) -> None:
 @router.channel_post(F.photo)
 async def handle_channel_photo(message: Message) -> None:
     await handle_photo_message(message)
+
+
+@router.channel_post(F.document)
+async def handle_channel_document(message: Message) -> None:
+    await handle_document_message(message)
 
 
 @router.message(F.forum_topic_created)

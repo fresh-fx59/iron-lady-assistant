@@ -260,6 +260,42 @@ async def handle_photo_message(
         )
 
 
+async def handle_document_message(
+    message: Any,
+    *,
+    log_incoming_message_fn: Callable[[Any, str], None],
+    logger: Any,
+    thread_id_fn: Callable[[Any], int | None],
+    handle_message_inner_fn: Callable[[Any, str | None], Any],
+    metrics: Any,
+    scope_key_from_message_fn: Callable[[Any], str],
+    record_error_fn: Callable[[str], None],
+    build_rollback_suggestion_markup_fn: Callable[[str, int | None], Any],
+) -> None:
+    log_incoming_message_fn(message, "document")
+    logger.info(
+        "Entering handle_document_message: chat=%s thread=%s message=%s",
+        message.chat.id,
+        thread_id_fn(message),
+        message.message_id,
+    )
+    try:
+        await handle_message_inner_fn(message)
+    except Exception:
+        logger.exception("Unhandled exception in handle_document_message")
+        metrics.MESSAGES_TOTAL.labels(status="error").inc()
+        scope_key = scope_key_from_message_fn(message)
+        record_error_fn(scope_key)
+        reply_markup = build_rollback_suggestion_markup_fn(
+            scope_key,
+            message.from_user and message.from_user.id,
+        )
+        await message.answer(
+            "An internal error occurred while processing your request.",
+            reply_markup=reply_markup,
+        )
+
+
 async def handle_forum_topic_created(
     message: Any,
     *,

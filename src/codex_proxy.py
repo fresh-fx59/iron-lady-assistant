@@ -145,9 +145,6 @@ def _parse_messages(value: Any) -> list[dict[str, str]]:
                 text_content = "\n".join(parts)
 
         if not text_content:
-            # Tool-call turns often contain non-text metadata only; skip these.
-            if role_raw in {"assistant", "tool"}:
-                continue
             raise ProxyHttpError(
                 status=400,
                 err_type="invalid_request_error",
@@ -157,13 +154,6 @@ def _parse_messages(value: Any) -> list[dict[str, str]]:
 
         parsed.append({"role": role, "content": text_content})
 
-    if not parsed:
-        raise ProxyHttpError(
-            status=400,
-            err_type="invalid_request_error",
-            err_code="invalid_messages",
-            message="messages did not contain any usable text content.",
-        )
     return parsed
 
 

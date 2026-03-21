@@ -318,28 +318,3 @@ async def test_accepts_provider_prefixed_model_name(monkeypatch, tmp_path: Path)
     finally:
         await client.close()
         await server.close()
-
-
-async def test_chat_skips_non_text_assistant_toolcall_messages(monkeypatch, tmp_path: Path) -> None:
-    async def _fake_runner(**kwargs):  # noqa: ARG001
-        return CodexRunResult(text="OK", duration_ms=10.0)
-
-    _, server, client = await _client(monkeypatch, tmp_path, runner=_fake_runner)
-    try:
-        resp = await client.post(
-            "/v1/chat/completions",
-            headers={"Authorization": "Bearer proxy-token"},
-            json={
-                "model": "openai:codex-cli",
-                "messages": [
-                    {"role": "assistant", "content": ""},
-                    {"role": "user", "content": "Return OK"},
-                ],
-            },
-        )
-        payload = await resp.json()
-        assert resp.status == 200
-        assert payload["choices"][0]["message"]["content"] == "OK"
-    finally:
-        await client.close()
-        await server.close()

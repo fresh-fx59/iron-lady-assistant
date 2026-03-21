@@ -6,7 +6,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-VERSION: str = "0.51.30"
+VERSION: str = "0.51.31"
 
 # ── Bot token (required) ────────────────────────────────────
 BOT_TOKEN: str = os.getenv("TELEGRAM_BOT_TOKEN", "")
@@ -196,6 +196,10 @@ CODEX_PROXY_TIMEOUT_SECONDS: float = max(1.0, float(os.getenv("CODEX_PROXY_TIMEO
 CODEX_PROXY_QUEUE_TIMEOUT_SECONDS: float = max(
     0.05,
     float(os.getenv("CODEX_PROXY_QUEUE_TIMEOUT_SECONDS", "5")),
+)
+CODEX_PROXY_STREAM_HEARTBEAT_SECONDS: float = max(
+    1.0,
+    float(os.getenv("CODEX_PROXY_STREAM_HEARTBEAT_SECONDS", "10")),
 )
 CODEX_PROXY_MAX_INFLIGHT: int = max(1, int(os.getenv("CODEX_PROXY_MAX_INFLIGHT", "4")))
 CODEX_PROXY_MAX_OUTPUT_BYTES: int = max(

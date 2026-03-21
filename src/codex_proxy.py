@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
 import os
@@ -10,7 +11,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Awaitable, Callable
 
-from aiohttp import web
+from aiohttp import ClientConnectionResetError, web
 
 from . import config
 
@@ -688,6 +689,13 @@ async def _responses(request: web.Request) -> web.Response:
 
     try:
         payload = await request.json()
+    except ConnectionResetError as exc:
+        raise ProxyHttpError(
+            status=499,
+            err_type="invalid_request_error",
+            err_code="client_disconnected",
+            message="Client disconnected before request body was fully received.",
+        ) from exc
     except json.JSONDecodeError as exc:
         raise ProxyHttpError(
             status=400,
@@ -718,17 +726,19 @@ async def _responses(request: web.Request) -> web.Response:
             max_tokens=parsed.max_tokens,
         )
         runner = request.app[RUNNER_KEY]
-        result = await runner(
-            prompt=prompt,
-            cli_name=config.CODEX_PROXY_CLI_NAME,
-            working_dir=config.CODEX_PROXY_WORKDIR,
-            timeout_seconds=max(config.CODEX_PROXY_TIMEOUT_SECONDS, 300.0),
-            max_output_bytes=config.CODEX_PROXY_MAX_OUTPUT_BYTES,
-        )
-        response = _responses_success_payload(parsed=parsed, prompt=prompt, result=result)
         if not parsed.stream:
+            result = await runner(
+                prompt=prompt,
+                cli_name=config.CODEX_PROXY_CLI_NAME,
+                working_dir=config.CODEX_PROXY_WORKDIR,
+                timeout_seconds=max(config.CODEX_PROXY_TIMEOUT_SECONDS, 300.0),
+                max_output_bytes=config.CODEX_PROXY_MAX_OUTPUT_BYTES,
+            )
+            response = _responses_success_payload(parsed=parsed, prompt=prompt, result=result)
             return web.json_response(response, headers={"X-Request-ID": req_id})
 
+        response_id = f"resp_{uuid.uuid4().hex}"
+        created_at = int(time.time())
         sse = web.StreamResponse(
             status=200,
             headers={
@@ -741,11 +751,48 @@ async def _responses(request: web.Request) -> web.Response:
         await sse.prepare(request)
 
         async def _event(name: str, data: dict[str, Any]) -> None:
-            payload = json.dumps(data, ensure_ascii=False)
+            event_payload = json.dumps(data, ensure_ascii=False)
             await sse.write(f"event: {name}\n".encode("utf-8"))
-            await sse.write(f"data: {payload}\n\n".encode("utf-8"))
+            await sse.write(f"data: {event_payload}\n\n".encode("utf-8"))
 
-        await _event("response.created", response)
+        created = {
+            "id": response_id,
+            "object": "response",
+            "created_at": created_at,
+            "status": "in_progress",
+            "model": parsed.model,
+            "output": [],
+        }
+        await _event("response.created", created)
+
+        task = asyncio.create_task(
+            runner(
+                prompt=prompt,
+                cli_name=config.CODEX_PROXY_CLI_NAME,
+                working_dir=config.CODEX_PROXY_WORKDIR,
+                timeout_seconds=max(config.CODEX_PROXY_TIMEOUT_SECONDS, 300.0),
+                max_output_bytes=config.CODEX_PROXY_MAX_OUTPUT_BYTES,
+            )
+        )
+        try:
+            while True:
+                try:
+                    result = await asyncio.wait_for(
+                        asyncio.shield(task),
+                        timeout=config.CODEX_PROXY_STREAM_HEARTBEAT_SECONDS,
+                    )
+                    break
+                except asyncio.TimeoutError:
+                    await sse.write(b": keepalive\n\n")
+        except (ConnectionResetError, BrokenPipeError, ClientConnectionResetError):
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+            return sse
+
+        response = _responses_success_payload(parsed=parsed, prompt=prompt, result=result)
+        response["id"] = response_id
+        response["created_at"] = created_at
         await _event(
             "response.output_text.delta",
             {
@@ -774,6 +821,8 @@ async def _responses(request: web.Request) -> web.Response:
 async def _error_middleware(request: web.Request, handler):
     try:
         return await handler(request)
+    except web.HTTPException as exc:
+        raise exc
     except ProxyHttpError as exc:
         return _error_response(
             status=exc.status,
@@ -795,6 +844,9 @@ async def _error_middleware(request: web.Request, handler):
             err_code="server_error",
             message=str(exc),
         )
+    except (ConnectionResetError, BrokenPipeError, ClientConnectionResetError):
+        logger.info("Client disconnected before response was fully sent.")
+        return web.Response(status=499)
     except Exception:
         logger.exception("Unhandled codex proxy error")
         return _error_response(

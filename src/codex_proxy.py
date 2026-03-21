@@ -561,26 +561,6 @@ async def _ready(_: web.Request) -> web.Response:
     return web.json_response({"ok": True})
 
 
-async def _models(_: web.Request) -> web.Response:
-    created = int(time.time())
-    alias = config.CODEX_PROXY_MODEL_ALIAS
-    data = [
-        {
-            "id": alias,
-            "object": "model",
-            "created": created,
-            "owned_by": "codex-proxy",
-        },
-        {
-            "id": f"openai:{alias}",
-            "object": "model",
-            "created": created,
-            "owned_by": "codex-proxy",
-        },
-    ]
-    return web.json_response({"object": "list", "data": data})
-
-
 async def _chat_completions(request: web.Request) -> web.Response:
     req_id = _request_id(request)
     _require_auth(request)
@@ -782,7 +762,6 @@ def create_app() -> web.Application:
 
     app.router.add_get("/health", _health)
     app.router.add_get("/ready", _ready)
-    app.router.add_get("/v1/models", _models)
     app.router.add_post("/v1/chat/completions", _chat_completions)
     app.router.add_post("/v1/responses", _responses)
     return app

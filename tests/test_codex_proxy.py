@@ -38,20 +38,6 @@ async def test_health_and_ready(monkeypatch, tmp_path: Path) -> None:
         await server.close()
 
 
-async def test_models_list(monkeypatch, tmp_path: Path) -> None:
-    _, server, client = await _client(monkeypatch, tmp_path)
-    try:
-        resp = await client.get("/v1/models")
-        payload = await resp.json()
-        assert resp.status == 200
-        model_ids = {m["id"] for m in payload["data"]}
-        assert "codex-cli" in model_ids
-        assert "openai:codex-cli" in model_ids
-    finally:
-        await client.close()
-        await server.close()
-
-
 async def test_chat_rejects_invalid_auth(monkeypatch, tmp_path: Path) -> None:
     _, server, client = await _client(monkeypatch, tmp_path)
     try:

@@ -104,7 +104,7 @@ jobs:
           port: ${{ secrets.SSH_PORT || 22 }}
           script_stop: true
           script: |
-            cd /home/claude-developer/claude-code-as-assistant
+            cd /home/claude-developer/iron-lady-assistant
 
             # Fetch latest and extract deploy script into the project dir
             # (deploy.sh uses BASH_SOURCE to find the git repo, so it must live here)

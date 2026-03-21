@@ -82,6 +82,20 @@ if is_truthy "$RESTART_CODEX_PROXY"; then
     restart_targets+=("codex-proxy.service")
 fi
 
+install_systemd_unit_if_present() {
+    local unit_name="$1"
+    local src_path="$SCRIPT_DIR/$unit_name"
+    local dst_path="/etc/systemd/system/$unit_name"
+    if [ ! -f "$src_path" ]; then
+        deploy_log "Unit file $unit_name not found in repo; skipping install"
+        return 0
+    fi
+    if [ ! -f "$dst_path" ] || ! cmp -s "$src_path" "$dst_path"; then
+        deploy_log "Installing/updating systemd unit: $unit_name"
+        sudo install -m 0644 "$src_path" "$dst_path"
+    fi
+}
+
 # ── 1. Save rollback target ──────────────────────────────────
 ROLLBACK_COMMIT=$(git rev-parse HEAD)
 ROLLBACK_SHORT=$(git rev-parse --short HEAD)
@@ -182,6 +196,9 @@ Old process kept running; restart was skipped."
 fi
 
 deploy_log "Smoke test passed. Restarting: ${restart_targets[*]}"
+if is_truthy "$RESTART_CODEX_PROXY"; then
+    install_systemd_unit_if_present "codex-proxy.service"
+fi
 sudo systemctl daemon-reload
 sudo systemctl restart "${restart_targets[@]}"
 

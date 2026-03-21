@@ -28,7 +28,6 @@ class ChatRequest:
     messages: list[dict[str, str]]
     temperature: float | None
     max_tokens: int | None
-    stream: bool = False
 
 
 @dataclass(frozen=True)
@@ -240,7 +239,6 @@ def _parse_chat_request(payload: Any) -> ChatRequest:
         messages=messages,
         temperature=temperature,
         max_tokens=max_tokens,
-        stream=False,
     )
 
 
@@ -307,7 +305,14 @@ def _parse_responses_request(payload: Any) -> ChatRequest:
         )
 
     stream = payload.get("stream")
-    if stream not in (None, False, True):
+    if stream is True:
+        raise ProxyHttpError(
+            status=400,
+            err_type="invalid_request_error",
+            err_code="stream_not_supported",
+            message="stream=true is not supported in MVP.",
+        )
+    if stream not in (None, False):
         raise ProxyHttpError(
             status=400,
             err_type="invalid_request_error",
@@ -366,7 +371,6 @@ def _parse_responses_request(payload: Any) -> ChatRequest:
         messages=messages,
         temperature=temperature,
         max_tokens=max_tokens,
-        stream=bool(stream is True),
     )
 
 
@@ -720,46 +724,7 @@ async def _responses(request: web.Request) -> web.Response:
             max_output_bytes=config.CODEX_PROXY_MAX_OUTPUT_BYTES,
         )
         response = _responses_success_payload(parsed=parsed, prompt=prompt, result=result)
-        if not parsed.stream:
-            return web.json_response(response, headers={"X-Request-ID": req_id})
-
-        sse = web.StreamResponse(
-            status=200,
-            headers={
-                "Content-Type": "text/event-stream",
-                "Cache-Control": "no-cache",
-                "Connection": "keep-alive",
-                "X-Request-ID": req_id,
-            },
-        )
-        await sse.prepare(request)
-
-        async def _event(name: str, data: dict[str, Any]) -> None:
-            payload = json.dumps(data, ensure_ascii=False)
-            await sse.write(f"event: {name}\n".encode("utf-8"))
-            await sse.write(f"data: {payload}\n\n".encode("utf-8"))
-
-        await _event("response.created", response)
-        await _event(
-            "response.output_text.delta",
-            {
-                "type": "response.output_text.delta",
-                "delta": result.text,
-                "response_id": response["id"],
-            },
-        )
-        await _event(
-            "response.output_text.done",
-            {
-                "type": "response.output_text.done",
-                "text": result.text,
-                "response_id": response["id"],
-            },
-        )
-        await _event("response.completed", response)
-        await sse.write(b"data: [DONE]\n\n")
-        await sse.write_eof()
-        return sse
+        return web.json_response(response, headers={"X-Request-ID": req_id})
     finally:
         semaphore.release()
 

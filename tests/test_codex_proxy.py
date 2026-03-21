@@ -251,11 +251,8 @@ async def test_responses_success_response_shape(monkeypatch, tmp_path: Path) -> 
         await server.close()
 
 
-async def test_responses_stream_true_returns_sse(monkeypatch, tmp_path: Path) -> None:
-    async def _fake_runner(**kwargs):  # noqa: ARG001
-        return CodexRunResult(text="OK", duration_ms=30.0)
-
-    _, server, client = await _client(monkeypatch, tmp_path, runner=_fake_runner)
+async def test_responses_rejects_stream_true(monkeypatch, tmp_path: Path) -> None:
+    _, server, client = await _client(monkeypatch, tmp_path)
     try:
         resp = await client.post(
             "/v1/responses",
@@ -266,12 +263,9 @@ async def test_responses_stream_true_returns_sse(monkeypatch, tmp_path: Path) ->
                 "stream": True,
             },
         )
-        payload = await resp.text()
-        assert resp.status == 200
-        assert "text/event-stream" in resp.headers.get("Content-Type", "")
-        assert "event: response.created" in payload
-        assert "event: response.completed" in payload
-        assert "data: [DONE]" in payload
+        payload = await resp.json()
+        assert resp.status == 400
+        assert payload["error"]["code"] == "stream_not_supported"
     finally:
         await client.close()
         await server.close()

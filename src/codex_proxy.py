@@ -53,13 +53,6 @@ class CodexExecutionError(Exception):
     pass
 
 
-def _model_matches_alias(model: str, alias: str) -> bool:
-    if model == alias:
-        return True
-    # Some clients send provider-prefixed model ids, e.g. "openai:codex-cli".
-    return model.endswith(f":{alias}")
-
-
 def _error_response(*, status: int, err_type: str, err_code: str, message: str) -> web.Response:
     return web.json_response(
         {
@@ -191,7 +184,7 @@ def _parse_chat_request(payload: Any) -> ChatRequest:
             message="model must be a non-empty string.",
         )
     model = model.strip()
-    if not _model_matches_alias(model, config.CODEX_PROXY_MODEL_ALIAS):
+    if model != config.CODEX_PROXY_MODEL_ALIAS:
         raise ProxyHttpError(
             status=404,
             err_type="invalid_request_error",
@@ -319,7 +312,7 @@ def _parse_responses_request(payload: Any) -> ChatRequest:
             message="model must be a non-empty string.",
         )
     model = model.strip()
-    if not _model_matches_alias(model, config.CODEX_PROXY_MODEL_ALIAS):
+    if model != config.CODEX_PROXY_MODEL_ALIAS:
         raise ProxyHttpError(
             status=404,
             err_type="invalid_request_error",

@@ -16,9 +16,7 @@ from . import config
 
 logger = logging.getLogger(__name__)
 
-ALLOWED_TOP_LEVEL_FIELDS = {"model", "messages", "temperature", "max_tokens", "stream"}
-ALLOWED_MESSAGE_FIELDS = {"role", "content", "name"}
-ALLOWED_ROLES = {"system", "user", "assistant"}
+ALLOWED_ROLES = {"system", "user", "assistant", "developer", "tool"}
 
 SEMAPHORE_KEY: web.AppKey[asyncio.Semaphore] = web.AppKey("codex_proxy_semaphore", asyncio.Semaphore)
 RUNNER_KEY: web.AppKey[Callable[..., Awaitable["CodexRunResult"]]] = web.AppKey("codex_proxy_runner", object)
@@ -113,33 +111,41 @@ def _parse_messages(value: Any) -> list[dict[str, str]]:
                 message=f"messages[{idx}] must be an object.",
             )
 
-        unknown = set(item.keys()) - ALLOWED_MESSAGE_FIELDS
-        if unknown:
-            raise ProxyHttpError(
-                status=400,
-                err_type="invalid_request_error",
-                err_code="unsupported_field",
-                message=f"messages[{idx}] contains unsupported fields: {sorted(unknown)}",
-            )
-
-        role = item.get("role")
-        content = item.get("content")
-        if role not in ALLOWED_ROLES:
+        role_raw = item.get("role")
+        if role_raw not in ALLOWED_ROLES:
             raise ProxyHttpError(
                 status=400,
                 err_type="invalid_request_error",
                 err_code="invalid_role",
                 message=f"messages[{idx}].role must be one of {sorted(ALLOWED_ROLES)}.",
             )
-        if not isinstance(content, str) or not content.strip():
+        role = "system" if role_raw == "developer" else ("user" if role_raw == "tool" else role_raw)
+
+        content = item.get("content")
+        text_content: str | None = None
+        if isinstance(content, str) and content.strip():
+            text_content = content.strip()
+        elif isinstance(content, list):
+            # OpenAI clients may send block content: [{"type":"text","text":"..."}].
+            parts: list[str] = []
+            for block in content:
+                if not isinstance(block, dict):
+                    continue
+                maybe_text = block.get("text")
+                if isinstance(maybe_text, str) and maybe_text.strip():
+                    parts.append(maybe_text.strip())
+            if parts:
+                text_content = "\n".join(parts)
+
+        if not text_content:
             raise ProxyHttpError(
                 status=400,
                 err_type="invalid_request_error",
                 err_code="invalid_content",
-                message=f"messages[{idx}].content must be a non-empty string in MVP.",
+                message=f"messages[{idx}].content must contain non-empty text.",
             )
 
-        parsed.append({"role": role, "content": content.strip()})
+        parsed.append({"role": role, "content": text_content})
 
     return parsed
 
@@ -151,15 +157,6 @@ def _parse_chat_request(payload: Any) -> ChatRequest:
             err_type="invalid_request_error",
             err_code="invalid_json",
             message="Request body must be a JSON object.",
-        )
-
-    unknown = set(payload.keys()) - ALLOWED_TOP_LEVEL_FIELDS
-    if unknown:
-        raise ProxyHttpError(
-            status=400,
-            err_type="invalid_request_error",
-            err_code="unsupported_field",
-            message=f"Unsupported top-level fields: {sorted(unknown)}",
         )
 
     stream = payload.get("stream")

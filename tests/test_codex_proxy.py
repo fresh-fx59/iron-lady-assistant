@@ -129,6 +129,41 @@ async def test_chat_success_response_shape(monkeypatch, tmp_path: Path) -> None:
         await server.close()
 
 
+async def test_chat_accepts_block_content_and_extra_fields(monkeypatch, tmp_path: Path) -> None:
+    async def _fake_runner(**kwargs):  # noqa: ARG001
+        return CodexRunResult(text="OK", duration_ms=50.0)
+
+    _, server, client = await _client(monkeypatch, tmp_path, runner=_fake_runner)
+    try:
+        resp = await client.post(
+            "/v1/chat/completions",
+            headers={"Authorization": "Bearer proxy-token"},
+            json={
+                "model": "codex-cli",
+                "messages": [
+                    {
+                        "role": "developer",
+                        "content": [{"type": "text", "text": "You are concise."}],
+                    },
+                    {
+                        "role": "user",
+                        "content": [{"type": "text", "text": "Reply with OK"}],
+                    },
+                ],
+                # Typical extra fields from OpenAI-compatible clients.
+                "n": 1,
+                "metadata": {"client": "deepagents"},
+                "tools": [],
+            },
+        )
+        payload = await resp.json()
+        assert resp.status == 200
+        assert payload["choices"][0]["message"]["content"] == "OK"
+    finally:
+        await client.close()
+        await server.close()
+
+
 async def test_chat_maps_timeout_to_504(monkeypatch, tmp_path: Path) -> None:
     async def _timeout_runner(**kwargs):  # noqa: ARG001
         raise CodexTimeoutError("Codex execution timed out.")
@@ -233,6 +268,31 @@ async def test_responses_rejects_invalid_input(monkeypatch, tmp_path: Path) -> N
         payload = await resp.json()
         assert resp.status == 400
         assert payload["error"]["code"] == "invalid_input"
+    finally:
+        await client.close()
+        await server.close()
+
+
+async def test_responses_accepts_extra_fields(monkeypatch, tmp_path: Path) -> None:
+    async def _fake_runner(**kwargs):  # noqa: ARG001
+        return CodexRunResult(text="OK", duration_ms=20.0)
+
+    _, server, client = await _client(monkeypatch, tmp_path, runner=_fake_runner)
+    try:
+        resp = await client.post(
+            "/v1/responses",
+            headers={"Authorization": "Bearer proxy-token"},
+            json={
+                "model": "codex-cli",
+                "input": [{"role": "user", "content": [{"type": "input_text", "text": "ping"}]}],
+                "metadata": {"client": "deepagents"},
+                "store": False,
+                "top_p": 1,
+            },
+        )
+        payload = await resp.json()
+        assert resp.status == 200
+        assert payload["output_text"] == "OK"
     finally:
         await client.close()
         await server.close()

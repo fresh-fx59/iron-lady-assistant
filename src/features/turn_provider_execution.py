@@ -16,6 +16,15 @@ class TurnExecutionResult:
     final_model_name: str
 
 
+def _is_empty_success_response(response: Any, state: Any) -> bool:
+    return bool(
+        response
+        and not response.is_error
+        and not state.cancel_requested
+        and not (response.text or "").strip()
+    )
+
+
 async def run_provider_execution_loop(
     *,
     message: Any,
@@ -149,6 +158,95 @@ async def run_provider_execution_loop(
                     logger.info(
                         "Chat %s: fallback from '%s' to '%s' (error=%r)",
                         scope_key, provider.name, next_provider.name, final_response.text,
+                    )
+                    provider = next_provider
+                    session_manager.set_provider(chat_id, next_provider.name, thread_id)
+                    env = worklog_subprocess_env_fn(
+                        provider_manager.subprocess_env(next_provider),
+                        chat_id=chat_id,
+                        message_thread_id=thread_id,
+                        provider=next_provider,
+                        session=session,
+                    )
+                    if is_codex_family_cli_fn(next_provider.cli):
+                        provider_attempts += 1
+                        codex_model = codex_model_arg_fn(session, next_provider)
+                        final_response = await run_codex_with_retries_fn(
+                            message,
+                            state,
+                            session,
+                            progress,
+                            codex_model,
+                            session.codex_session_id,
+                            next_provider.resume_arg,
+                            env,
+                            next_provider.cli,
+                            override_text=effective_prompt,
+                            observed_tools=observed_tools,
+                        )
+                    else:
+                        provider_attempts += 1
+                        final_response = await run_claude_fn(
+                            message,
+                            state,
+                            session,
+                            progress,
+                            env,
+                            override_text=effective_prompt,
+                            observed_tools=observed_tools,
+                        )
+                    final_provider_name = next_provider.name
+                    final_model_name = current_model_label_fn(session, next_provider)
+
+            if _is_empty_success_response(final_response, state):
+                logger.warning(
+                    "Chat %s: provider '%s' returned empty successful response; retrying once",
+                    scope_key,
+                    provider.name,
+                )
+                if is_codex_family_cli_fn(provider.cli):
+                    provider_attempts += 1
+                    codex_model = codex_model_arg_fn(session, provider)
+                    retry_response = await run_codex_with_retries_fn(
+                        message,
+                        state,
+                        session,
+                        progress,
+                        codex_model,
+                        session.codex_session_id,
+                        provider.resume_arg,
+                        env,
+                        provider.cli,
+                        override_text=effective_prompt,
+                        observed_tools=observed_tools,
+                    )
+                else:
+                    provider_attempts += 1
+                    retry_response = await run_claude_fn(
+                        message,
+                        state,
+                        session,
+                        progress,
+                        env,
+                        override_text=effective_prompt,
+                        observed_tools=observed_tools,
+                    )
+                if retry_response:
+                    final_response = retry_response
+
+            if _is_empty_success_response(final_response, state):
+                next_provider = provider_manager.advance(scope_key)
+                if next_provider:
+                    await message.answer(
+                        f"<b>{provider.name}</b> returned an empty response. "
+                        f"Switching to <b>{next_provider.name}</b>...",
+                        parse_mode="HTML",
+                    )
+                    logger.info(
+                        "Chat %s: fallback from '%s' to '%s' after empty response",
+                        scope_key,
+                        provider.name,
+                        next_provider.name,
                     )
                     provider = next_provider
                     session_manager.set_provider(chat_id, next_provider.name, thread_id)

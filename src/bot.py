@@ -143,8 +143,8 @@ _INCOMING_MEDIA_DIR = config.MEMORY_DIR / "incoming_media"
 _MAX_ATTACHMENT_PREVIEW_BYTES = 512 * 1024
 _MAX_ATTACHMENT_PREVIEW_CHARS = 8000
 _EMPTY_RESPONSE_FALLBACK_TEXT = (
-    "I received an empty response from the provider. "
-    "Please resend your last message."
+    "I could not generate a response for this turn. "
+    "Please try again."
 )
 _AUDIO_PROGRESS_UPDATE_INTERVAL = 3.0
 _VOICE_TRANSCRIPTION_PROGRESS_INTERVAL = 5.0

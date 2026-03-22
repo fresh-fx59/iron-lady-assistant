@@ -247,3 +247,162 @@ async def test_run_provider_execution_loop_falls_back_when_cli_missing():
     session_manager.set_provider.assert_called_once_with(123, "claude", None)
     message.answer.assert_awaited()
     assert result.final_provider_name == "claude"
+
+
+@pytest.mark.asyncio
+async def test_run_provider_execution_loop_retries_once_on_empty_success():
+    message = SimpleNamespace(
+        chat=SimpleNamespace(id=123),
+        message_id=79,
+        answer=AsyncMock(),
+    )
+    state = SimpleNamespace(cancel_requested=False, process_handle=None, reset_requested=False)
+    session = SimpleNamespace(claude_session_id=None, codex_session_id=None)
+    progress = SimpleNamespace(report_tool=AsyncMock())
+    typing_task = asyncio.create_task(asyncio.sleep(3600))
+
+    provider = SimpleNamespace(name="claude", cli="claude", resume_arg=None)
+    provider_manager = SimpleNamespace(
+        get_provider=lambda _scope: provider,
+        reset=lambda _scope: provider,
+        advance=lambda _scope: None,
+        subprocess_env=lambda _provider: {},
+        is_rate_limit_error=lambda _text: False,
+    )
+    session_manager = SimpleNamespace(
+        set_provider=MagicMock(),
+        update_session_id=MagicMock(),
+        update_codex_session_id=MagicMock(),
+    )
+    resume_state_store = SimpleNamespace(record_start=MagicMock())
+    steering_ledger_store = SimpleNamespace(
+        mark_applied=MagicMock(),
+        get_unapplied=lambda **_: [],
+    )
+    responses = [
+        SimpleNamespace(is_error=False, text="   ", session_id=None),
+        SimpleNamespace(is_error=False, text="ok after retry", session_id=None),
+    ]
+
+    async def run_claude(*_args, **_kwargs):
+        return responses.pop(0)
+
+    result = await run_provider_execution_loop(
+        message=message,
+        state=state,
+        session=session,
+        progress=progress,
+        typing_task=typing_task,
+        scope_key="123:main",
+        chat_id=123,
+        thread_id=None,
+        raw_prompt="hello",
+        override_text=None,
+        provider_manager=provider_manager,
+        session_manager=session_manager,
+        resume_state_store=resume_state_store,
+        steering_ledger_store=steering_ledger_store,
+        logger=MagicMock(),
+        current_model_label_fn=lambda *_: "sonnet",
+        is_codex_family_cli_fn=lambda cli: bool(cli and cli.startswith("codex")),
+        find_provider_cli_fn=lambda _cli: "/usr/bin/claude",
+        as_text_fn=lambda text: text or "",
+        worklog_subprocess_env_fn=lambda env, **_: env,
+        codex_model_arg_fn=lambda *_: None,
+        run_codex_with_retries_fn=AsyncMock(),
+        run_claude_fn=run_claude,
+        extract_requested_tools_fn=lambda _text: [],
+        inject_tool_request_fn=lambda prompt, _tool: prompt,
+        build_steering_patch_fn=lambda prompt, _events: prompt,
+        has_high_risk_conflict_fn=lambda _events: False,
+    )
+
+    assert result.final_response.text == "ok after retry"
+    assert result.provider_attempts == 2
+    message.answer.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_run_provider_execution_loop_falls_back_after_empty_retry():
+    message = SimpleNamespace(
+        chat=SimpleNamespace(id=123),
+        message_id=80,
+        answer=AsyncMock(),
+    )
+    state = SimpleNamespace(cancel_requested=False, process_handle=None, reset_requested=False)
+    session = SimpleNamespace(claude_session_id=None, codex_session_id=None)
+    progress = SimpleNamespace(report_tool=AsyncMock())
+    typing_task = asyncio.create_task(asyncio.sleep(3600))
+
+    primary = SimpleNamespace(name="primary", cli="claude", resume_arg=None)
+    fallback = SimpleNamespace(name="fallback", cli="claude", resume_arg=None)
+
+    advanced = {"used": False}
+
+    def advance(_scope):
+        if advanced["used"]:
+            return None
+        advanced["used"] = True
+        return fallback
+
+    provider_manager = SimpleNamespace(
+        get_provider=lambda _scope: primary,
+        reset=lambda _scope: primary,
+        advance=advance,
+        subprocess_env=lambda _provider: {},
+        is_rate_limit_error=lambda _text: False,
+    )
+    session_manager = SimpleNamespace(
+        set_provider=MagicMock(),
+        update_session_id=MagicMock(),
+        update_codex_session_id=MagicMock(),
+    )
+    resume_state_store = SimpleNamespace(record_start=MagicMock())
+    steering_ledger_store = SimpleNamespace(
+        mark_applied=MagicMock(),
+        get_unapplied=lambda **_: [],
+    )
+    responses = [
+        SimpleNamespace(is_error=False, text="", session_id=None),
+        SimpleNamespace(is_error=False, text=" ", session_id=None),
+        SimpleNamespace(is_error=False, text="fallback answer", session_id=None),
+    ]
+
+    async def run_claude(*_args, **_kwargs):
+        return responses.pop(0)
+
+    result = await run_provider_execution_loop(
+        message=message,
+        state=state,
+        session=session,
+        progress=progress,
+        typing_task=typing_task,
+        scope_key="123:main",
+        chat_id=123,
+        thread_id=None,
+        raw_prompt="hello",
+        override_text=None,
+        provider_manager=provider_manager,
+        session_manager=session_manager,
+        resume_state_store=resume_state_store,
+        steering_ledger_store=steering_ledger_store,
+        logger=MagicMock(),
+        current_model_label_fn=lambda *_: "sonnet",
+        is_codex_family_cli_fn=lambda cli: bool(cli and cli.startswith("codex")),
+        find_provider_cli_fn=lambda _cli: "/usr/bin/claude",
+        as_text_fn=lambda text: text or "",
+        worklog_subprocess_env_fn=lambda env, **_: env,
+        codex_model_arg_fn=lambda *_: None,
+        run_codex_with_retries_fn=AsyncMock(),
+        run_claude_fn=run_claude,
+        extract_requested_tools_fn=lambda _text: [],
+        inject_tool_request_fn=lambda prompt, _tool: prompt,
+        build_steering_patch_fn=lambda prompt, _events: prompt,
+        has_high_risk_conflict_fn=lambda _events: False,
+    )
+
+    assert result.final_response.text == "fallback answer"
+    assert result.final_provider_name == "fallback"
+    assert result.provider_attempts == 3
+    session_manager.set_provider.assert_called_once_with(123, "fallback", None)
+    message.answer.assert_awaited_once()

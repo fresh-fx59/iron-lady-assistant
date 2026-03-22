@@ -943,7 +943,7 @@ class TaskManager:
             html_chunks = split_message(markdown_to_html(clean_text))
 
         if not html_chunks and not media_refs:
-            html_chunks = ["I received an empty response from the provider."]
+            html_chunks = ["I could not generate a response for this task run."]
 
         for chunk in html_chunks:
             if not strip_html(chunk).strip():

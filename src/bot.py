@@ -24,7 +24,13 @@ from . import bridge, config, metrics, transcribe
 from .core.context_plugins import ContextPluginRegistry
 from .sessions import ChatSession, SessionManager
 from .formatter import markdown_to_html, split_message, strip_html
-from .features.state_store import ProviderSyncStore, ResumeStateStore, SteeringEvent, SteeringLedgerStore
+from .features.state_store import (
+    ProviderSyncStore,
+    ResumeStateStore,
+    SteeringEvent,
+    SteeringLedgerStore,
+    TopicStateStore,
+)
 from .features.prompt_helpers import (
     as_text as _as_text_impl,
     default_timezone_name as _default_timezone_name_impl,
@@ -84,6 +90,7 @@ memory_manager = MemoryManager(config.MEMORY_DIR)
 resume_state_store = ResumeStateStore(config.MEMORY_DIR / "resume_envelopes.json")
 steering_ledger_store = SteeringLedgerStore(config.MEMORY_DIR / "steering_ledger.json")
 provider_sync_store = ProviderSyncStore(config.MEMORY_DIR / "provider_sync_cursors.json")
+topic_state_store = TopicStateStore(config.MEMORY_DIR / "topic_state_store.json")
 lifecycle_store = LifecycleQueueStore(config.LIFECYCLE_DB_PATH)
 tool_registry = ToolRegistry(
     config.TOOLS_DIR,
@@ -774,50 +781,56 @@ def _build_augmented_prompt(
     return "\n\n".join(prompt_parts)
 
 
-def _build_provider_sync_payload(scope_key: str, provider_name: str, last_synced_worklog_id: int) -> dict[str, object]:
+def _build_provider_sync_payload(scope_key: str, provider_name: str, last_synced_topic_version: int) -> dict[str, object]:
     """Build a compact, bounded context delta for provider re-sync."""
     if not config.PROVIDER_SWITCH_CONTEXT_SYNC_ENABLED:
-        return {"latest_worklog_id": int(last_synced_worklog_id), "payload_text": "", "payload_hash": ""}
+        return {"latest_topic_version": int(last_synced_topic_version), "payload_text": "", "payload_hash": ""}
 
-    delta = memory_manager.get_scope_worklog_delta(
+    delta = topic_state_store.delta_since(
         scope_key=scope_key,
-        after_worklog_id=max(0, int(last_synced_worklog_id)),
+        after_version=max(0, int(last_synced_topic_version)),
         limit=config.PROVIDER_SWITCH_CONTEXT_SYNC_MAX_ITEMS,
     )
-    latest_worklog_id = int(delta.get("latest_worklog_id", last_synced_worklog_id) or 0)
-    rows = list(delta.get("rows", []) or [])
-    if not rows:
-        return {"latest_worklog_id": latest_worklog_id, "payload_text": "", "payload_hash": ""}
+    latest_topic_version = int(delta.get("latest_topic_version", last_synced_topic_version) or 0)
+    events = list(delta.get("events", []) or [])
+    if not events:
+        return {"latest_topic_version": latest_topic_version, "payload_text": "", "payload_hash": ""}
 
     lines: list[str] = [
         f"Target provider: {provider_name}",
         f"Scope: {scope_key}",
-        f"Worklog updates since id>{int(last_synced_worklog_id)} (latest={latest_worklog_id})",
+        f"Topic updates since version>{int(last_synced_topic_version)} (latest={latest_topic_version})",
         "",
     ]
-    for row in rows:
-        worklog_id = int(row.get("id", 0) or 0)
-        summary = str(row.get("summary", "") or "").strip()
+    for event in events:
+        version = int(event.get("version", 0) or 0)
+        summary = str(event.get("summary", "") or "").strip()
         if len(summary) > 280:
             summary = summary[:277].rstrip() + "..."
-        topic_label = str(row.get("topic_label", "") or "").strip()
-        started_at = str(row.get("started_at", "") or "")
-        lines.append(f"- #{worklog_id} [{started_at}] {topic_label or '(topic)'}")
+        provider = str(event.get("provider_name", "") or "")
+        updated_at = str(event.get("updated_at", "") or "")
+        lines.append(f"- v{version} [{updated_at}] provider={provider}")
         if summary:
             lines.append(f"  summary: {summary}")
-        decisions = [str(item).strip() for item in (row.get('decisions') or []) if str(item).strip()]
+        decisions = [str(item).strip() for item in (event.get("decisions") or []) if str(item).strip()]
         if decisions:
             compact_decisions = "; ".join(decisions[:2])
             if len(compact_decisions) > 220:
                 compact_decisions = compact_decisions[:217].rstrip() + "..."
             lines.append(f"  decisions: {compact_decisions}")
+        open_tasks = [str(item).strip() for item in (event.get("open_tasks") or []) if str(item).strip()]
+        if open_tasks:
+            compact_tasks = "; ".join(open_tasks[:2])
+            if len(compact_tasks) > 220:
+                compact_tasks = compact_tasks[:217].rstrip() + "..."
+            lines.append(f"  open_tasks: {compact_tasks}")
 
     payload_text = "\n".join(lines).strip()
     if len(payload_text) > config.PROVIDER_SWITCH_CONTEXT_SYNC_MAX_CHARS:
         payload_text = payload_text[: config.PROVIDER_SWITCH_CONTEXT_SYNC_MAX_CHARS].rstrip() + "\n...(truncated)"
     payload_hash = hashlib.sha256(payload_text.encode("utf-8", errors="ignore")).hexdigest()
     return {
-        "latest_worklog_id": latest_worklog_id,
+        "latest_topic_version": latest_topic_version,
         "payload_text": payload_text,
         "payload_hash": payload_hash,
     }
@@ -2006,6 +2019,7 @@ async def _handle_message_inner(message: Message, override_text: str | None = No
                 has_high_risk_conflict_fn=_has_high_risk_conflict,
                 provider_switch_context_sync_enabled=config.PROVIDER_SWITCH_CONTEXT_SYNC_ENABLED,
                 provider_sync_store=provider_sync_store,
+                topic_state_store=topic_state_store,
                 build_provider_sync_payload_fn=_build_provider_sync_payload,
             )
             final_response = execution.final_response

@@ -263,11 +263,12 @@ class SteeringLedgerStore:
 
 @dataclass
 class ProviderSyncCursor:
-    scope_key: str
-    provider_name: str
-    last_synced_worklog_id: int
-    last_injected_hash: str
-    updated_at: str
+    scope_key: str = ""
+    provider_name: str = ""
+    last_synced_worklog_id: int = 0  # legacy cursor
+    last_synced_topic_version: int = 0
+    last_injected_hash: str = ""
+    updated_at: str = ""
 
 
 class ProviderSyncStore:
@@ -329,7 +330,8 @@ class ProviderSyncStore:
         *,
         scope_key: str,
         provider_name: str,
-        latest_worklog_id: int,
+        latest_worklog_id: int | None = None,
+        latest_topic_version: int | None = None,
         injected_hash: str | None = None,
     ) -> ProviderSyncCursor:
         key = self._key(scope_key, provider_name)
@@ -345,8 +347,10 @@ class ProviderSyncStore:
                     updated_at=_now_iso(),
                 )
 
-            if latest_worklog_id >= current.last_synced_worklog_id:
+            if latest_worklog_id is not None and latest_worklog_id >= current.last_synced_worklog_id:
                 current.last_synced_worklog_id = latest_worklog_id
+            if latest_topic_version is not None and latest_topic_version >= current.last_synced_topic_version:
+                current.last_synced_topic_version = latest_topic_version
             if injected_hash is not None:
                 current.last_injected_hash = injected_hash
             current.updated_at = _now_iso()
@@ -354,3 +358,146 @@ class ProviderSyncStore:
             cursors[key] = current
             self._save_all_unlocked(cursors)
             return current
+
+
+@dataclass
+class TopicDeltaEvent:
+    version: int
+    provider_name: str
+    summary: str
+    decisions: list[str]
+    open_tasks: list[str]
+    artifacts: list[str]
+    updated_at: str
+
+
+@dataclass
+class TopicState:
+    scope_key: str
+    topic_version: int
+    updated_at: str
+    events: list[TopicDeltaEvent]
+
+
+class TopicStateStore:
+    """Persist per-scope topic version and compact event deltas."""
+
+    def __init__(self, path: Path) -> None:
+        self._path = path
+        self._lock = threading.Lock()
+        self._path.parent.mkdir(parents=True, exist_ok=True)
+
+    def _load_all_unlocked(self) -> dict[str, TopicState]:
+        if not self._path.exists():
+            return {}
+        try:
+            data = json.loads(self._path.read_text(encoding="utf-8"))
+        except Exception:
+            return {}
+        if not isinstance(data, dict):
+            return {}
+
+        states: dict[str, TopicState] = {}
+        for scope_key, row in data.items():
+            if not isinstance(row, dict):
+                continue
+            events_raw = row.get("events")
+            if not isinstance(events_raw, list):
+                events_raw = []
+            events: list[TopicDeltaEvent] = []
+            for item in events_raw:
+                if not isinstance(item, dict):
+                    continue
+                try:
+                    events.append(TopicDeltaEvent(**item))
+                except TypeError:
+                    continue
+            try:
+                states[scope_key] = TopicState(
+                    scope_key=str(row.get("scope_key") or scope_key),
+                    topic_version=int(row.get("topic_version") or 0),
+                    updated_at=str(row.get("updated_at") or _now_iso()),
+                    events=events,
+                )
+            except Exception:
+                continue
+        return states
+
+    def _save_all_unlocked(self, states: dict[str, TopicState]) -> None:
+        payload = {
+            key: {
+                "scope_key": state.scope_key,
+                "topic_version": state.topic_version,
+                "updated_at": state.updated_at,
+                "events": [asdict(event) for event in state.events],
+            }
+            for key, state in states.items()
+        }
+        tmp = self._path.with_suffix(self._path.suffix + ".tmp")
+        tmp.parent.mkdir(parents=True, exist_ok=True)
+        tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        tmp.replace(self._path)
+
+    def get(self, *, scope_key: str) -> TopicState:
+        with self._lock:
+            states = self._load_all_unlocked()
+            existing = states.get(scope_key)
+            if existing is not None:
+                return existing
+            return TopicState(
+                scope_key=scope_key,
+                topic_version=0,
+                updated_at=_now_iso(),
+                events=[],
+            )
+
+    def record_event(
+        self,
+        *,
+        scope_key: str,
+        provider_name: str,
+        summary: str,
+        decisions: list[str] | None = None,
+        open_tasks: list[str] | None = None,
+        artifacts: list[str] | None = None,
+        max_events: int = 80,
+    ) -> TopicState:
+        with self._lock:
+            states = self._load_all_unlocked()
+            current = states.get(scope_key)
+            if current is None:
+                current = TopicState(
+                    scope_key=scope_key,
+                    topic_version=0,
+                    updated_at=_now_iso(),
+                    events=[],
+                )
+            next_version = current.topic_version + 1
+            event = TopicDeltaEvent(
+                version=next_version,
+                provider_name=provider_name,
+                summary=(summary or "").strip(),
+                decisions=[item.strip() for item in (decisions or []) if item and item.strip()],
+                open_tasks=[item.strip() for item in (open_tasks or []) if item and item.strip()],
+                artifacts=[item.strip() for item in (artifacts or []) if item and item.strip()],
+                updated_at=_now_iso(),
+            )
+            current.topic_version = next_version
+            current.updated_at = event.updated_at
+            current.events.append(event)
+            if len(current.events) > max(1, max_events):
+                current.events = current.events[-max(1, max_events):]
+            states[scope_key] = current
+            self._save_all_unlocked(states)
+            return current
+
+    def delta_since(self, *, scope_key: str, after_version: int, limit: int = 8) -> dict[str, object]:
+        state = self.get(scope_key=scope_key)
+        filtered = [event for event in state.events if int(event.version) > int(after_version)]
+        if limit > 0:
+            filtered = filtered[-limit:]
+        return {
+            "scope_key": scope_key,
+            "latest_topic_version": int(state.topic_version),
+            "events": [asdict(event) for event in filtered],
+        }

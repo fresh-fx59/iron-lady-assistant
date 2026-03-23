@@ -438,7 +438,7 @@ async def test_run_provider_execution_loop_injects_sync_payload_and_marks_synced
         mark_applied=MagicMock(),
         get_unapplied=lambda **_: [],
     )
-    sync_cursor = SimpleNamespace(last_synced_worklog_id=1, last_injected_hash="")
+    sync_cursor = SimpleNamespace(last_synced_worklog_id=1, last_synced_topic_version=1, last_injected_hash="")
     provider_sync_store = SimpleNamespace(
         get=MagicMock(return_value=sync_cursor),
         mark_synced=MagicMock(),
@@ -480,10 +480,15 @@ async def test_run_provider_execution_loop_injects_sync_payload_and_marks_synced
         provider_switch_context_sync_enabled=True,
         provider_sync_store=provider_sync_store,
         build_provider_sync_payload_fn=lambda *_: {
-            "latest_worklog_id": 4,
+            "latest_topic_version": 4,
             "payload_text": "delta line",
             "payload_hash": "hash-1",
         },
+        topic_state_store=SimpleNamespace(
+            record_event=MagicMock(
+                return_value=SimpleNamespace(topic_version=5),
+            )
+        ),
     )
 
     assert result.final_response.text == "ok"
@@ -491,6 +496,6 @@ async def test_run_provider_execution_loop_injects_sync_payload_and_marks_synced
     provider_sync_store.mark_synced.assert_called_once_with(
         scope_key="123:main",
         provider_name="codex2",
-        latest_worklog_id=4,
+        latest_topic_version=5,
         injected_hash="hash-1",
     )

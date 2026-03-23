@@ -3,7 +3,13 @@ from __future__ import annotations
 import json
 from datetime import datetime, timedelta, timezone
 
-from src.features.state_store import ProviderSyncStore, ResumeStateStore, SteeringEvent, SteeringLedgerStore
+from src.features.state_store import (
+    ProviderSyncStore,
+    ResumeStateStore,
+    SteeringEvent,
+    SteeringLedgerStore,
+    TopicStateStore,
+)
 
 
 def test_record_start_and_success_persists(tmp_path) -> None:
@@ -113,13 +119,16 @@ def test_provider_sync_store_defaults_and_mark_synced(tmp_path) -> None:
         scope_key="123:main",
         provider_name="codex2",
         latest_worklog_id=42,
+        latest_topic_version=7,
         injected_hash="abc",
     )
     assert updated.last_synced_worklog_id == 42
+    assert updated.last_synced_topic_version == 7
     assert updated.last_injected_hash == "abc"
 
     reloaded = store.get(scope_key="123:main", provider_name="codex2")
     assert reloaded.last_synced_worklog_id == 42
+    assert reloaded.last_synced_topic_version == 7
     assert reloaded.last_injected_hash == "abc"
 
 
@@ -130,3 +139,36 @@ def test_provider_sync_store_does_not_regress_version(tmp_path) -> None:
 
     cursor = store.get(scope_key="123:main", provider_name="codex")
     assert cursor.last_synced_worklog_id == 10
+
+
+def test_provider_sync_store_keeps_latest_topic_version(tmp_path) -> None:
+    store = ProviderSyncStore(tmp_path / "provider_sync_cursors.json")
+    store.mark_synced(scope_key="123:main", provider_name="codex", latest_topic_version=11)
+    store.mark_synced(scope_key="123:main", provider_name="codex", latest_topic_version=9)
+    cursor = store.get(scope_key="123:main", provider_name="codex")
+    assert cursor.last_synced_topic_version == 11
+
+
+def test_topic_state_store_records_incrementing_versions(tmp_path) -> None:
+    store = TopicStateStore(tmp_path / "topic_state_store.json")
+    state1 = store.record_event(scope_key="123:main", provider_name="codex", summary="first")
+    state2 = store.record_event(scope_key="123:main", provider_name="codex2", summary="second")
+
+    assert state1.topic_version == 1
+    assert state2.topic_version == 2
+    assert len(state2.events) == 2
+    assert state2.events[-1].provider_name == "codex2"
+
+
+def test_topic_state_store_delta_since_returns_recent_events(tmp_path) -> None:
+    store = TopicStateStore(tmp_path / "topic_state_store.json")
+    store.record_event(scope_key="123:main", provider_name="codex", summary="v1")
+    store.record_event(scope_key="123:main", provider_name="codex", summary="v2")
+    store.record_event(scope_key="123:main", provider_name="codex2", summary="v3")
+
+    delta = store.delta_since(scope_key="123:main", after_version=1, limit=10)
+    assert delta["latest_topic_version"] == 3
+    events = delta["events"]
+    assert len(events) == 2
+    assert events[0]["version"] == 2
+    assert events[1]["version"] == 3

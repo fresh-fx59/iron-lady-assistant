@@ -189,3 +189,44 @@ def run_one_time_provider_sync_backfill(
         latest_worklog_id,
     )
     return result
+
+
+def auto_prepare_new_codex_providers(
+    *,
+    topic_state_store: TopicStateStore,
+    provider_sync_store: ProviderSyncStore,
+    codex_provider_names: Iterable[str],
+    catchup_window: int,
+) -> dict[str, object]:
+    """Prepare newly added codex-family providers for existing scopes automatically."""
+    provider_names = [name.strip() for name in codex_provider_names if str(name).strip()]
+    if not provider_names:
+        return {"status": "noop", "reason": "no_codex_providers"}
+
+    window = max(1, int(catchup_window))
+    states = topic_state_store.list()
+    created = 0
+    scanned = 0
+    for scope_key, state in states.items():
+        scanned += 1
+        latest_topic_version = int(getattr(state, "topic_version", 0) or 0)
+        if latest_topic_version <= 0:
+            continue
+        seed_version = max(0, latest_topic_version - window)
+        for provider_name in provider_names:
+            if provider_sync_store.exists(scope_key=scope_key, provider_name=provider_name):
+                continue
+            provider_sync_store.mark_synced(
+                scope_key=scope_key,
+                provider_name=provider_name,
+                latest_topic_version=seed_version,
+            )
+            created += 1
+
+    return {
+        "status": "ok",
+        "scopes_scanned": scanned,
+        "cursors_created": created,
+        "provider_names": provider_names,
+        "catchup_window": window,
+    }

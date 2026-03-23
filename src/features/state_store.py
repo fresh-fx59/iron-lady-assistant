@@ -325,6 +325,12 @@ class ProviderSyncStore:
                 updated_at=_now_iso(),
             )
 
+    def exists(self, *, scope_key: str, provider_name: str) -> bool:
+        key = self._key(scope_key, provider_name)
+        with self._lock:
+            cursors = self._load_all_unlocked()
+            return key in cursors
+
     def mark_synced(
         self,
         *,
@@ -450,6 +456,10 @@ class TopicStateStore:
                 updated_at=_now_iso(),
                 events=[],
             )
+
+    def list(self) -> dict[str, TopicState]:
+        with self._lock:
+            return self._load_all_unlocked()
 
     def record_event(
         self,

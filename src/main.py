@@ -24,11 +24,13 @@ from .config import (
     TELEGRAM_BACKOFF_FACTOR,
     TELEGRAM_BACKOFF_JITTER,
     EMBEDDED_SCHEDULER_ENABLED,
+    PROVIDER_SWITCH_CONTEXT_SYNC_MAX_ITEMS,
     SCHEDULER_NOTIFY_LEVEL,
 )
 from . import bot as bot_module
 from .bot import router, provider_manager, task_manager, schedule_manager
 from .features.provider_sync_backfill import run_one_time_provider_sync_backfill
+from .features.provider_sync_backfill import auto_prepare_new_codex_providers
 from .metrics import start_metrics_server
 from .tasks import TaskNotificationMode
 
@@ -411,8 +413,15 @@ async def initialize_runtime(bot: Bot) -> tuple[object, object]:
             codex_provider_names=codex_provider_names,
         )
         logging.info("Provider sync backfill result: %s", backfill_result)
+        reconcile_result = auto_prepare_new_codex_providers(
+            topic_state_store=bot_module.topic_state_store,
+            provider_sync_store=bot_module.provider_sync_store,
+            codex_provider_names=codex_provider_names,
+            catchup_window=PROVIDER_SWITCH_CONTEXT_SYNC_MAX_ITEMS,
+        )
+        logging.info("Provider sync auto-prepare result: %s", reconcile_result)
     except Exception:
-        logging.exception("Provider sync one-time backfill failed")
+        logging.exception("Provider sync startup preparation failed")
     await task_manager.start()
     if _lifecycle_replay_task is None:
         _lifecycle_replay_task = asyncio.create_task(lifecycle_replay_loop(bot))

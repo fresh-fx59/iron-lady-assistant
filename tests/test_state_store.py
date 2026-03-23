@@ -139,6 +139,8 @@ def test_provider_sync_store_does_not_regress_version(tmp_path) -> None:
 
     cursor = store.get(scope_key="123:main", provider_name="codex")
     assert cursor.last_synced_worklog_id == 10
+    assert store.exists(scope_key="123:main", provider_name="codex") is True
+    assert store.exists(scope_key="123:main", provider_name="codex2") is False
 
 
 def test_provider_sync_store_keeps_latest_topic_version(tmp_path) -> None:
@@ -201,3 +203,5 @@ def test_topic_state_store_backfill_scope_seeds_compact_history(tmp_path) -> Non
     )
     assert applied2 is False
     assert state2.topic_version == 3
+    listed = store.list()
+    assert "123:main" in listed

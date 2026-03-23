@@ -975,6 +975,33 @@ class TestScheduleCommands:
         assert "failed after restart" in answer_text
         sched_mock.find_schedule_id_for_chat.assert_called_once()
 
+    async def test_schedule_history_shows_full_error_text(self, mock_message):
+        mock_message.text = "/schedule_history deadbeef"
+        long_error = "error-start " + ("x" * 5000) + " error-end"
+        run = type(
+            "RunLike",
+            (),
+            {
+                "schedule_id": "deadbeef-1234",
+                "status": "failed",
+                "planned_for": datetime(2026, 3, 10, 11, 30, tzinfo=timezone.utc),
+                "started_at": datetime(2026, 3, 10, 11, 30, 5, tzinfo=timezone.utc),
+                "completed_at": datetime(2026, 3, 10, 11, 31, tzinfo=timezone.utc),
+                "background_task_id": "01234567-89ab-cdef-0123-456789abcdef",
+                "error_text": long_error,
+                "response_preview": None,
+            },
+        )()
+        with patch("src.bot.schedule_manager") as sched_mock:
+            sched_mock.find_schedule_id_for_chat = AsyncMock(return_value="deadbeef-1234")
+            sched_mock.list_runs_for_chat = AsyncMock(return_value=[run])
+            await cmd_schedule_history(mock_message)
+
+        sent_text = "\n".join(call.args[0] for call in mock_message.answer.call_args_list)
+        assert "error-start" in sent_text
+        assert "error-end" in sent_text
+        assert sent_text.count("error-start") == 1
+
 
 # ── Contract 7: Message handling ─────────────────────────────────
 @pytest.mark.asyncio

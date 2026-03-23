@@ -1,9 +1,10 @@
 from __future__ import annotations
 
-import html
 import re
 from datetime import datetime
 from typing import Any, Callable
+
+from ..formatter import split_message
 
 
 async def cmd_bg(
@@ -313,21 +314,22 @@ async def cmd_schedule_history(
         await message.answer("No scheduled job history yet.")
         return
 
-    lines = ["<b>Scheduled job history:</b>", ""]
+    lines = ["Scheduled job history:", ""]
     for run in runs:
-        lines.append(f"🕓 <code>{run.schedule_id[:8]}</code> — {format_schedule_run_status_fn(run)}")
+        lines.append(f"🕓 {run.schedule_id[:8]} — {format_schedule_run_status_fn(run)}")
         lines.append(f"   planned: {run.planned_for.astimezone().strftime('%Y-%m-%d %H:%M')}")
         if run.started_at:
             lines.append(f"   started: {run.started_at.astimezone().strftime('%Y-%m-%d %H:%M:%S')}")
         if run.completed_at:
             lines.append(f"   finished: {run.completed_at.astimezone().strftime('%Y-%m-%d %H:%M:%S')}")
         if run.background_task_id:
-            lines.append(f"   task: <code>{run.background_task_id[:8]}</code>")
+            lines.append(f"   task: {run.background_task_id[:8]}")
         detail = run.error_text or run.response_preview
         if detail:
-            lines.append(f"   result: {html.escape(detail[:160])}")
+            lines.append(f"   result: {detail}")
         lines.append("")
-    await message.answer("\n".join(lines), parse_mode="HTML")
+    for chunk in split_message("\n".join(lines)):
+        await message.answer(chunk)
 
 
 async def cmd_schedule_weekly(

@@ -590,14 +590,15 @@ class ScheduleManager:
                         f"<b>Prompt:</b> {html.escape(self._preview_text(schedule.prompt, 160) or '')}"
                     )
                 )
-            except Exception:
+            except Exception as exc:
                 logger.exception("Failed to submit scheduled task %s", schedule.id)
+                error_text = f"Failed to submit background task: {exc}"
                 await asyncio.to_thread(
                     self._mark_run_submission_failed,
                     schedule.id,
                     run_id,
                     submitted_at.isoformat(),
-                    "Failed to submit background task",
+                    error_text,
                 )
                 await self._notify_schedule_event(
                     "submission_failed",
@@ -605,8 +606,10 @@ class ScheduleManager:
                         "❌ <b>Scheduled run submission failed</b>\n"
                         f"<b>Schedule:</b> <code>{schedule.id[:8]}</code>\n"
                         f"<b>Planned:</b> {planned_for.astimezone().strftime('%Y-%m-%d %H:%M:%S')}\n"
-                        f"<b>Target:</b> {self._format_schedule_target(schedule.chat_id, schedule.message_thread_id)}"
-                    )
+                        f"<b>Target:</b> {self._format_schedule_target(schedule.chat_id, schedule.message_thread_id)}\n"
+                        f"<b>Result:</b> {html.escape(error_text)}"
+                    ),
+                    current_error=error_text,
                 )
 
     async def _run_native_schedule(
@@ -728,14 +731,15 @@ class ScheduleManager:
                     f"<b>Prompt:</b> {html.escape(native_result.summary)}"
                 ),
             )
-        except Exception:
+        except Exception as exc:
             logger.exception("Failed to submit native escalation for scheduled task %s", schedule.id)
+            error_text = f"Failed to submit background task: {exc}"
             await asyncio.to_thread(
                 self._mark_run_submission_failed,
                 schedule.id,
                 run_id,
                 submitted_at.isoformat(),
-                "Failed to submit background task",
+                error_text,
             )
             await self._notify_schedule_event(
                 "submission_failed",
@@ -743,8 +747,10 @@ class ScheduleManager:
                     "❌ <b>Scheduled run submission failed</b>\n"
                     f"<b>Schedule:</b> <code>{schedule.id[:8]}</code>\n"
                     f"<b>Planned:</b> {planned_for.astimezone().strftime('%Y-%m-%d %H:%M:%S')}\n"
-                    f"<b>Target:</b> {self._format_schedule_target(schedule.chat_id, schedule.message_thread_id)}"
+                    f"<b>Target:</b> {self._format_schedule_target(schedule.chat_id, schedule.message_thread_id)}\n"
+                    f"<b>Result:</b> {html.escape(error_text)}"
                 ),
+                current_error=error_text,
             )
 
     async def _prepare_incident_report(
@@ -861,7 +867,7 @@ class ScheduleManager:
             task.started_at.isoformat() if task.started_at else None,
             task.completed_at.isoformat() if task.completed_at else None,
             task.error,
-            self._preview_text(task.response),
+            task.response,
         )
         if run:
             if rate_limit_retry_at:
@@ -872,6 +878,7 @@ class ScheduleManager:
                 )
             finished_at = task.completed_at.astimezone().strftime("%Y-%m-%d %H:%M:%S") if task.completed_at else "unknown"
             detail = task.error or self._preview_text(task.response, 220) or "No detail"
+            full_detail = task.error or task.response or "No detail"
             planned_for = datetime.fromisoformat(run["planned_for"]).astimezone().strftime("%Y-%m-%d %H:%M:%S")
             previous_run = await asyncio.to_thread(
                 self._find_previous_run_row,
@@ -889,7 +896,7 @@ class ScheduleManager:
                 if rate_limit_retry_at
                 else ""
             )
-            await self._notify_schedule_event(
+            sent = await self._notify_schedule_event(
                 event_kind,
                 (
                     f"{header}"
@@ -904,6 +911,12 @@ class ScheduleManager:
                 current_response=task.response,
                 current_error=task.error,
             )
+            if sent and full_detail and full_detail != detail:
+                await self._notify_schedule_detail(
+                    run["schedule_id"],
+                    status_value,
+                    full_detail,
+                )
 
     async def list_runs_for_chat(
         self,
@@ -1681,16 +1694,16 @@ class ScheduleManager:
         previous_run: sqlite3.Row | None = None,
         current_response: str | None = None,
         current_error: str | None = None,
-    ) -> None:
+    ) -> bool:
         if self._notification_bot is None or self._notification_chat_id is None:
-            return
+            return False
         if not self._should_notify_event(
             event_kind,
             previous_run=previous_run,
             current_response=current_response,
             current_error=current_error,
         ):
-            return
+            return False
         kwargs: dict[str, Any] = {
             "chat_id": self._notification_chat_id,
             "text": text,
@@ -1700,8 +1713,45 @@ class ScheduleManager:
             kwargs["message_thread_id"] = self._notification_thread_id
         try:
             await self._notification_bot.send_message(**kwargs)
+            return True
         except Exception:
             logger.exception("Failed to send scheduler notification")
+            return False
+
+    async def _notify_schedule_detail(self, schedule_id: str, status: str, detail_text: str) -> None:
+        if self._notification_bot is None or self._notification_chat_id is None:
+            return
+        escaped = html.escape(detail_text or "")
+        if not escaped:
+            return
+        chunks = self._chunk_text(escaped, 2400)
+        for idx, chunk in enumerate(chunks, start=1):
+            part_suffix = f"\n<b>Part:</b> {idx}/{len(chunks)}" if len(chunks) > 1 else ""
+            text = (
+                "🧾 <b>Scheduled run full result</b>\n"
+                f"<b>Schedule:</b> <code>{schedule_id[:8]}</code>\n"
+                f"<b>Status:</b> {html.escape(status)}"
+                f"{part_suffix}\n"
+                f"<pre>{chunk}</pre>"
+            )
+            kwargs: dict[str, Any] = {
+                "chat_id": self._notification_chat_id,
+                "text": text,
+                "parse_mode": "HTML",
+            }
+            if self._notification_thread_id is not None:
+                kwargs["message_thread_id"] = self._notification_thread_id
+            try:
+                await self._notification_bot.send_message(**kwargs)
+            except Exception:
+                logger.exception("Failed to send scheduler detail notification")
+                return
+
+    @staticmethod
+    def _chunk_text(text: str, chunk_size: int) -> list[str]:
+        if not text:
+            return []
+        return [text[index:index + chunk_size] for index in range(0, len(text), chunk_size)]
 
     @staticmethod
     def _next_daily_run(daily_time: str, timezone_name: str, now_utc: datetime) -> datetime:

@@ -1,4 +1,5 @@
 import asyncio
+import html
 import inspect
 import logging
 import re
@@ -898,18 +899,19 @@ class TaskManager:
             lines.append("")
             lines.append(f"<b>Response:</b>")
             # Truncate if too long
-            response_preview = (task.response or "")[:3000]
+            response_preview = html.escape((task.response or "")[:3000])
             lines.append(response_preview)
             if len(task.response or "") > 3000:
                 lines.append(f"...")
                 lines.append(f"(Response truncated, {len(task.response) - 3000} more characters)")
 
-            await self.bot.send_message(
-                chat_id=task.chat_id,
-                message_thread_id=task.message_thread_id,
-                text="\n".join(lines),
-                parse_mode="HTML",
-            )
+            for chunk in split_message("\n".join(lines)):
+                await self.bot.send_message(
+                    chat_id=task.chat_id,
+                    message_thread_id=task.message_thread_id,
+                    text=chunk,
+                    parse_mode="HTML",
+                )
 
         except Exception as e:
             logger.warning("Failed to notify completion for task %s: %s", task.id, e)
@@ -967,14 +969,15 @@ class TaskManager:
                 f"<b>Duration:</b> {task.duration_ms / 1000:.1f}s",
                 f"",
                 f"<b>Error:</b>",
-                f"{task.error or 'Unknown error'}",
+                f"{html.escape(task.error or 'Unknown error')}",
             ]
-            await self.bot.send_message(
-                chat_id=task.chat_id,
-                message_thread_id=task.message_thread_id,
-                text="\n".join(lines),
-                parse_mode="HTML",
-            )
+            for chunk in split_message("\n".join(lines)):
+                await self.bot.send_message(
+                    chat_id=task.chat_id,
+                    message_thread_id=task.message_thread_id,
+                    text=chunk,
+                    parse_mode="HTML",
+                )
 
         except Exception as e:
             logger.warning("Failed to notify failure for task %s: %s", task.id, e)

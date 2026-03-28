@@ -62,6 +62,9 @@ class TelegramProxy:
         self._client = None
         self._channel_cls = None
         self._get_full_channel_request = None
+        self._create_channel_request = None
+        self._invite_to_channel_request = None
+        self._export_chat_invite_request = None
         self._entity_cache: dict[tuple[str, int], Any] = {}
         self._lock = asyncio.Lock()
         self._allowed_channel_ids = set(config.TELEGRAM_PROXY_ALLOWED_CHANNEL_IDS)
@@ -73,6 +76,8 @@ class TelegramProxy:
             from telethon import TelegramClient
             from telethon.sessions import StringSession
             from telethon.tl.functions.channels import GetFullChannelRequest
+            from telethon.tl.functions.channels import CreateChannelRequest, InviteToChannelRequest
+            from telethon.tl.functions.messages import ExportChatInviteRequest
             from telethon.tl.types import Channel
         except Exception as exc:  # pragma: no cover - dependency failure
             raise RuntimeError(f"Telethon import failed: {exc}") from exc
@@ -88,6 +93,9 @@ class TelegramProxy:
         self._client = TelegramClient(session, creds.api_id, creds.api_hash)
         self._channel_cls = Channel
         self._get_full_channel_request = GetFullChannelRequest
+        self._create_channel_request = CreateChannelRequest
+        self._invite_to_channel_request = InviteToChannelRequest
+        self._export_chat_invite_request = ExportChatInviteRequest
         await self._client.connect()
         if not await self._client.is_user_authorized():
             raise RuntimeError("Telegram proxy user session is not authorized.")
@@ -210,6 +218,50 @@ class TelegramProxy:
         self._entity_cache[cache_key] = entity
         return entity
 
+    async def create_group(self, *, title: str, members: list[str]) -> dict[str, Any]:
+        client = self._require_client()
+        if not title.strip():
+            raise web.HTTPBadRequest(text="Missing title.")
+        invited: list[str] = []
+        failed_invites: list[dict[str, str]] = []
+        async with self._lock:
+            created = await client(
+                self._create_channel_request(
+                    title=title.strip(),
+                    about="",
+                    megagroup=True,
+                )
+            )
+            if not created.chats:
+                raise RuntimeError("Telegram did not return created chat.")
+            channel = created.chats[0]
+
+            invite_link = None
+            try:
+                invite = await client(self._export_chat_invite_request(peer=channel))
+                invite_link = getattr(invite, "link", None)
+            except Exception:
+                invite_link = None
+
+            for raw_member in members:
+                member = raw_member.strip()
+                if not member:
+                    continue
+                try:
+                    entity = await client.get_input_entity(member)
+                    await client(self._invite_to_channel_request(channel=channel, users=[entity]))
+                    invited.append(member)
+                except Exception as exc:
+                    failed_invites.append({"member": member, "error": str(exc)})
+
+        return {
+            "chat_id": int(channel.id),
+            "title": title.strip(),
+            "invite_link": invite_link,
+            "invited": invited,
+            "failed_invites": failed_invites,
+        }
+
     async def _prime_entity_cache_from_dialogs(self) -> None:
         client = self._require_client()
         async with self._lock:
@@ -283,6 +335,32 @@ async def _read_messages(request: web.Request) -> web.Response:
     return web.json_response({"messages": messages})
 
 
+async def _create_group(request: web.Request) -> web.Response:
+    _check_auth(request)
+    proxy: TelegramProxy = request.app["proxy"]
+    try:
+        payload = await request.json()
+    except Exception:
+        raise web.HTTPBadRequest(text="Invalid JSON body.") from None
+
+    title = str(payload.get("title", "")).strip()
+    members_raw = payload.get("members", [])
+    if isinstance(members_raw, str):
+        members = [item.strip() for item in members_raw.split(",") if item.strip()]
+    elif isinstance(members_raw, list):
+        members = [str(item).strip() for item in members_raw if str(item).strip()]
+    else:
+        members = []
+
+    try:
+        result = await proxy.create_group(title=title, members=members)
+    except web.HTTPException:
+        raise
+    except Exception as exc:
+        raise web.HTTPBadGateway(text=f"Create group failed: {exc}") from exc
+    return web.json_response({"ok": True, "result": result})
+
+
 async def _startup(app: web.Application) -> None:
     proxy = TelegramProxy()
     await proxy.start()
@@ -299,6 +377,7 @@ def create_app() -> web.Application:
     app.router.add_get("/health", _health)
     app.router.add_get("/v1/channels", _list_channels)
     app.router.add_get("/v1/messages/{kind}/{entity_id}", _read_messages)
+    app.router.add_post("/v1/telegram/createGroup", _create_group)
     app.on_startup.append(_startup)
     app.on_cleanup.append(_cleanup)
     return app

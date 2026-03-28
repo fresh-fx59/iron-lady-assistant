@@ -22,6 +22,8 @@ from aiogram import Bot
 from .tasks import BackgroundTask, TaskManager, TaskNotificationMode
 
 logger = logging.getLogger(__name__)
+_CLAUDE_CHAT_MODELS = {"sonnet", "opus", "haiku", "default"}
+_CODEX_DEFAULT_MODEL = "gpt-5-codex"
 _RESPONSE_STATUS_RE = re.compile(r"overall status:\s*[`']?(ok|warn|critical|error|failed)[`']?", re.IGNORECASE)
 _NATIVE_SCHEDULE_HEADER = "[[SCHEDULE_NATIVE]]"
 _SCHEDULE_DELIVER_MARKER = "[[SCHEDULE_DELIVER]]"
@@ -214,6 +216,15 @@ class ScheduleManager:
                 "CREATE INDEX IF NOT EXISTS idx_scheduled_tasks_due "
                 "ON scheduled_tasks(state, current_run_id, next_run_at)"
             )
+            con.execute(
+                """
+                UPDATE scheduled_tasks
+                SET model = ?
+                WHERE lower(coalesce(provider_cli, '')) LIKE 'codex%'
+                  AND lower(trim(coalesce(model, ''))) IN ('', 'default', 'sonnet', 'opus', 'haiku')
+                """,
+                (_CODEX_DEFAULT_MODEL,),
+            )
 
     @staticmethod
     def _ensure_column(con: sqlite3.Connection, name: str, definition: str) -> None:
@@ -251,6 +262,7 @@ class ScheduleManager:
         now = datetime.now(timezone.utc)
         next_run = now + timedelta(minutes=interval_minutes)
         provider_cli, resume_arg = self._normalize_provider_runtime(provider_cli, resume_arg)
+        model = self._normalize_model_for_provider(model, provider_cli)
         await asyncio.to_thread(
             self._insert_schedule,
             task_id,
@@ -289,6 +301,7 @@ class ScheduleManager:
         now = datetime.now(timezone.utc)
         next_run = self._next_daily_run(daily_time=daily_time, timezone_name=timezone_name, now_utc=now)
         provider_cli, resume_arg = self._normalize_provider_runtime(provider_cli, resume_arg)
+        model = self._normalize_model_for_provider(model, provider_cli)
         await asyncio.to_thread(
             self._insert_schedule,
             task_id,
@@ -333,6 +346,7 @@ class ScheduleManager:
             now_utc=now,
         )
         provider_cli, resume_arg = self._normalize_provider_runtime(provider_cli, resume_arg)
+        model = self._normalize_model_for_provider(model, provider_cli)
         await asyncio.to_thread(
             self._insert_schedule,
             task_id,
@@ -545,6 +559,15 @@ class ScheduleManager:
     def _normalize_provider_runtime(provider_cli: str | None, resume_arg: str | None) -> tuple[str, str | None]:
         cli_name = (provider_cli or "claude").strip() or "claude"
         return cli_name, resume_arg
+
+    @staticmethod
+    def _normalize_model_for_provider(model: str | None, provider_cli: str | None) -> str:
+        model_name = (model or "").strip()
+        cli_name = (provider_cli or "").strip().lower()
+        if cli_name.startswith("codex"):
+            if not model_name or model_name.lower() in _CLAUDE_CHAT_MODELS:
+                return _CODEX_DEFAULT_MODEL
+        return model_name or "sonnet"
 
     async def _worker_loop(self) -> None:
         while True:
@@ -1297,6 +1320,7 @@ class ScheduleManager:
             row["provider_cli"],
             row["resume_arg"],
         )
+        model = ScheduleManager._normalize_model_for_provider(row["model"], provider_cli)
         return ScheduledTask(
             id=row["id"],
             chat_id=row["chat_id"],
@@ -1308,7 +1332,7 @@ class ScheduleManager:
             daily_time=row["daily_time"],
             timezone_name=row["timezone_name"],
             weekly_day=row["weekly_day"],
-            model=row["model"],
+            model=model,
             session_id=row["session_id"],
             provider_cli=provider_cli,
             resume_arg=resume_arg,

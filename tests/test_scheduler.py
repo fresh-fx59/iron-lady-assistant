@@ -157,6 +157,28 @@ async def test_due_schedule_preserves_selected_codex_runtime(tmp_path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_due_schedule_normalizes_unsupported_claude_model_for_codex(tmp_path) -> None:
+    stub = _StubTaskManager()
+    manager = ScheduleManager(stub, tmp_path / "schedules.db")
+    sid = await manager.create_every(
+        chat_id=10,
+        user_id=20,
+        prompt="scheduled prompt",
+        interval_minutes=1,
+        model="haiku",
+        session_id="sess-1",
+        provider_cli="codex",
+    )
+
+    past = (datetime.now(timezone.utc) - timedelta(minutes=1)).isoformat()
+    await asyncio.to_thread(manager._update_next_run, sid, past)  # noqa: SLF001
+
+    await manager._run_due_once()  # noqa: SLF001
+    assert stub.submissions[0]["provider_cli"] == "codex"
+    assert stub.submissions[0]["model"] == "gpt-5-codex"
+
+
+@pytest.mark.asyncio
 async def test_native_schedule_skips_llm_when_validator_reports_no_change(tmp_path) -> None:
     stub = _StubTaskManager()
     manager = ScheduleManager(stub, tmp_path / "schedules.db")

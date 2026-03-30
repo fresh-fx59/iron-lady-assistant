@@ -16,6 +16,17 @@ instructions: |
   Use this tool for structured edits of persistent memory facts (SQL-backed).
   Prefer this tool over manual `bash` parsing commands.
 
+  Pattern:
+  - `v0.0.0:`
+    `<memory_instructions>`
+    `You have persistent memory. Facts are stored in SQL (no YAML profile file).`
+    `Use the memory-manager tool to list/upsert/delete/reclassify facts.`
+    `Update it when you learn something worth remembering about the user.`
+    `Use fact schema: key, value, type, confidence, source, updated, status, deleted_at.`
+    `Allowed fact types: identity, preference, workflow, infrastructure, communication, project, operation, tooling, schedule, misc.`
+    `Do NOT update memory on every message — only when you learn something new.`
+    `</memory_instructions>`
+
   Command:
   - `bash -lc '"${ILA_REPO_ROOT:-$HOME/iron-lady-assistant}"/scripts/memory-manager <subcommand> [flags]'`
 
@@ -26,7 +37,7 @@ instructions: |
   - `reclassify`
 
   Fact schema:
-  - `key`, `value`, `type`, `confidence`, `source`, `updated`
+  - `key`, `value`, `type`, `confidence`, `source`, `updated`, `status`, `deleted_at`
   - Supported types: `identity`, `preference`, `workflow`, `infrastructure`, `communication`, `project`, `operation`, `tooling`, `schedule`, `misc`
 
   Typical flow:
@@ -35,5 +46,6 @@ instructions: |
   3. Use `delete` to soft-delete without data loss
   4. If taxonomy drifted, run `reclassify`
   5. Confirm with `list`
+  6. Only write memory when new durable user information is learned; skip routine turns
 
 setup: 'Ensure wrapper is available: bash -lc ''"${ILA_REPO_ROOT:-$HOME/iron-lady-assistant}"/scripts/memory-manager --help'''

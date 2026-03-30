@@ -499,3 +499,114 @@ async def test_run_provider_execution_loop_injects_sync_payload_and_marks_synced
         latest_topic_version=5,
         injected_hash="hash-1",
     )
+
+
+@pytest.mark.asyncio
+async def test_run_provider_execution_loop_rebuilds_sync_payload_for_fallback_provider():
+    message = SimpleNamespace(
+        chat=SimpleNamespace(id=123),
+        message_id=82,
+        answer=AsyncMock(),
+    )
+    state = SimpleNamespace(cancel_requested=False, process_handle=None, reset_requested=False)
+    session = SimpleNamespace(claude_session_id=None, codex_session_id=None)
+    progress = SimpleNamespace(report_tool=AsyncMock())
+    typing_task = asyncio.create_task(asyncio.sleep(3600))
+
+    primary = SimpleNamespace(name="codex", cli="claude", resume_arg=None)
+    fallback = SimpleNamespace(name="codex2", cli="claude", resume_arg=None)
+    advanced = {"used": False}
+
+    def advance(_scope):
+        if advanced["used"]:
+            return None
+        advanced["used"] = True
+        return fallback
+
+    provider_manager = SimpleNamespace(
+        get_provider=lambda _scope: primary,
+        reset=lambda _scope: primary,
+        advance=advance,
+        subprocess_env=lambda _provider: {},
+        is_rate_limit_error=lambda text: "rate" in (text or "").lower(),
+    )
+    session_manager = SimpleNamespace(
+        set_provider=MagicMock(),
+        update_session_id=MagicMock(),
+        update_codex_session_id=MagicMock(),
+    )
+    resume_state_store = SimpleNamespace(record_start=MagicMock())
+    steering_ledger_store = SimpleNamespace(
+        mark_applied=MagicMock(),
+        get_unapplied=lambda **_: [],
+    )
+
+    primary_cursor = SimpleNamespace(last_synced_worklog_id=0, last_synced_topic_version=1, last_injected_hash="")
+    fallback_cursor = SimpleNamespace(last_synced_worklog_id=0, last_synced_topic_version=3, last_injected_hash="")
+    provider_sync_store = SimpleNamespace(
+        get=MagicMock(side_effect=[primary_cursor, fallback_cursor]),
+        mark_synced=MagicMock(),
+    )
+
+    captured_prompts: list[str] = []
+    responses = [
+        SimpleNamespace(is_error=True, text="rate limited", session_id=None),
+        SimpleNamespace(is_error=False, text="fallback ok", session_id=None),
+    ]
+
+    async def run_claude(*_args, **kwargs):
+        captured_prompts.append(kwargs.get("override_text") or "")
+        return responses.pop(0)
+
+    def build_sync_payload(_scope_key, provider_name, _last_synced):
+        if provider_name == "codex":
+            return {"latest_topic_version": 5, "payload_text": "primary delta", "payload_hash": "hash-primary"}
+        return {"latest_topic_version": 7, "payload_text": "fallback delta", "payload_hash": "hash-fallback"}
+
+    result = await run_provider_execution_loop(
+        message=message,
+        state=state,
+        session=session,
+        progress=progress,
+        typing_task=typing_task,
+        scope_key="123:main",
+        chat_id=123,
+        thread_id=None,
+        raw_prompt="hello",
+        override_text=None,
+        provider_manager=provider_manager,
+        session_manager=session_manager,
+        resume_state_store=resume_state_store,
+        steering_ledger_store=steering_ledger_store,
+        logger=MagicMock(),
+        current_model_label_fn=lambda *_: "sonnet",
+        is_codex_family_cli_fn=lambda cli: bool(cli and cli.startswith("codex")),
+        find_provider_cli_fn=lambda _cli: "/usr/bin/claude",
+        as_text_fn=lambda text: text or "",
+        worklog_subprocess_env_fn=lambda env, **_: env,
+        codex_model_arg_fn=lambda *_: None,
+        run_codex_with_retries_fn=AsyncMock(),
+        run_claude_fn=run_claude,
+        extract_requested_tools_fn=lambda _text: [],
+        inject_tool_request_fn=lambda prompt, _tool: prompt,
+        build_steering_patch_fn=lambda prompt, _events: prompt,
+        has_high_risk_conflict_fn=lambda _events: False,
+        provider_switch_context_sync_enabled=True,
+        provider_sync_store=provider_sync_store,
+        build_provider_sync_payload_fn=build_sync_payload,
+        topic_state_store=SimpleNamespace(
+            record_event=MagicMock(return_value=SimpleNamespace(topic_version=8)),
+        ),
+    )
+
+    assert result.final_provider_name == "codex2"
+    assert len(captured_prompts) == 2
+    assert "primary delta" in captured_prompts[0]
+    assert "fallback delta" in captured_prompts[1]
+    assert "primary delta" not in captured_prompts[1]
+    provider_sync_store.mark_synced.assert_called_once_with(
+        scope_key="123:main",
+        provider_name="codex2",
+        latest_topic_version=8,
+        injected_hash="hash-fallback",
+    )

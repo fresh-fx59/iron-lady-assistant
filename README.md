@@ -1,6 +1,6 @@
 # Telegram Persona Assistant
 
-Chat with your assistant directly from Telegram. The bot supports multiple providers and CLIs, including Claude, Codex, Codex2, Codex3, and Codex4.
+Chat with your assistant directly from Telegram. The bot supports multiple providers and CLIs, including Claude and Codex.
 
 The runtime can switch providers per chat, preserve session state, and fall back between configured backends from `providers.json`.
 
@@ -14,9 +14,6 @@ Before starting, make sure you have:
 4. **At least one provider CLI configured**:
    - Claude: [Claude Code](https://docs.anthropic.com/en/docs/claude-code)
    - Codex: `codex`
-   - Codex2: `codex2`
-   - Codex3: `codex3`
-   - Codex4: `codex4`
 
 ## Setup (5 minutes)
 
@@ -36,32 +33,11 @@ Codex:
 npm install -g @openai/codex
 ```
 
-Codex2:
-
-```bash
-# install/configure the codex2 CLI so `codex2` is available in PATH
-```
-
-Codex3:
-
-```bash
-# install/configure the codex3 CLI so `codex3` is available in PATH
-```
-
-Codex4:
-
-```bash
-# install/configure the codex4 CLI so `codex4` is available in PATH
-```
-
 Then authenticate the providers you installed:
 
 ```bash
 claude   # follow the prompts to log in
 codex    # optional
-codex2   # optional
-codex3   # optional
-codex4   # optional
 ```
 
 ### 2. Clone this repo
@@ -173,7 +149,7 @@ For safe remote interaction, keep VNC localhost-only and forward it over SSH:
 
 ```bash
 ./scripts/start_ozon_vnc_local.sh
-ssh -N -L 5901:127.0.0.1:5901 claude-developer@31.220.78.216
+ssh -N -L 5901:127.0.0.1:5901 claude-developer@YOUR.SER.VER.IP
 ```
 
 ## Personal Browser Takeover
@@ -293,11 +269,13 @@ Incoming Telegram `text`, `voice`, `photo`, and `document` updates are also logg
 
 ## Codex Instance Helper
 
-If you want a separate Codex home directory and a real executable on `PATH`, use [`create_codex_instance.sh`](/home/claude-developer/iron-lady-assistant/create_codex_instance.sh):
+If you want a separate Codex home directory and a real executable on `PATH`, use [`create_codex_instance.sh`](/home/claude-developer/iron-lady-assistant/create_codex_instance.sh).
 
 ```bash
-./create_codex_instance.sh codex3
-codex3
+bash create_codex_instance.sh codex5
+source ~/.bashrc
+ssh -N -L 1455:127.0.0.1:1455 claude-developer@YOUR.SER.VER.IP
+codex5 login
 ```
 
 What it does:
@@ -308,22 +286,16 @@ What it does:
 - Keeps Codex/OpenAI login isolated by default because each instance has its own `HOME`
 - Shares `gh` auth only if you explicitly pass `--share-gh-config`
 
-Then authenticate that separate instance once:
+After that, launch `codex5` and use this prompt:
 
 ```bash
-HOME="$HOME/.codex3" codex login
+launch codex5, say i am using providers in my app. i have codex codex2 codex3 codex4. add codex5 provider like other codex* providers
 ```
 
-If you also want that instance to reuse your normal `gh` login:
+Then restart the bot:
 
 ```bash
-./create_codex_instance.sh codex3 /usr/local/bin/codex3 --share-gh-config
-```
-
-If you do not pass `--share-gh-config`, GitHub CLI stays separate too:
-
-```bash
-HOME="$HOME/.codex3" gh auth login
+sudo systemctl restart telegram-bot
 ```
 
 ## Running in the Background
@@ -679,7 +651,7 @@ The bundled systemd units include the per-user npm bin path so `codex` CLIs inst
 - Run `npm install -g @anthropic-ai/claude-code`
 - Make sure Node.js 18+ is installed
 
-**"Provider CLI 'codex', 'codex2', 'codex3', or 'codex4' is not installed"**
+**"Provider CLI 'codex*' is not installed"**
 - Install or configure the missing CLI so it is available on `PATH`
 - Switch providers with `/provider` only after the CLI is installed
 

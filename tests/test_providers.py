@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 from pathlib import Path
 
@@ -33,3 +34,13 @@ def test_provider_manager_subprocess_env_normalizes_path_and_preserves_provider_
     assert env["ILA_REPO_ROOT"] == str(Path(__file__).resolve().parents[1])
     assert "/usr/local/bin" in env["PATH"].split(os.pathsep)
     assert str(custom_bin) in env["PATH"].split(os.pathsep)
+
+
+def test_repo_codex_provider_uses_native_codex_cli_config() -> None:
+    providers_path = Path(__file__).resolve().parents[1] / "providers.json"
+    data = json.loads(providers_path.read_text())
+
+    codex_provider = next(provider for provider in data["providers"] if provider["name"] == "codex")
+
+    assert codex_provider["cli"] == "codex"
+    assert codex_provider.get("env", {}) == {}

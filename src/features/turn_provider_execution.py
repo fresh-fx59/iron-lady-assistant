@@ -16,6 +16,16 @@ class TurnExecutionResult:
     final_model_name: str
 
 
+_MISSING_PROVIDER_CLI_ERROR_MARKER = "not installed or not in path on the server"
+
+
+def _is_missing_provider_cli_error(error_text: str | None) -> bool:
+    if not error_text:
+        return False
+    text = error_text.strip().lower()
+    return "cli" in text and _MISSING_PROVIDER_CLI_ERROR_MARKER in text
+
+
 def _is_empty_success_response(response: Any, state: Any) -> bool:
     return bool(
         response
@@ -180,6 +190,7 @@ async def run_provider_execution_loop(
                 and (
                     provider_manager.is_rate_limit_error(final_response.text)
                     or (provider.cli == "claude" and error_text_l == "claude returned an error.")
+                    or _is_missing_provider_cli_error(final_response.text)
                 )
             )
             if should_fallback:
@@ -188,6 +199,8 @@ async def run_provider_execution_loop(
                     reason = (
                         "Rate limited"
                         if provider_manager.is_rate_limit_error(final_response.text)
+                        else "CLI not available"
+                        if _is_missing_provider_cli_error(final_response.text)
                         else "Provider error"
                     )
                     await message.answer(

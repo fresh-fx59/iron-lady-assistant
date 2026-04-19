@@ -663,7 +663,7 @@ async def _download_document_attachment(message: Message) -> dict[str, object] |
 async def _attachment_blocks_for_message(message: Message, *, relation: str = "current") -> list[str]:
     blocks: list[str] = []
     image_path = await _download_photo_attachment(message)
-    if image_path:
+    if image_path and Path(image_path).exists():
         ocr_text = await asyncio.to_thread(extract_ocr_text, image_path)
         image_block = (
             "User attached an image.\n"

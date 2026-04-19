@@ -120,6 +120,7 @@ class TaskManager:
         "codex process exited without producing a result",
         "codex process was interrupted by service restart",
     )
+    _MISSING_PROVIDER_CLI_ERROR_MARKER: Final[str] = "not installed or not in path on the server"
 
     def __init__(
         self,
@@ -547,6 +548,15 @@ class TaskManager:
                             task.session_id = None
                             await asyncio.sleep(0.3)
                             continue
+                    if (
+                        response
+                        and response.is_error
+                        and self._is_missing_provider_cli_error(response.text)
+                    ):
+                        if self._advance_task_provider(task, attempted_provider_clis):
+                            task.session_id = None
+                            await asyncio.sleep(0.3)
+                            continue
                     break
 
                 logger.warning(
@@ -686,6 +696,14 @@ class TaskManager:
             return False
         return bool(error_text) and self._provider_manager.is_rate_limit_error(error_text)
 
+    def _is_missing_provider_cli_error(self, error_text: str | None) -> bool:
+        if self._provider_manager is None:
+            return False
+        text = (error_text or "").strip().lower()
+        if not text:
+            return False
+        return "cli" in text and self._MISSING_PROVIDER_CLI_ERROR_MARKER in text
+
     def _ensure_task_provider_scope(self, task: BackgroundTask) -> None:
         if self._provider_manager is None:
             return
@@ -772,7 +790,7 @@ class TaskManager:
             return None
 
         codex_providers = codex_family_providers(list(providers))
-        if len(codex_providers) < 2:
+        if not codex_providers:
             return None
 
         current_idx = next(
@@ -785,6 +803,16 @@ class TaskManager:
             None,
         )
         if current_idx is None:
+            for candidate in codex_providers:
+                candidate_cli = getattr(candidate, "cli", None)
+                if not candidate_cli or candidate_cli in attempted_provider_clis:
+                    continue
+                if getattr(self._provider_manager, "set_provider", None):
+                    self._provider_manager.set_provider(
+                        self._task_scope_key(task),
+                        getattr(candidate, "name", candidate_cli),
+                    )
+                return candidate
             return None
 
         for offset in range(1, len(codex_providers)):

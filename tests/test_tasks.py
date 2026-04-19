@@ -726,6 +726,87 @@ async def test_execute_task_cycles_through_codex_family_before_non_codex_fallbac
 
 
 @pytest.mark.asyncio
+async def test_execute_task_falls_back_when_configured_codex_cli_is_missing(monkeypatch) -> None:
+    bot = AsyncMock()
+    providers = [
+        SimpleNamespace(name="codex", cli="codex", model=None, resume_arg=None),
+        SimpleNamespace(name="codex2", cli="codex2", model=None, resume_arg=None),
+    ]
+    scope_state = {"123:main": 1}
+    set_calls: list[tuple[str, str]] = []
+
+    provider_manager = SimpleNamespace()
+    provider_manager.providers = providers
+
+    def _get_provider(scope_key: str):
+        return providers[scope_state[scope_key]]
+
+    def _set_provider(scope_key: str, name: str):
+        set_calls.append((scope_key, name))
+        for idx, provider in enumerate(providers):
+            if provider.name == name:
+                scope_state[scope_key] = idx
+                return provider
+        return None
+
+    provider_manager.get_provider = _get_provider
+    provider_manager.set_provider = _set_provider
+    provider_manager.advance = lambda _scope_key: None
+    provider_manager.is_rate_limit_error = lambda _text: False
+    provider_manager.subprocess_env = lambda _provider: {"FAKE_PROVIDER_ENV": "1"}
+
+    manager = TaskManager(bot, provider_manager=provider_manager)
+    task = BackgroundTask(
+        id="task-codex-cli-missing",
+        chat_id=123,
+        message_thread_id=None,
+        user_id=123,
+        prompt="x",
+        model="gpt-5-codex",
+        session_id="sess-1",
+        provider_cli="codex2",
+        status=TaskStatus.RUNNING,
+        created_at=datetime.now(),
+    )
+
+    attempts: list[str] = []
+
+    async def fake_stream_codex_message(**kwargs):
+        attempts.append(kwargs["cli_name"])
+        if len(attempts) == 1:
+            yield bridge.StreamEvent(
+                event_type=bridge.StreamEventType.RESULT,
+                response=bridge.ClaudeResponse(
+                    text="Provider CLI 'codex2' is not installed or not in PATH on the server.",
+                    session_id="sess-1",
+                    is_error=True,
+                    cost_usd=0.0,
+                ),
+            )
+            return
+
+        yield bridge.StreamEvent(
+            event_type=bridge.StreamEventType.RESULT,
+            response=bridge.ClaudeResponse(
+                text="ok-after-cli-fallback",
+                session_id="sess-2",
+                is_error=False,
+                cost_usd=0.0,
+            ),
+        )
+
+    monkeypatch.setattr("src.tasks.bridge.stream_codex_message", fake_stream_codex_message)
+
+    await manager._execute_task(task)  # noqa: SLF001
+
+    assert set_calls == [("123:main", "codex")]
+    assert attempts == ["codex2", "codex"]
+    assert task.provider_cli == "codex"
+    assert task.status == TaskStatus.COMPLETED
+    assert task.response == "ok-after-cli-fallback"
+
+
+@pytest.mark.asyncio
 async def test_silent_notification_mode_suppresses_completion_and_failure_messages(monkeypatch) -> None:
     bot = AsyncMock()
     manager = TaskManager(bot)

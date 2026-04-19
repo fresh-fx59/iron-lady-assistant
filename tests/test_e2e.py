@@ -220,7 +220,7 @@ class TestProviderFallbackPersistence:
             ),
             bridge.ClaudeResponse(
                 text="ok after fallback",
-                session_id="codex2-sess",
+                session_id="fallback-sess",
                 is_error=False,
                 cost_usd=0.0,
                 duration_ms=0,
@@ -237,8 +237,9 @@ class TestProviderFallbackPersistence:
         mock_message.text = "please handle with fallback"
         await handle_message(mock_message)
 
-        assert provider_manager.get_provider(scope_key).name == "codex2"
-        assert session_manager.get(123456789).provider == "codex2"
+        # codex is at idx 0 in providers.json; advance() moves to idx 1 = claude.
+        assert provider_manager.get_provider(scope_key).name == "claude"
+        assert session_manager.get(123456789).provider == "claude"
 
 
 # ── E2E Flow 6: Message formatting pipeline ────────────────────

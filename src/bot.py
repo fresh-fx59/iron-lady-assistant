@@ -660,6 +660,76 @@ async def _download_document_attachment(message: Message) -> dict[str, object] |
         return None
 
 
+async def _download_non_document_attachment(message: Message) -> dict[str, object] | None:
+    attachment = None
+    relation_label = "file"
+    default_name = "attachment.bin"
+
+    audio = getattr(message, "audio", None)
+    if audio:
+        attachment = audio
+        relation_label = "audio file"
+        performer = str(getattr(audio, "performer", "") or "").strip()
+        title = str(getattr(audio, "title", "") or "").strip()
+        base_name = " - ".join(part for part in (performer, title) if part) or "audio"
+        default_name = f"{base_name}.bin"
+
+    video = getattr(message, "video", None)
+    if video and attachment is None:
+        attachment = video
+        relation_label = "video file"
+        default_name = "video.bin"
+
+    animation = getattr(message, "animation", None)
+    if animation and attachment is None:
+        attachment = animation
+        relation_label = "animation file"
+        default_name = "animation.bin"
+
+    video_note = getattr(message, "video_note", None)
+    if video_note and attachment is None:
+        attachment = video_note
+        relation_label = "video note"
+        default_name = "video-note.bin"
+
+    if attachment is None:
+        return None
+
+    try:
+        tg_file = await message.bot.get_file(attachment.file_id)
+        file_name = getattr(attachment, "file_name", None) or Path(tg_file.file_path or "").name or default_name
+        suffix = Path(file_name).suffix.lower() or Path(tg_file.file_path or "").suffix.lower() or ".bin"
+        mime_type = getattr(attachment, "mime_type", None) or mimetypes.guess_type(file_name)[0] or ""
+        if relation_label == "audio file" and suffix == ".bin":
+            suffix = ".mp3" if mime_type == "audio/mpeg" else ".m4a"
+        elif relation_label in {"video file", "video note", "animation file"} and suffix == ".bin":
+            suffix = ".mp4" if mime_type.startswith("video/") else ".bin"
+
+        _INCOMING_MEDIA_DIR.mkdir(parents=True, exist_ok=True)
+        target_path = _INCOMING_MEDIA_DIR / f"{message.chat.id}_{message.message_id}_{uuid4().hex[:8]}{suffix}"
+        await message.bot.download_file(tg_file.file_path, destination=target_path)
+        preview_text = await asyncio.to_thread(_text_preview_from_file, str(target_path), mime_type)
+        return {
+            "path": str(target_path),
+            "file_name": file_name,
+            "mime_type": mime_type,
+            "size_bytes": int(getattr(attachment, "file_size", 0) or 0),
+            "preview_text": preview_text,
+            "relation_label": relation_label,
+        }
+    except Exception:
+        logger.exception("Failed to download non-document attachment for message %s", message.message_id)
+        return None
+
+
+async def _download_generic_attachment(message: Message) -> dict[str, object] | None:
+    document_info = await _download_document_attachment(message)
+    if document_info is not None:
+        document_info.setdefault("relation_label", "file")
+        return document_info
+    return await _download_non_document_attachment(message)
+
+
 async def _attachment_blocks_for_message(message: Message, *, relation: str = "current") -> list[str]:
     blocks: list[str] = []
     image_path = await _download_photo_attachment(message)
@@ -680,10 +750,11 @@ async def _attachment_blocks_for_message(message: Message, *, relation: str = "c
             )
         blocks.append(image_block)
 
-    document_info = await _download_document_attachment(message)
+    document_info = await _download_generic_attachment(message)
     if document_info:
+        relation_label = str(document_info.get("relation_label") or "file")
         document_block_lines = [
-            "User attached a file.",
+            f"User attached {relation_label}.",
             f"Filename: {document_info['file_name']}",
             f"Local file path: {document_info['path']}",
         ]
@@ -1868,6 +1939,70 @@ async def handle_document_message(message: Message) -> None:
     )
 
 
+@router.message(F.audio)
+async def handle_audio_message(message: Message) -> None:
+    await _message_media_handlers.handle_generic_file_message(
+        message,
+        route_label="audio",
+        log_incoming_message_fn=_log_incoming_message,
+        logger=logger,
+        thread_id_fn=_thread_id,
+        handle_message_inner_fn=_handle_message_inner,
+        metrics=metrics,
+        scope_key_from_message_fn=_scope_key_from_message,
+        record_error_fn=_record_error,
+        build_rollback_suggestion_markup_fn=_build_rollback_suggestion_markup,
+    )
+
+
+@router.message(F.video)
+async def handle_video_message(message: Message) -> None:
+    await _message_media_handlers.handle_generic_file_message(
+        message,
+        route_label="video",
+        log_incoming_message_fn=_log_incoming_message,
+        logger=logger,
+        thread_id_fn=_thread_id,
+        handle_message_inner_fn=_handle_message_inner,
+        metrics=metrics,
+        scope_key_from_message_fn=_scope_key_from_message,
+        record_error_fn=_record_error,
+        build_rollback_suggestion_markup_fn=_build_rollback_suggestion_markup,
+    )
+
+
+@router.message(F.animation)
+async def handle_animation_message(message: Message) -> None:
+    await _message_media_handlers.handle_generic_file_message(
+        message,
+        route_label="animation",
+        log_incoming_message_fn=_log_incoming_message,
+        logger=logger,
+        thread_id_fn=_thread_id,
+        handle_message_inner_fn=_handle_message_inner,
+        metrics=metrics,
+        scope_key_from_message_fn=_scope_key_from_message,
+        record_error_fn=_record_error,
+        build_rollback_suggestion_markup_fn=_build_rollback_suggestion_markup,
+    )
+
+
+@router.message(F.video_note)
+async def handle_video_note_message(message: Message) -> None:
+    await _message_media_handlers.handle_generic_file_message(
+        message,
+        route_label="video_note",
+        log_incoming_message_fn=_log_incoming_message,
+        logger=logger,
+        thread_id_fn=_thread_id,
+        handle_message_inner_fn=_handle_message_inner,
+        metrics=metrics,
+        scope_key_from_message_fn=_scope_key_from_message,
+        record_error_fn=_record_error,
+        build_rollback_suggestion_markup_fn=_build_rollback_suggestion_markup,
+    )
+
+
 @router.channel_post(F.text)
 async def handle_channel_post(message: Message) -> None:
     await handle_message(message)
@@ -1881,6 +2016,26 @@ async def handle_channel_photo(message: Message) -> None:
 @router.channel_post(F.document)
 async def handle_channel_document(message: Message) -> None:
     await handle_document_message(message)
+
+
+@router.channel_post(F.audio)
+async def handle_channel_audio(message: Message) -> None:
+    await handle_audio_message(message)
+
+
+@router.channel_post(F.video)
+async def handle_channel_video(message: Message) -> None:
+    await handle_video_message(message)
+
+
+@router.channel_post(F.animation)
+async def handle_channel_animation(message: Message) -> None:
+    await handle_animation_message(message)
+
+
+@router.channel_post(F.video_note)
+async def handle_channel_video_note(message: Message) -> None:
+    await handle_video_note_message(message)
 
 
 @router.message(F.forum_topic_created)

@@ -32,6 +32,7 @@ from src.bot import (
     cmd_schedule_list,
     cmd_schedule_history,
     cmd_schedule_cancel,
+    handle_audio_message,
     handle_message,
     handle_voice,
     _ChatState,
@@ -163,6 +164,29 @@ async def test_handle_message_allows_explicit_bot_mention_in_passive_chat(mock_m
     await handle_message(mock_message)
 
     assert delegated is True
+
+
+@pytest.mark.asyncio
+async def test_handle_audio_message_delegates_to_inner_pipeline(mock_message, monkeypatch) -> None:
+    mock_message.audio = type(
+        "AudioStub",
+        (),
+        {"file_id": "audio-file", "file_size": 12, "mime_type": "audio/mpeg", "performer": None, "title": None},
+    )()
+    mock_message.content_type = "audio"
+
+    seen = {"called": False}
+
+    async def fake_inner(message, override_text=None):
+        seen["called"] = True
+        assert message is mock_message
+        assert override_text is None
+
+    monkeypatch.setattr("src.bot._handle_message_inner", fake_inner)
+
+    await handle_audio_message(mock_message)
+
+    assert seen["called"] is True
 
 
 # ── Contract 2: /start command ────────────────────────────────────

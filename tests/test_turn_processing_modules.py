@@ -610,3 +610,131 @@ async def test_run_provider_execution_loop_rebuilds_sync_payload_for_fallback_pr
         latest_topic_version=8,
         injected_hash="hash-fallback",
     )
+
+
+_PROVIDER_API_ERROR_ENVELOPE = (
+    '{"type":"error","status":400,"error":{"message":"Provider API error: '
+    "Instructions are required (request id: 20260605170650508042777xiPCjBti)\","
+    '"type":"invalid_request_error","param":"","code":null}}'
+)
+
+
+@pytest.mark.asyncio
+async def test_run_provider_execution_loop_falls_back_on_provider_api_error():
+    """A hard upstream provider-API error from codex must trigger fallback."""
+    message = SimpleNamespace(
+        chat=SimpleNamespace(id=123),
+        message_id=81,
+        answer=AsyncMock(),
+    )
+    state = SimpleNamespace(cancel_requested=False, process_handle=None, reset_requested=False)
+    session = SimpleNamespace(claude_session_id=None, codex_session_id=None)
+    progress = SimpleNamespace(report_tool=AsyncMock())
+    typing_task = asyncio.create_task(asyncio.sleep(3600))
+
+    primary = SimpleNamespace(name="codex", cli="codex", resume_arg=None)
+    fallback = SimpleNamespace(name="claude", cli="claude", resume_arg=None)
+    provider_manager = SimpleNamespace(
+        get_provider=lambda _scope: primary,
+        reset=lambda _scope: primary,
+        advance=lambda _scope: fallback,
+        subprocess_env=lambda _provider: {},
+        is_rate_limit_error=lambda _text: False,
+    )
+    session_manager = SimpleNamespace(
+        set_provider=MagicMock(),
+        update_session_id=MagicMock(),
+        update_codex_session_id=MagicMock(),
+    )
+    resume_state_store = SimpleNamespace(record_start=MagicMock())
+    steering_ledger_store = SimpleNamespace(
+        mark_applied=MagicMock(),
+        get_unapplied=lambda **_: [],
+    )
+
+    async def run_codex(*_args, **_kwargs):
+        return SimpleNamespace(is_error=True, text=_PROVIDER_API_ERROR_ENVELOPE, session_id=None)
+
+    async def run_claude(*_args, **_kwargs):
+        return SimpleNamespace(is_error=False, text="coffee and brownie logged", session_id="sess-2")
+
+    result = await run_provider_execution_loop(
+        message=message,
+        state=state,
+        session=session,
+        progress=progress,
+        typing_task=typing_task,
+        scope_key="123:main",
+        chat_id=123,
+        thread_id=None,
+        raw_prompt="7.3 coffee and brownie",
+        override_text=None,
+        provider_manager=provider_manager,
+        session_manager=session_manager,
+        resume_state_store=resume_state_store,
+        steering_ledger_store=steering_ledger_store,
+        logger=MagicMock(),
+        current_model_label_fn=lambda *_: "gpt-5-codex",
+        is_codex_family_cli_fn=lambda cli: bool(cli and cli.startswith("codex")),
+        find_provider_cli_fn=lambda _cli: "/usr/bin/codex",
+        as_text_fn=lambda text: text or "",
+        worklog_subprocess_env_fn=lambda env, **_: env,
+        codex_model_arg_fn=lambda *_: None,
+        run_codex_with_retries_fn=run_codex,
+        run_claude_fn=run_claude,
+        extract_requested_tools_fn=lambda _text: [],
+        inject_tool_request_fn=lambda prompt, _tool: prompt,
+        build_steering_patch_fn=lambda prompt, _events: prompt,
+        has_high_risk_conflict_fn=lambda _events: False,
+    )
+
+    # Fell back to claude and produced a real answer instead of leaking JSON.
+    assert result.final_provider_name == "claude"
+    assert result.final_response.is_error is False
+    assert result.final_response.text == "coffee and brownie logged"
+    session_manager.set_provider.assert_called_once_with(123, "claude", None)
+    message.answer.assert_awaited()
+
+
+@pytest.mark.asyncio
+async def test_dispatch_turn_response_sanitizes_provider_api_error(mock_message):
+    """When a provider-API error is surfaced, the user gets a clean message, not raw JSON."""
+    state = SimpleNamespace(cancel_requested=False)
+    progress = SimpleNamespace(finish=AsyncMock())
+    final_response = SimpleNamespace(is_error=True, text=_PROVIDER_API_ERROR_ENVELOPE)
+    provider = SimpleNamespace(name="codex")
+    resume_state_store = SimpleNamespace(
+        record_success=MagicMock(),
+        record_failure=MagicMock(),
+    )
+    answer_text = AsyncMock()
+
+    await dispatch_turn_response(
+        message=mock_message,
+        state=state,
+        final_response=final_response,
+        progress=progress,
+        scope_key="123:main",
+        provider=provider,
+        resume_state_store=resume_state_store,
+        record_error_fn=MagicMock(),
+        build_rollback_suggestion_markup_fn=lambda *_: None,
+        answer_text_with_retry_fn=answer_text,
+        extract_media_directives_fn=lambda text: (text, [], False),
+        strip_tool_directive_lines_fn=lambda text: text,
+        send_media_reply_fn=AsyncMock(),
+        markdown_to_html_fn=lambda text: text,
+        split_message_fn=lambda text: [text],
+        strip_html_fn=lambda text: text,
+        has_recent_outbound_fn=lambda *_: False,
+        remember_outbound_fn=MagicMock(),
+        clear_errors_fn=MagicMock(),
+        empty_response_fallback_text="fallback",
+        logger=MagicMock(),
+    )
+
+    answer_text.assert_awaited_once()
+    sent_text = answer_text.await_args.args[1]
+    assert sent_text == "Provider API error: Instructions are required"
+    assert "{" not in sent_text
+    assert "request id" not in sent_text.lower()

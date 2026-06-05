@@ -4,6 +4,8 @@ import asyncio
 from dataclasses import dataclass
 from typing import Any, Callable
 
+from ..provider_errors import is_provider_api_error
+
 
 @dataclass
 class TurnExecutionResult:
@@ -191,6 +193,7 @@ async def run_provider_execution_loop(
                     provider_manager.is_rate_limit_error(final_response.text)
                     or (provider.cli == "claude" and error_text_l == "claude returned an error.")
                     or _is_missing_provider_cli_error(final_response.text)
+                    or is_provider_api_error(final_response.text)
                 )
             )
             if should_fallback:

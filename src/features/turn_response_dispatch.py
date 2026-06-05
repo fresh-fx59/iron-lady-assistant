@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from typing import Any, Callable
 
+from ..provider_errors import humanize_provider_api_error
+
 
 async def dispatch_turn_response(
     *,
@@ -58,6 +60,11 @@ async def dispatch_turn_response(
             provider.name,
             error_text[:500],
         )
+        # Never leak a raw upstream provider JSON envelope (with internal
+        # request ids) to the user; show the clean inner message instead.
+        humanized = humanize_provider_api_error(error_text)
+        if humanized:
+            error_text = humanized
         record_error_fn(scope_key)
         reply_markup = build_rollback_suggestion_markup_fn(
             scope_key,

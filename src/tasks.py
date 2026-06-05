@@ -16,7 +16,11 @@ from . import bridge, config, metrics
 from .formatter import markdown_to_html, split_message, strip_html
 from .media import extract_media_directives, send_media, strip_tool_directive_lines
 from .providers import codex_family_providers
-from .provider_errors import is_stale_codex_session_error
+from .provider_errors import (
+    humanize_provider_api_error,
+    is_provider_api_error,
+    is_stale_codex_session_error,
+)
 from .sessions import make_scope_key
 from .telegram_status_throttle import EphemeralStatusSuppressedError, send_ephemeral_status
 
@@ -557,6 +561,15 @@ class TaskManager:
                             task.session_id = None
                             await asyncio.sleep(0.3)
                             continue
+                    if (
+                        response
+                        and response.is_error
+                        and is_provider_api_error(response.text)
+                    ):
+                        if self._advance_task_provider(task, attempted_provider_clis):
+                            task.session_id = None
+                            await asyncio.sleep(0.3)
+                            continue
                     break
 
                 logger.warning(
@@ -600,7 +613,11 @@ class TaskManager:
                 task.status = TaskStatus.COMPLETED if not response.is_error else TaskStatus.FAILED
 
                 if response.is_error:
-                    task.error = response.text or "Unknown error"
+                    task.error = (
+                        humanize_provider_api_error(response.text)
+                        or response.text
+                        or "Unknown error"
+                    )
                     logger.warning("Task %s failed: %s", task.id, task.error)
                     await self._notify_failure(task)
                     metrics.BG_TASKS_TOTAL.labels(status="failed").inc()

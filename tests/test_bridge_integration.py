@@ -19,7 +19,24 @@ from src.bridge import (
     ClaudeResponse,
     _extract_tool_input,
     _extract_tool_input_partial,
+    _resolve_claude_model,
 )
+
+
+class TestResolveClaudeModel:
+    """Provider-forced model (ILA_CLAUDE_MODEL) must win over session model."""
+
+    def test_forced_model_overrides_session_model(self):
+        assert _resolve_claude_model(
+            "sonnet", {"ILA_CLAUDE_MODEL": "claude-opus-4-8"}
+        ) == "claude-opus-4-8"
+
+    def test_no_force_keeps_session_model(self):
+        assert _resolve_claude_model("sonnet", {}) == "sonnet"
+        assert _resolve_claude_model("opus", None) == "opus"
+
+    def test_blank_force_is_ignored(self):
+        assert _resolve_claude_model("haiku", {"ILA_CLAUDE_MODEL": "  "}) == "haiku"
 
 
 # ── Contract 1: Event types and data structures ──────────────────

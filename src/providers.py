@@ -113,6 +113,18 @@ class _ProviderConfig:
     cooldown_minutes: int
 
 
+def _expand_env_values(env: dict | None) -> dict[str, str]:
+    """Expand ``${VAR}``/``$VAR`` references in provider env values from os.environ.
+
+    Lets secrets (e.g. proxy API keys) live in the bot's ``.env`` instead of the
+    git-tracked ``providers.json``. Unset references are left verbatim.
+    """
+    expanded: dict[str, str] = {}
+    for key, value in (env or {}).items():
+        expanded[key] = os.path.expandvars(value) if isinstance(value, str) else value
+    return expanded
+
+
 def _load_config() -> _ProviderConfig:
     """Load and parse providers.json."""
     if not _CONFIG_PATH.exists():
@@ -134,7 +146,7 @@ def _load_config() -> _ProviderConfig:
             model=p.get("model"),
             models=p.get("models"),
             resume_arg=p.get("resume_arg"),
-            env=p.get("env", {}),
+            env=_expand_env_values(p.get("env", {})),
         )
         for p in raw.get("providers", [])
     ]

@@ -151,6 +151,23 @@ def _subprocess_env() -> dict[str, str]:
     return _default_subprocess_env()
 
 
+# Env key a provider can set to force a specific model on the wire, overriding
+# the session's --model alias. Used by proxy-backed providers (e.g. linkapi)
+# where the requested model name must exactly match an upstream model.
+FORCE_MODEL_ENV_KEY = "ILA_CLAUDE_MODEL"
+
+
+def _resolve_claude_model(model: str, subprocess_env: dict[str, str] | None) -> str:
+    """Return the model the claude CLI should use.
+
+    A provider may pin a model via ``ILA_CLAUDE_MODEL`` in its env; that wins
+    over the session-derived ``model`` (which the CLI would otherwise expand
+    from a sonnet/opus/haiku alias and send on the wire).
+    """
+    forced = (subprocess_env or {}).get(FORCE_MODEL_ENV_KEY)
+    return forced.strip() if isinstance(forced, str) and forced.strip() else model
+
+
 def _extract_codex_tool_input(item: dict) -> str | None:
     """Extract a concise tool input from a Codex CLI item."""
     if not item:
@@ -207,6 +224,7 @@ async def stream_message(
     We emit ``TOOL_USE`` events from **both** ``stream_event`` (real-time)
     and ``assistant`` (fallback).  The :class:`ProgressReporter` deduplicates.
     """
+    model = _resolve_claude_model(model, subprocess_env)
     cmd = [
         "claude",
         "-p",

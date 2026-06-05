@@ -19,6 +19,18 @@
       "env": {}
     },
     {
+      "name": "opus-linkapi",
+      "description": "Claude Opus 4.8 via CLIProxyAPI :8317 -> linkapi (claude CLI, forced model)",
+      "cli": "claude",
+      "model": "claude-opus-4-8",
+      "env": {
+        "ANTHROPIC_BASE_URL": "http://127.0.0.1:8317",
+        "ANTHROPIC_AUTH_TOKEN": "${OPENAI_API_KEY}",
+        "ANTHROPIC_MODEL": "claude-opus-4-8",
+        "ILA_CLAUDE_MODEL": "claude-opus-4-8"
+      }
+    },
+    {
       "name": "claude",
       "description": "Anthropic Claude",
       "cli": "claude",

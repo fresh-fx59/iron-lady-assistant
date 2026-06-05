@@ -1,6 +1,6 @@
 # Claude Code as Telegram Assistant
 
-**Current version: `0.51.47`** — defined in `src/config.py` as `VERSION`.
+**Current version: `0.51.48`** — defined in `src/config.py` as `VERSION`.
 
 Telegram bot that bridges messages to Claude Code's `--print` mode via subprocess, providing a conversational AI assistant through Telegram.
 
@@ -371,17 +371,34 @@ The `CLAUDECODE` env var is stripped from the child process to bypass the nested
 
 ## Provider Fallback System
 
-When Claude hits rate limits or quota errors, the bot automatically falls back to alternative LLM providers via LiteLLM proxies.
+The bot runs each turn through a chain of providers (`providers.json`) and auto-advances to the next one when the active provider rate-limits or returns a hard backend error.
+
+### Backends
+
+Each provider names a `cli` that determines the wire protocol:
+
+- **`claude`** — drives the `claude` CLI (Anthropic Messages API). Configured via `ANTHROPIC_BASE_URL` / `ANTHROPIC_AUTH_TOKEN` and the `--model` flag.
+- **`codex`** — drives the `codex` CLI (OpenAI/Responses API), via `stream_codex_message`. Reads `~/.codex/config.toml` (`openai_base_url`) + `~/.codex/auth.json`.
+
+Both can point at a local **CLIProxyAPI** (`:8317`), which accepts Anthropic- or OpenAI-shaped requests and routes by model name to upstreams (e.g. **linkapi**, `https://api.linkapi.ai/v1`, which serves GPT/Claude/Gemini/Grok). CLIProxyAPI lives in the `~/cliproxyapi` project (`cliproxyapi.service`).
+
+### Current chain (default)
+
+1. **`codex`** (primary) → codex CLI in `apikey` mode → CLIProxyAPI `:8317` → linkapi, default model **`gpt-5.4`**. No ChatGPT/codex subscription needed — codex authenticates to the proxy by API key.
+2. **`opus-linkapi`** (first fallback) → `claude` CLI → CLIProxyAPI `:8317` → linkapi, forced to **`claude-opus-4-8`**.
+3. `claude` (native Anthropic) → `glm4.7` / `qwen3-coder` / `glm4.7-flash` (older LiteLLM proxies on `:4000`–`:4002`).
 
 ### Configuration (`providers.json`)
 
 ```json
 {
   "providers": [
-    {"name": "claude", "description": "Anthropic Claude (default)", "env": {}},
-    {"name": "glm4.7", "description": "GLM-4.7 via Cloud.ru", "env": {
-      "ANTHROPIC_BASE_URL": "http://0.0.0.0:4001",
-      "ANTHROPIC_AUTH_TOKEN": "any-placeholder-value"
+    {"name": "codex", "cli": "codex", "model": "gpt-5.4",
+     "models": ["gpt-5.4", "gpt-5.5", "gpt-5.3-codex"], "env": {}},
+    {"name": "opus-linkapi", "cli": "claude", "model": "claude-opus-4-8", "env": {
+      "ANTHROPIC_BASE_URL": "http://127.0.0.1:8317",
+      "ANTHROPIC_AUTH_TOKEN": "${OPENAI_API_KEY}",
+      "ILA_CLAUDE_MODEL": "claude-opus-4-8"
     }}
   ],
   "rate_limit_patterns": ["rate limit", "overloaded", "429", "quota exceeded"],
@@ -389,19 +406,21 @@ When Claude hits rate limits or quota errors, the bot automatically falls back t
 }
 ```
 
+- **`${VAR}` expansion** — provider `env` values are expanded from the process env (`providers._expand_env_values`), so secrets live in `.env` (e.g. `${OPENAI_API_KEY}`, which already equals the CLIProxyAPI client key) instead of git-tracked `providers.json`.
+- **Forced model (`ILA_CLAUDE_MODEL`)** — the bot always passes `--model sonnet|opus|haiku` to the `claude` CLI, and that flag overrides `ANTHROPIC_MODEL`. Since CLIProxyAPI routes by *exact* model name, a `claude`-backed provider sets `ILA_CLAUDE_MODEL` to force the on-wire model (read in `bridge.stream_message`). Codex providers select their model via the `model` / `models` fields (`_codex_model_arg`).
+
 ### How it works
 
-1. Each request uses the current provider's env vars for the `claude -p` subprocess
-2. If the response is an error matching `rate_limit_patterns`, the bot automatically advances to the next provider and retries
-3. The user is notified: "Rate limited on **claude**. Switching to **glm4.7**..."
-4. After `cooldown_minutes`, the bot auto-recovers to the primary provider
-5. Users can manually switch with `/provider [name]`
+1. Each request uses the current provider's `cli`, model, and env for the subprocess.
+2. The bot advances to the next provider when the response `is_error` and the text matches `rate_limit_patterns`, **or is a hard provider-API error** (`provider_errors.is_provider_api_error` — JSON `{"type":"error",…}` envelopes or `Provider API error: …` lines), **or** indicates a missing provider CLI. The user sees "… on **codex**. Switching to **opus-linkapi**…".
+3. Raw upstream error envelopes are **never shown verbatim** — `provider_errors.humanize_provider_api_error` extracts the inner message and strips `(request id: …)` before it reaches the user (interactive turns and background tasks).
+4. **No auto-recovery**: fallback is sticky per chat (`ProviderManager.get_provider` does not auto-revert). Switch back with `/provider codex` or `/new`. `cooldown_minutes` is retained in config but not used for auto-recovery.
+5. Users can manually switch with `/provider [name]`.
 
 ### Adding a new provider
 
-1. Start a LiteLLM proxy: `litellm --model openai/your-model --api_base https://api.example.com/v1 --alias claude-3-5-sonnet-latest --drop_params --port 4002`
-2. Add an entry to `providers.json` with the proxy's `ANTHROPIC_BASE_URL`
-3. The bot picks it up on next restart (or `/provider reload` — future feature)
+1. For a proxy-backed model, ensure CLIProxyAPI (`:8317`) serves it, then add an entry to `providers.json` with the proxy's `ANTHROPIC_BASE_URL` (claude CLI) and either `ILA_CLAUDE_MODEL` (claude) or `model`/`models` (codex). Reference secrets as `${ENV_VAR}`.
+2. The bot hot-reloads `providers.json` (file watcher) and re-reads it on restart.
 
 ## Memory System
 

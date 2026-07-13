@@ -286,6 +286,16 @@ TELEGRAM_PROXY_ENCRYPTED_CREDENTIALS: str = os.getenv(
     "TELEGRAM_PROXY_ENCRYPTED_CREDENTIALS",
     "",
 ).strip()
+# Filesystem lock guaranteeing only ONE telegram-proxy holds the user session
+# at a time. Two concurrent holders make Telegram invalidate the auth key
+# (AUTH_KEY_DUPLICATED) and force-logout the user session. Default is an
+# absolute runtime path; overridable (e.g. for tests) via the env var.
+_raw_proxy_lock_path = os.getenv("TELEGRAM_PROXY_LOCK_PATH", "").strip()
+TELEGRAM_PROXY_LOCK_PATH: Path = (
+    Path(os.path.expanduser(_raw_proxy_lock_path))
+    if _raw_proxy_lock_path
+    else Path("/run/iron-lady/telegram_proxy.lock")
+)
 TELEGRAM_DIGEST_COLLECT_LIMIT: int = max(10, int(os.getenv("TELEGRAM_DIGEST_COLLECT_LIMIT", "200")))
 TELEGRAM_DIGEST_SOURCE_LIMIT: int = max(1, int(os.getenv("TELEGRAM_DIGEST_SOURCE_LIMIT", "200")))
 TELEGRAM_DIGEST_COLLECT_INTERVAL_MINUTES: int = max(
@@ -327,7 +337,15 @@ PROACTIVE_TOPIC_SESSIONS_PATH: Path = Path(
 LIFECYCLE_DB_PATH: Path = MEMORY_DIR / "lifecycle.db"
 TELEGRAM_DIGEST_DB_PATH: Path = MEMORY_DIR / "telegram_digest.db"
 TELEGRAM_DIGEST_BRIEF_PATH: Path = MEMORY_DIR / "telegram_digest_brief.md"
-TELEGRAM_PROXY_SESSION_PATH: Path = MEMORY_DIR / "telethon_user_proxy"
+# File-session FALLBACK (used only when no StringSession is configured). This
+# must be ABSOLUTE: a relative path would resolve against whatever cwd the proxy
+# happens to run under, silently creating a second, unauthorized session file.
+_raw_proxy_session_path = os.getenv("TELEGRAM_PROXY_SESSION_PATH", "").strip()
+TELEGRAM_PROXY_SESSION_PATH: Path = (
+    Path(os.path.expanduser(_raw_proxy_session_path)).resolve()
+    if _raw_proxy_session_path
+    else (MEMORY_DIR / "telethon_user_proxy").resolve()
+)
 
 # ── Tool system ───────────────────────────────────────────
 _raw_tools_dir = os.getenv("TOOLS_DIR") or None

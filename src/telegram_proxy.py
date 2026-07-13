@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import asyncio
+import fcntl
 import json
 import logging
+import os
 from dataclasses import asdict, dataclass
 from datetime import timezone
 from pathlib import Path
@@ -67,10 +69,53 @@ class TelegramProxy:
         self._export_chat_invite_request = None
         self._entity_cache: dict[tuple[str, int], Any] = {}
         self._lock = asyncio.Lock()
+        self._session_lock_fd: int | None = None
         self._allowed_channel_ids = set(config.TELEGRAM_PROXY_ALLOWED_CHANNEL_IDS)
         self._allowed_chat_ids = set(config.TELEGRAM_PROXY_ALLOWED_CHAT_IDS)
 
+    def _acquire_session_lock(self) -> None:
+        """Take an exclusive, non-blocking OS lock on the session lockfile.
+
+        Guarantees a single live holder of the Telegram user session on this
+        host. A second proxy connecting with the same session makes Telegram
+        rotate the auth key (AUTH_KEY_DUPLICATED) and force-logout the account,
+        so we refuse to connect rather than race.
+        """
+        lock_path = Path(config.TELEGRAM_PROXY_LOCK_PATH)
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        # O_CLOEXEC so a forked child never inherits (and silently holds) the lock.
+        fd = os.open(str(lock_path), os.O_CREAT | os.O_RDWR | os.O_CLOEXEC, 0o600)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as exc:
+            os.close(fd)
+            raise RuntimeError(
+                "another telegram-proxy already holds the session lock; refusing "
+                "to connect (would trigger AUTH_KEY_DUPLICATED)"
+            ) from exc
+        self._session_lock_fd = fd
+
+    def _release_session_lock(self) -> None:
+        fd = self._session_lock_fd
+        if fd is None:
+            return
+        self._session_lock_fd = None
+        try:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        finally:
+            os.close(fd)
+
     async def start(self) -> None:
+        # Acquire the singleton lock BEFORE connecting so two proxies can never
+        # bring up the same session concurrently.
+        self._acquire_session_lock()
+        try:
+            await self._start_locked()
+        except Exception:
+            self._release_session_lock()
+            raise
+
+    async def _start_locked(self) -> None:
         creds = self._load_credentials()
         try:
             from telethon import TelegramClient
@@ -101,8 +146,11 @@ class TelegramProxy:
             raise RuntimeError("Telegram proxy user session is not authorized.")
 
     async def stop(self) -> None:
-        if self._client is not None:
-            await self._client.disconnect()
+        try:
+            if self._client is not None:
+                await self._client.disconnect()
+        finally:
+            self._release_session_lock()
 
     def _load_credentials(self) -> TelegramProxyCredentials:
         key = load_decryption_key()

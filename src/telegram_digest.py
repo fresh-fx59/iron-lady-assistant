@@ -4,14 +4,23 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import sqlite3
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterable, Sequence
 
 from . import config
 from .telegram_proxy_client import TelegramProxyClient
+
+logger = logging.getLogger(__name__)
+
+# Sources tagged with this role feed the legacy topic-digest briefing. Lead
+# groups the parser account JOINED are ingested under role="lead" (M2) and are
+# deliberately kept OUT of the digest briefing.
+DEFAULT_SOURCE_ROLE = "digest"
+LEAD_SOURCE_ROLE = "lead"
 
 
 @dataclass(frozen=True)
@@ -22,6 +31,7 @@ class SourceRecord:
     username: str | None
     kind: str
     linked_channel_key: str | None
+    role: str = DEFAULT_SOURCE_ROLE
 
 
 def _utc_now() -> datetime:
@@ -67,12 +77,27 @@ class TelegramDigestStore:
                     username TEXT,
                     kind TEXT NOT NULL,
                     linked_channel_key TEXT,
+                    role TEXT NOT NULL DEFAULT 'digest',
                     last_collected_message_id INTEGER,
                     last_collected_at TEXT,
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL
                 )
                 """
+            )
+            # Additive migration for dbs created before the role split. ADD COLUMN
+            # with a constant DEFAULT is a metadata-only change in SQLite — it does
+            # NOT rewrite the (272MB) table, and every existing row reads back as
+            # role='digest', so legacy digest sources keep behaving exactly as before.
+            source_cols = {
+                row["name"] for row in con.execute("PRAGMA table_info(digest_sources)").fetchall()
+            }
+            if "role" not in source_cols:
+                con.execute(
+                    "ALTER TABLE digest_sources ADD COLUMN role TEXT NOT NULL DEFAULT 'digest'"
+                )
+            con.execute(
+                "CREATE INDEX IF NOT EXISTS idx_digest_sources_role ON digest_sources(role)"
             )
             con.execute(
                 """
@@ -107,21 +132,23 @@ class TelegramDigestStore:
         username: str | None,
         kind: str,
         linked_channel_key: str | None,
+        role: str = DEFAULT_SOURCE_ROLE,
     ) -> None:
         now = _isoformat(_utc_now())
         with self._connect() as con:
             con.execute(
                 """
-                INSERT INTO digest_sources(peer_key, entity_id, title, username, kind, linked_channel_key, created_at, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                INSERT INTO digest_sources(peer_key, entity_id, title, username, kind, linked_channel_key, role, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(peer_key) DO UPDATE SET
                     title = excluded.title,
                     username = excluded.username,
                     kind = excluded.kind,
                     linked_channel_key = excluded.linked_channel_key,
+                    role = excluded.role,
                     updated_at = excluded.updated_at
                 """,
-                (peer_key, entity_id, title, username, kind, linked_channel_key, now, now),
+                (peer_key, entity_id, title, username, kind, linked_channel_key, role, now, now),
             )
 
     def last_message_id(self, peer_key: str) -> int:
@@ -188,15 +215,19 @@ class TelegramDigestStore:
             row = con.execute("SELECT COUNT(*) AS count FROM digest_sources").fetchone()
             return int(row["count"] or 0)
 
-    def list_sources(self) -> list[SourceRecord]:
+    def list_sources(self, roles: Sequence[str] | None = None) -> list[SourceRecord]:
+        query = (
+            "SELECT peer_key, entity_id, title, username, kind, linked_channel_key, role "
+            "FROM digest_sources"
+        )
+        params: tuple[Any, ...] = ()
+        if roles:
+            placeholders = ", ".join("?" for _ in roles)
+            query += f" WHERE role IN ({placeholders})"
+            params = tuple(roles)
+        query += " ORDER BY kind, title"
         with self._connect() as con:
-            rows = con.execute(
-                """
-                SELECT peer_key, entity_id, title, username, kind, linked_channel_key
-                FROM digest_sources
-                ORDER BY kind, title
-                """
-            ).fetchall()
+            rows = con.execute(query, params).fetchall()
         return [
             SourceRecord(
                 peer_key=str(row["peer_key"]),
@@ -205,6 +236,7 @@ class TelegramDigestStore:
                 username=row["username"],
                 kind=str(row["kind"]),
                 linked_channel_key=row["linked_channel_key"],
+                role=str(row["role"]),
             )
             for row in rows
         ]
@@ -234,12 +266,12 @@ class TelegramDigestStore:
                        MAX(m.posted_at) AS latest_posted_at
                 FROM digest_sources s
                 JOIN digest_messages m ON m.peer_key = s.peer_key
-                WHERE m.posted_at >= ?
+                WHERE m.posted_at >= ? AND s.role = ?
                 GROUP BY s.peer_key, s.title, s.username, s.kind, s.linked_channel_key
                 ORDER BY latest_posted_at DESC
                 LIMIT ?
                 """,
-                (cutoff, source_limit),
+                (cutoff, DEFAULT_SOURCE_ROLE, source_limit),
             ).fetchall()
 
             lines = [
@@ -288,6 +320,60 @@ class TelegramDigestStore:
             return "\n".join(lines).strip() + "\n"
 
 
+def sync_joined_sources(
+    store: TelegramDigestStore,
+    join_db_path: Path | None = None,
+) -> int:
+    """Mirror the parser account's JOINED lead groups into digest_sources.
+
+    Reads the JOIN store (written by the proxy join loop) for rows the account
+    actually joined and upserts each as a role="lead" digest source keyed by
+    ``linked_chat:<entity_id>`` — the same peer-kind the reader already knows how
+    to read (a joined megagroup is a Channel with broadcast=False → kind
+    "linked_chat"). Idempotent: re-running upserts the same rows and adds nothing.
+
+    Returns the number of lead sources synced.
+    """
+    path = Path(join_db_path) if join_db_path else config.TELEGRAM_PROXY_JOIN_DB_PATH
+    # The join loop owns this file; if it has not been created yet there is simply
+    # nothing to sync. Never CREATE it here (a stray empty file would confuse the
+    # join loop) — just no-op.
+    if not path.exists():
+        return 0
+
+    con = sqlite3.connect(path)
+    con.row_factory = sqlite3.Row
+    try:
+        rows = con.execute(
+            """
+            SELECT target, entity_id
+            FROM joins
+            WHERE status = 'joined' AND entity_id IS NOT NULL
+            """
+        ).fetchall()
+    except sqlite3.OperationalError:
+        # joins table not initialised yet — nothing to sync.
+        return 0
+    finally:
+        con.close()
+
+    synced = 0
+    for row in rows:
+        entity_id = int(row["entity_id"])
+        title = str(row["target"] or f"lead:{entity_id}").strip() or f"lead:{entity_id}"
+        store.upsert_source(
+            peer_key=_peer_key("linked_chat", entity_id),
+            entity_id=entity_id,
+            title=title,
+            username=None,
+            kind="linked_chat",
+            linked_channel_key=None,
+            role=LEAD_SOURCE_ROLE,
+        )
+        synced += 1
+    return synced
+
+
 async def collect_digest(
     *,
     db_path: Path | None = None,
@@ -295,6 +381,8 @@ async def collect_digest(
     window_hours: int | None = None,
     source_limit: int | None = None,
     collect_limit: int | None = None,
+    roles: Iterable[str] | None = None,
+    join_db_path: Path | None = None,
 ) -> dict[str, Any]:
     return await _collect_digest_via_proxy(
         db_path=db_path,
@@ -302,6 +390,8 @@ async def collect_digest(
         window_hours=window_hours,
         source_limit=source_limit,
         collect_limit=collect_limit,
+        roles=roles,
+        join_db_path=join_db_path,
     )
 
 
@@ -312,30 +402,57 @@ async def _collect_digest_via_proxy(
     window_hours: int | None = None,
     source_limit: int | None = None,
     collect_limit: int | None = None,
+    roles: Iterable[str] | None = None,
+    join_db_path: Path | None = None,
 ) -> dict[str, Any]:
     store = TelegramDigestStore(db_path)
     brief_target = brief_path or config.TELEGRAM_DIGEST_BRIEF_PATH
     window_hours = window_hours or config.TELEGRAM_DIGEST_WINDOW_HOURS
     source_limit = source_limit or config.TELEGRAM_DIGEST_SOURCE_LIMIT
     collect_limit = collect_limit or config.TELEGRAM_DIGEST_COLLECT_LIMIT
+    # Default to the legacy digest pipeline so an unqualified collect is unchanged.
+    role_filter = tuple(roles) if roles else (DEFAULT_SOURCE_ROLE,)
 
     client = TelegramProxyClient()
 
     collected_messages = 0
     tracked_sources = 0
-    known_sources = store.list_sources()
+    failed_sources = 0
+    synced_sources = 0
+
+    # A LEAD collect first mirrors the JOINED groups into the store, then reads
+    # ONLY those — never touching the legacy digest sources (no catch-up burst).
+    if LEAD_SOURCE_ROLE in role_filter:
+        synced_sources = sync_joined_sources(store, join_db_path)
+
+    known_sources = store.list_sources(roles=role_filter)
     if known_sources:
         for source in known_sources:
             tracked_sources += 1
-            collected_messages += await _collect_proxy_messages_for_peer(
-                client=client,
-                store=store,
-                peer_key=source.peer_key,
-                kind=source.kind,
-                entity_id=source.entity_id,
-                collect_limit=collect_limit,
-            )
-    else:
+            try:
+                collected_messages += await _collect_proxy_messages_for_peer(
+                    client=client,
+                    store=store,
+                    peer_key=source.peer_key,
+                    kind=source.kind,
+                    entity_id=source.entity_id,
+                    collect_limit=collect_limit,
+                )
+            except Exception as exc:  # noqa: BLE001 — per-source isolation
+                # FloodWait / proxy / network error on ONE source must not abort
+                # the pass. The watermark is left untouched so this source is
+                # retried next pass; the healthy sources keep collecting.
+                failed_sources += 1
+                logger.warning(
+                    "digest collect: skipping source %s (%s) this pass: %s",
+                    source.peer_key,
+                    source.role,
+                    exc,
+                )
+                continue
+    elif role_filter == (DEFAULT_SOURCE_ROLE,):
+        # First-run bootstrap only applies to the legacy digest pipeline: lead
+        # sources come exclusively from sync_joined_sources, never list_channels.
         channels = await client.list_channels(limit=source_limit)
         for channel in channels:
             channel_key = _peer_key("channel", int(channel.entity_id))
@@ -348,14 +465,20 @@ async def _collect_digest_via_proxy(
                 linked_channel_key=None,
             )
             tracked_sources += 1
-            collected_messages += await _collect_proxy_messages_for_peer(
-                client=client,
-                store=store,
-                peer_key=channel_key,
-                kind="channel",
-                entity_id=int(channel.entity_id),
-                collect_limit=collect_limit,
-            )
+            try:
+                collected_messages += await _collect_proxy_messages_for_peer(
+                    client=client,
+                    store=store,
+                    peer_key=channel_key,
+                    kind="channel",
+                    entity_id=int(channel.entity_id),
+                    collect_limit=collect_limit,
+                )
+            except Exception as exc:  # noqa: BLE001 — per-source isolation
+                failed_sources += 1
+                logger.warning(
+                    "digest collect: skipping channel %s this pass: %s", channel_key, exc
+                )
 
             if channel.linked_chat_id:
                 linked_key = _peer_key("linked_chat", int(channel.linked_chat_id))
@@ -368,30 +491,45 @@ async def _collect_digest_via_proxy(
                     linked_channel_key=channel_key,
                 )
                 tracked_sources += 1
-                collected_messages += await _collect_proxy_messages_for_peer(
-                    client=client,
-                    store=store,
-                    peer_key=linked_key,
-                    kind="linked_chat",
-                    entity_id=int(channel.linked_chat_id),
-                    collect_limit=collect_limit,
-                )
+                try:
+                    collected_messages += await _collect_proxy_messages_for_peer(
+                        client=client,
+                        store=store,
+                        peer_key=linked_key,
+                        kind="linked_chat",
+                        entity_id=int(channel.linked_chat_id),
+                        collect_limit=collect_limit,
+                    )
+                except Exception as exc:  # noqa: BLE001 — per-source isolation
+                    failed_sources += 1
+                    logger.warning(
+                        "digest collect: skipping linked chat %s this pass: %s",
+                        linked_key,
+                        exc,
+                    )
 
-    brief = store.render_briefing(window_hours=window_hours)
-    brief_target.write_text(brief)
+    # The digest briefing belongs to the digest pipeline; a lead-only collect is
+    # pure ingestion (the lead scorer reads the store later) and must not clobber it.
+    if DEFAULT_SOURCE_ROLE in role_filter:
+        brief = store.render_briefing(window_hours=window_hours)
+        brief_target.write_text(brief)
     recent_count = store.recent_message_count(window_hours)
     return {
         "status": "ok",
         "should_alert": False,
         "change_type": "collected",
         "summary": (
-            f"Collected {collected_messages} new messages across {tracked_sources} sources. "
+            f"Collected {collected_messages} new messages across {tracked_sources} sources "
+            f"(roles={','.join(role_filter)}; {failed_sources} skipped this pass). "
             f"Recent window contains {recent_count} messages."
         ),
         "payload": {
             "brief_path": str(brief_target),
             "collected_messages": collected_messages,
             "tracked_sources": tracked_sources,
+            "failed_sources": failed_sources,
+            "synced_sources": synced_sources,
+            "roles": list(role_filter),
             "recent_messages": recent_count,
             "transport": "telegram_proxy",
         },

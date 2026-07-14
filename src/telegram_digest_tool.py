@@ -51,6 +51,8 @@ def _cmd_collect(args: argparse.Namespace) -> int:
         window_hours=args.window_hours,
         source_limit=args.source_limit,
         collect_limit=args.collect_limit,
+        roles=(args.role,) if args.role else None,
+        join_db_path=Path(args.join_db_path) if args.join_db_path else None,
     )
     print(json.dumps(payload, ensure_ascii=False))
     return 0
@@ -116,6 +118,15 @@ def build_parser() -> argparse.ArgumentParser:
     collect.add_argument("--window-hours", type=int, default=config.TELEGRAM_DIGEST_WINDOW_HOURS)
     collect.add_argument("--source-limit", type=int, default=config.TELEGRAM_DIGEST_SOURCE_LIMIT)
     collect.add_argument("--collect-limit", type=int, default=config.TELEGRAM_DIGEST_COLLECT_LIMIT)
+    # Role filter. Omitted → the legacy digest pipeline (role='digest', unchanged).
+    # '--role lead' first syncs the JOINED groups into the store, then reads ONLY
+    # those lead sources incrementally — never the legacy digest sources.
+    collect.add_argument("--role", choices=("digest", "lead"), default=None)
+    collect.add_argument(
+        "--join-db-path",
+        default=str(config.TELEGRAM_PROXY_JOIN_DB_PATH),
+        help="JOIN store to mirror joined lead groups from (used with --role lead).",
+    )
     collect.set_defaults(func=_cmd_collect)
 
     render = sub.add_parser("render")

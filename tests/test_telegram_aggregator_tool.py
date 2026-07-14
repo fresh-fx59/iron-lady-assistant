@@ -5,6 +5,7 @@ import json
 
 import pytest
 
+from src import telegram_aggregator_tool
 from src.telegram_aggregator_gates import Story
 from src.telegram_aggregator_publish import DigestLedger
 from src.telegram_aggregator_tool import main
@@ -73,3 +74,60 @@ def test_approve_and_publish_dry_run(state, capsys):
     rc = main(["publish", "--dry-run"])
     assert rc == 0
     assert "dry-run" in capsys.readouterr().out
+
+
+def test_gate_malformed_input_json_is_input_error(state, capsys):
+    input_path = state / "drafts" / "bad-input.json"
+    input_path.parent.mkdir(parents=True, exist_ok=True)
+    input_path.write_text("{not valid json")
+    draft_path = _write_draft(state, _stories(1))
+    rc = main(["gate", "--draft", str(draft_path), "--input", str(input_path), "--date", "2026-07-14"])
+    assert rc == 1
+    out = json.loads(capsys.readouterr().out)
+    assert out["status"] == "input-error"
+
+
+def test_gate_missing_draft_file_exits_nonzero(state, capsys):
+    input_path = _write_input(state, [("https://t.me/chan/1", "длинный исходный текст " * 10)])
+    missing_draft = state / "drafts" / "does-not-exist.json"
+    rc = main(["gate", "--draft", str(missing_draft), "--input", str(input_path), "--date", "2026-07-14"])
+    assert rc == 1
+
+
+def test_gate_bad_date_is_input_error(state, capsys):
+    input_path = _write_input(state, [("https://t.me/chan/1", "длинный исходный текст " * 10)])
+    draft_path = _write_draft(state, _stories(3))
+    rc = main(["gate", "--draft", str(draft_path), "--input", str(input_path), "--date", "garbage"])
+    assert rc == 1
+    out = json.loads(capsys.readouterr().out)
+    assert out["status"] == "input-error"
+
+
+def test_collect_passes_file_delivered_api_key_to_proxy_client(state, monkeypatch, capsys):
+    monkeypatch.delenv("TELEGRAM_PROXY_API_KEY", raising=False)
+    key_file = state.parent / "proxy_api_key"
+    key_file.write_text("file-delivered-secret\n")
+    monkeypatch.setenv("TELEGRAM_PROXY_API_KEY_FILE", str(key_file))
+
+    sources_path = state / "sources.txt"
+    sources_path.parent.mkdir(parents=True, exist_ok=True)
+    sources_path.write_text("@some_channel\n")
+
+    captured: dict = {}
+
+    class _FakeProxyClient:
+        def __init__(self, *, base_url=None, api_key=None, timeout_seconds=None):
+            captured["base_url"] = base_url
+            captured["api_key"] = api_key
+
+        async def list_channels(self, *, limit):
+            return []
+
+    monkeypatch.setattr(telegram_aggregator_tool, "TelegramProxyClient", _FakeProxyClient)
+
+    rc = main(["collect"])
+    assert rc == 0
+    out = json.loads(capsys.readouterr().out)
+    assert out["status"] == "ok"
+    assert out["resolved"] == 0
+    assert captured["api_key"] == "file-delivered-secret"

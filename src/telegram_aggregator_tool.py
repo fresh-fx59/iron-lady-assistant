@@ -10,7 +10,6 @@ import argparse
 import asyncio
 import json
 import os
-import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -54,7 +53,10 @@ def _cmd_collect(args: argparse.Namespace) -> int:
         return 1
     sources = parse_sources(paths.sources_path.read_text())
     store = TelegramDigestStore(paths.db_path)
-    client = TelegramProxyClient()
+    client = TelegramProxyClient(
+        api_key=os.environ.get("TELEGRAM_PROXY_API_KEY") or None,
+        base_url=os.environ.get("TELEGRAM_PROXY_BASE_URL") or None,
+    )
     result = asyncio.run(collect(client, store, sources, collect_limit=args.collect_limit))
     _print({"status": "ok", **result})
     return 0
@@ -73,19 +75,23 @@ def _cmd_render_input(args: argparse.Namespace) -> int:
 def _cmd_gate(args: argparse.Namespace) -> int:
     paths = resolve_paths()
     date_key = args.date or _today()
-    input_doc = json.loads(Path(args.input).read_text())
-    known_links = {p["link"] for p in input_doc["posts"] if p.get("link")}
-    source_texts = [p["text"] for p in input_doc["posts"]]
+    try:
+        input_doc = json.loads(Path(args.input).read_text())
+        known_links = {p["link"] for p in input_doc["posts"] if p.get("link")}
+        source_texts = [p["text"] for p in input_doc["posts"]]
+        date_label = datetime.fromisoformat(date_key).strftime("%d.%m.%Y")
+    except (OSError, ValueError, KeyError) as exc:
+        _print({"status": "input-error", "error": str(exc)})
+        return 1
     try:
         stories = parse_draft(Path(args.draft).read_text())
-    except ValueError as exc:
+    except (OSError, ValueError) as exc:
         _print({"status": "parse-error", "error": str(exc)})
         return 1
     result = run_gates(stories, known_links=known_links, source_texts=source_texts)
     if not result.ok:
         _print({"status": "gate-failed", "errors": result.errors})
         return 1
-    date_label = datetime.fromisoformat(date_key).strftime("%d.%m.%Y")
     messages = render_messages(result.stories, date_label=date_label, footer=FOOTER)
     ledger = DigestLedger(paths.state_dir / "ledger.db")
     ledger.upsert_draft(date_key, messages)

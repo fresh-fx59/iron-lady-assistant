@@ -12,8 +12,11 @@ import logging
 import os
 import re
 from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, MutableMapping
+
+from .telegram_digest import TelegramDigestStore
 
 logger = logging.getLogger(__name__)
 
@@ -97,3 +100,93 @@ def parse_sources(text: str) -> list[str]:
         seen.add(key)
         out.append(candidate)
     return out
+
+
+def _utc_now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+async def collect(
+    client: Any,
+    store: TelegramDigestStore,
+    sources: list[str],
+    *,
+    collect_limit: int = 200,
+) -> dict[str, Any]:
+    """Resolve @usernames to joined dialogs via the proxy, ingest incrementally.
+
+    Resolution uses list_channels (the account has joined the sources via the
+    paced join loop); unresolved names are reported, not fatal — the join loop
+    may still be pacing its way through the list. Per-source failures (FloodWait,
+    network) skip that source this pass; watermark untouched -> retried next pass.
+    """
+    channels = await client.list_channels(limit=500)
+    by_username = {
+        (c.username or "").lower(): c for c in channels if getattr(c, "username", None)
+    }
+
+    resolved = 0
+    unresolved: list[str] = []
+    collected = 0
+    failed = 0
+
+    for name in sources:
+        channel = by_username.get(name.lower())
+        if channel is None:
+            unresolved.append(name)
+            continue
+        resolved += 1
+        entity_id = int(channel.entity_id)
+        peer_key = f"channel:{entity_id}"
+        store.upsert_source(
+            peer_key=peer_key,
+            entity_id=entity_id,
+            title=(channel.title or name).strip(),
+            username=channel.username,
+            kind="channel",
+            linked_channel_key=None,
+            role=AGG_ROLE,
+        )
+        last_id = store.last_message_id(peer_key)
+        try:
+            messages = await client.read_messages(
+                kind="channel",
+                entity_id=entity_id,
+                min_id=last_id,
+                limit=collect_limit,
+                recent_first=last_id == 0,
+            )
+        except Exception as exc:  # noqa: BLE001 — per-source isolation
+            failed += 1
+            logger.warning("aggregator collect: skipping %s this pass: %s", name, exc)
+            continue
+        latest = last_id
+        for message in messages:
+            posted_raw = message.get("posted_at")
+            posted_at = (
+                datetime.fromisoformat(posted_raw)
+                if isinstance(posted_raw, str) and posted_raw
+                else _utc_now()
+            )
+            if store.insert_message(
+                peer_key=peer_key,
+                message_id=int(message["message_id"]),
+                posted_at=posted_at,
+                sender_id=message.get("sender_id"),
+                views=message.get("views"),
+                forwards=message.get("forwards"),
+                replies=message.get("replies"),
+                link=message.get("link"),
+                text=str(message.get("text", "")).strip(),
+                raw_json=message.get("raw_json") or {},
+            ):
+                collected += 1
+            latest = max(latest, int(message["message_id"]))
+        store.mark_collected(peer_key, latest if latest > 0 else None)
+
+    return {
+        "resolved": resolved,
+        "unresolved": unresolved,
+        "collected_messages": collected,
+        "failed_sources": failed,
+    }

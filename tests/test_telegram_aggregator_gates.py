@@ -70,3 +70,68 @@ def test_gate_drops_verbatim_overlap():
 def test_gate_fails_when_too_few_survive():
     result = run_gates([Story(**_story())], known_links=KNOWN, source_texts=[])
     assert not result.ok
+
+
+@pytest.mark.parametrize("raw", ["[1,2,3]", "42", "null", '"just a string"'])
+def test_parse_draft_rejects_non_object_top_level(raw):
+    with pytest.raises(ValueError):
+        parse_draft(raw)
+
+
+def test_parse_draft_rejects_null_source_links():
+    raw = json.dumps(
+        {"stories": [{"headline": "x", "summary": "y", "source_links": None}]}
+    )
+    with pytest.raises(ValueError):
+        parse_draft(raw)
+
+
+def test_parse_draft_rejects_bare_string_source_links():
+    raw = json.dumps(
+        {
+            "stories": [
+                {
+                    "headline": "x",
+                    "summary": "y",
+                    "source_links": "https://t.me/a/1",
+                }
+            ]
+        }
+    )
+    with pytest.raises(ValueError):
+        parse_draft(raw)
+
+
+def test_parse_draft_rejects_int_source_links():
+    raw = json.dumps(
+        {"stories": [{"headline": "x", "summary": "y", "source_links": 7}]}
+    )
+    with pytest.raises(ValueError):
+        parse_draft(raw)
+
+
+def test_gate_headline_length_boundary():
+    ok_story = Story(**_story(headline="Р" * 120))
+    too_long = Story(**_story(headline="Р" * 121))
+    good = [Story(**_story()), Story(**_story())]
+    result = run_gates(
+        good + [ok_story, too_long], known_links=KNOWN, source_texts=[]
+    )
+    assert ok_story in result.stories
+    assert too_long not in result.stories
+    assert any("too long" in e for e in result.errors)
+
+
+def test_gate_source_links_count_boundary():
+    eight_links = [LINK_A] * 8
+    nine_links = [LINK_A] * 9
+    known_many = {LINK_A}
+    ok_story = Story(**_story(source_links=eight_links))
+    too_many = Story(**_story(source_links=nine_links))
+    good = [Story(**_story(source_links=[LINK_A])), Story(**_story(source_links=[LINK_A]))]
+    result = run_gates(
+        good + [ok_story, too_many], known_links=known_many, source_texts=[]
+    )
+    assert ok_story in result.stories
+    assert too_many not in result.stories
+    assert any("1-8 source links" in e for e in result.errors)

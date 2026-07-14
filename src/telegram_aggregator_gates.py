@@ -34,6 +34,14 @@ class Story:
         )
 
 
+# @dataclass(frozen=True) would otherwise auto-generate a __hash__ that tries to
+# hash the list field (TypeError at call time). Assigning here — *after* the
+# class body — is required: setting __hash__ = None inside the class body gets
+# silently clobbered by the dataclass decorator, which treats a user-defined
+# __eq__ + __hash__ = None as "no explicit hash" and regenerates one anyway.
+Story.__hash__ = None
+
+
 @dataclass(frozen=True)
 class GateResult:
     ok: bool
@@ -50,6 +58,8 @@ def parse_draft(raw: str) -> list[Story]:
         payload = json.loads(text)
     except json.JSONDecodeError as exc:
         raise ValueError(f"draft is not valid JSON: {exc}") from exc
+    if not isinstance(payload, dict):
+        raise ValueError("draft JSON is not an object")
     stories_raw = payload.get("stories")
     if not isinstance(stories_raw, list):
         raise ValueError("draft JSON has no 'stories' list")
@@ -57,16 +67,23 @@ def parse_draft(raw: str) -> list[Story]:
     for i, item in enumerate(stories_raw):
         if not isinstance(item, dict):
             raise ValueError(f"story {i} is not an object")
+        links = item.get("source_links")
+        # A bare string is iterable too (would silently split into one-char
+        # "links" instead of raising) — reject anything that isn't a real list.
+        if not isinstance(links, list):
+            raise ValueError(f"story {i} source_links is not a list")
         try:
             stories.append(
                 Story(
                     headline=str(item["headline"]).strip(),
                     summary=str(item["summary"]).strip(),
-                    source_links=[str(x).strip() for x in item["source_links"]],
+                    source_links=[str(x).strip() for x in links],
                 )
             )
         except KeyError as exc:
             raise ValueError(f"story {i} missing key {exc}") from exc
+        except TypeError as exc:
+            raise ValueError(f"story {i} has invalid field type: {exc}") from exc
     return stories
 
 
@@ -78,6 +95,9 @@ def _norm_words(text: str) -> list[str]:
 def _has_verbatim_overlap(story_text: str, source_texts: list[str]) -> bool:
     words = _norm_words(story_text)
     if len(words) < _OVERLAP_WORDS:
+        # Fail-safe on purpose: short texts use the whole string as one needle,
+        # which is stricter than the documented >=12-word rule (any overlap at
+        # all kills a <12-word story, not just a 12-word run).
         needles = {" ".join(words)} if words else set()
     else:
         needles = {

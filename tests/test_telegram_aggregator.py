@@ -2,11 +2,19 @@
 from __future__ import annotations
 
 import os
+from datetime import datetime
 from pathlib import Path
 
 import pytest
 
-from src.telegram_aggregator import AGG_ROLE, collect, load_file_env, parse_sources, resolve_paths
+from src.telegram_aggregator import (
+    AGG_ROLE,
+    build_draft_input,
+    collect,
+    load_file_env,
+    parse_sources,
+    resolve_paths,
+)
 from src.telegram_digest import TelegramDigestStore
 
 
@@ -139,3 +147,45 @@ async def test_collect_isolates_per_source_failures(tmp_path):
     result = await collect(client, store, ["ok_chan", "broken_chan"])
     assert result["collected_messages"] == 1
     assert result["failed_sources"] == 1
+
+
+def _seed(store, peer_key, title, username, mid, text, views, posted="2026-07-14T10:00:00+00:00"):
+    store.upsert_source(
+        peer_key=peer_key, entity_id=int(peer_key.split(":")[1]), title=title,
+        username=username, kind="channel", linked_channel_key=None, role=AGG_ROLE,
+    )
+    store.insert_message(
+        peer_key=peer_key, message_id=mid,
+        posted_at=datetime.fromisoformat(posted),
+        sender_id=None, views=views, forwards=0, replies=None,
+        link=f"https://t.me/{username}/{mid}", text=text, raw_json={},
+    )
+
+
+def test_build_draft_input_dedups_and_ranks(tmp_path, monkeypatch):
+    store = TelegramDigestStore(tmp_path / "agg.db")
+    long_text = "Анонс большой модели и её бенчмарки. " * 5
+    _seed(store, "channel:1", "A", "chan_a", 10, long_text, views=100)
+    _seed(store, "channel:2", "B", "chan_b", 20, long_text, views=999)      # dup, more views
+    _seed(store, "channel:1", "A", "chan_a", 11, "короткий пост", views=5)  # <80 chars -> dropped
+    other = "Совсем другой длинный пост про агентов и инструменты разработки. " * 3
+    _seed(store, "channel:2", "B", "chan_b", 21, other, views=50)
+
+    doc = build_draft_input(store, window_hours=24 * 365 * 10)  # huge window: include seeds
+    texts = [p["text"] for p in doc["posts"]]
+    assert len(doc["posts"]) == 2
+    assert doc["posts"][0]["views"] == 999                     # dup collapsed to top-views copy
+    assert doc["posts"][0]["link"] == "https://t.me/chan_b/20"
+    assert all(len(t) >= 80 for t in texts)
+    assert doc["window_hours"] == 24 * 365 * 10
+
+
+def test_build_draft_input_caps_posts(tmp_path):
+    store = TelegramDigestStore(tmp_path / "agg.db")
+    for i in range(30):
+        _seed(store, "channel:1", "A", "chan_a", 100 + i,
+              f"Пост номер {i} — достаточно длинный текст про искусственный интеллект и релизы моделей сегодня.",
+              views=i)
+    doc = build_draft_input(store, window_hours=24 * 365 * 10, max_posts=10)
+    assert len(doc["posts"]) == 10
+    assert doc["posts"][0]["views"] == 29

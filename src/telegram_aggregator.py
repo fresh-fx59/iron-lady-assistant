@@ -11,6 +11,8 @@ from __future__ import annotations
 import logging
 import os
 import re
+import sqlite3
+import unicodedata
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -189,4 +191,60 @@ async def collect(
         "unresolved": unresolved,
         "collected_messages": collected,
         "failed_sources": failed,
+    }
+
+
+def _dedup_key(text: str) -> str:
+    norm = unicodedata.normalize("NFKC", text).lower()
+    norm = " ".join(norm.split())
+    return norm[:120]
+
+
+def build_draft_input(
+    store: TelegramDigestStore,
+    *,
+    window_hours: int = 24,
+    max_posts: int = 150,
+) -> dict[str, Any]:
+    cutoff = (_utc_now() - timedelta(hours=window_hours)).isoformat()
+    con = sqlite3.connect(store._db_path)  # noqa: SLF001 — same-package, own db file
+    con.row_factory = sqlite3.Row
+    try:
+        rows = con.execute(
+            """
+            SELECT s.title AS channel, s.username AS username,
+                   m.link, m.text, m.views, m.forwards, m.posted_at
+            FROM digest_messages m
+            JOIN digest_sources s ON s.peer_key = m.peer_key
+            WHERE s.role = ? AND m.posted_at >= ?
+            ORDER BY COALESCE(m.views, 0) DESC
+            """,
+            (AGG_ROLE, cutoff),
+        ).fetchall()
+    finally:
+        con.close()
+
+    best: dict[str, sqlite3.Row] = {}
+    for row in rows:  # rows arrive views-DESC, so first wins per dedup key
+        text = (row["text"] or "").strip()
+        if len(text) < 80 or not row["link"]:
+            continue
+        best.setdefault(_dedup_key(text), row)
+
+    posts = [
+        {
+            "channel": r["channel"],
+            "username": r["username"],
+            "link": r["link"],
+            "text": (r["text"] or "").strip(),
+            "views": r["views"],
+            "forwards": r["forwards"],
+            "posted_at": r["posted_at"],
+        }
+        for r in list(best.values())[:max_posts]
+    ]
+    return {
+        "date": _utc_now().date().isoformat(),
+        "window_hours": window_hours,
+        "posts": posts,
     }

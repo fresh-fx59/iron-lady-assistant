@@ -32,7 +32,27 @@ FEEDBACK="$STATE_DIR/drafts/$TODAY-gate-errors.json"
 # collect failure must not kill the draft run — stale-but-present data still
 # makes a digest.
 "$PY" -m src.telegram_aggregator_tool collect >>"$LOG_DIR/$TODAY-runner.log" 2>&1 || true
+
+# render-input and every run_draft call below must NOT kill the script
+# silently under set -e — a bare failing command outside an if/&&/|| context
+# still trips -e and the run just vanishes with no log line and no operator
+# ping (that was the "no digest today, no one told me" gap). Toggle -e off
+# around the call so the real exit code survives into $rc (negating via
+# `if ! cmd` loses the original code), log it, notify, then exit 1 ourselves.
+notify_stage_failure() {
+  local stage="$1" rc="$2"
+  echo "stage '$stage' failed (rc=$rc)" >>"$LOG_DIR/$TODAY-runner.log"
+  "$PY" - <<'EOF'
+from src.telegram_aggregator_publish import notify_operator
+notify_operator("❌ Дайджест: сбой на этапе render-input/draft — см. логи")
+EOF
+}
+
+set +e
 "$PY" -m src.telegram_aggregator_tool render-input --out "$INPUT" >>"$LOG_DIR/$TODAY-runner.log" 2>&1
+rc=$?
+set -e
+[ "$rc" -eq 0 ] || { notify_stage_failure "render-input" "$rc"; exit 1; }
 
 run_draft() {
   local extra="${1:-}"
@@ -55,11 +75,20 @@ gate() {
     | tee "$STATE_DIR/drafts/$TODAY-gate.json"
 }
 
+set +e
 run_draft
+rc=$?
+set -e
+[ "$rc" -eq 0 ] || { notify_stage_failure "draft" "$rc"; exit 1; }
+
 if ! gate; then
   cp "$STATE_DIR/drafts/$TODAY-gate.json" "$FEEDBACK" 2>/dev/null || true
   echo "gate failed; one regen with feedback" >>"$LOG_DIR/$TODAY-runner.log"
+  set +e
   run_draft "$FEEDBACK"
+  rc=$?
+  set -e
+  [ "$rc" -eq 0 ] || { notify_stage_failure "draft-regen" "$rc"; exit 1; }
   gate || { "$PY" - <<'EOF'
 from src.telegram_aggregator_publish import notify_operator
 notify_operator("❌ Дайджест: черновик не прошёл гейты после regen — сегодня без выпуска. См. логи draft-runner.")

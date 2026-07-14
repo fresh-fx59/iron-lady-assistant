@@ -163,6 +163,7 @@ class DigestLedger:
     def _connect(self) -> sqlite3.Connection:
         con = sqlite3.connect(self._db_path)
         con.row_factory = sqlite3.Row
+        con.execute("PRAGMA busy_timeout=5000")
         return con
 
     @staticmethod

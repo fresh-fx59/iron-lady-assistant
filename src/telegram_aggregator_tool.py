@@ -77,10 +77,15 @@ def _cmd_gate(args: argparse.Namespace) -> int:
     date_key = args.date or _today()
     try:
         input_doc = json.loads(Path(args.input).read_text())
-        known_links = {p["link"] for p in input_doc["posts"] if p.get("link")}
-        source_texts = [p["text"] for p in input_doc["posts"]]
+        if not isinstance(input_doc, dict):
+            raise ValueError("input JSON is not an object")
+        posts = input_doc.get("posts")
+        if not isinstance(posts, list) or any(not isinstance(p, dict) for p in posts):
+            raise ValueError("input JSON 'posts' is not a list of objects")
+        known_links = {p["link"] for p in posts if p.get("link")}
+        source_texts = [p["text"] for p in posts]
         date_label = datetime.fromisoformat(date_key).strftime("%d.%m.%Y")
-    except (OSError, ValueError, KeyError) as exc:
+    except (OSError, ValueError, KeyError, TypeError, AttributeError) as exc:
         _print({"status": "input-error", "error": str(exc)})
         return 1
     try:

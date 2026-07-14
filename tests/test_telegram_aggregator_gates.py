@@ -67,6 +67,24 @@ def test_gate_drops_verbatim_overlap():
     assert any("verbatim" in e for e in result.errors)
 
 
+def test_gate_drops_verbatim_overlap_with_zero_width_spaces():
+    # Same 15-word verbatim run as test_gate_drops_verbatim_overlap, but with
+    # zero-width spaces (U+200B) spliced inside two of the words. \w doesn't
+    # match ZWSP, so without stripping Cf chars first these split into extra
+    # "words" and the 12-gram sliding window never lines up with the source —
+    # the copy sails through undetected. Regression for that bypass.
+    verbatim = Story(**_story(
+        summary=(
+            "сегодня вышла но​вая модель кото​рая обгоняет всех "
+            "конкурентов на всех бенчмарках сразу и это"
+        )
+    ))
+    good = [Story(**_story()), Story(**_story()), Story(**_story())]
+    result = run_gates(good + [verbatim], known_links=KNOWN, source_texts=SOURCE_TEXTS)
+    assert len(result.stories) == 3
+    assert any("verbatim" in e for e in result.errors)
+
+
 def test_gate_fails_when_too_few_survive():
     result = run_gates([Story(**_story())], known_links=KNOWN, source_texts=[])
     assert not result.ok

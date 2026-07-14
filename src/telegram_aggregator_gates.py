@@ -89,6 +89,13 @@ def parse_draft(raw: str) -> list[Story]:
 
 def _norm_words(text: str) -> list[str]:
     norm = unicodedata.normalize("NFKC", text).lower()
+    # Strip every Unicode "format" char (category Cf) BEFORE tokenizing — this
+    # covers zero-width space U+200B, zero-width non-joiner/joiner U+200C/
+    # U+200D, and soft hyphen U+00AD. \w doesn't match any of them, so left in
+    # place they silently split a copied word in two ("но​вая" ->
+    # "но","вая"), which shifts every downstream 12-word window and lets a
+    # verbatim-copied passage sail past the no-verbatim gate untouched.
+    norm = "".join(ch for ch in norm if unicodedata.category(ch) != "Cf")
     return re.findall(r"\w+", norm)
 
 

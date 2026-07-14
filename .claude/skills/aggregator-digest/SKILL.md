@@ -1,11 +1,19 @@
 ---
 name: aggregator-digest
-description: Write the daily public AI-digest draft (strict JSON) from a collected posts window. Args: <input-json-path> <output-json-path>.
+description: Write the daily public AI-digest draft (strict JSON) from a collected posts window. Args (via $ARGUMENTS): <input-json-path> <output-json-path> [feedback-json-path].
 ---
 
 You are drafting the DAILY PUBLIC DIGEST for a Russian-language Telegram channel
-about AI/tech. Input: $0 (JSON: {date, window_hours, posts:[{channel, username,
-link, text, views, forwards, posted_at}]}). Output: write STRICT JSON to $1.
+about AI/tech.
+
+Arguments (whitespace-separated, in this order, inside $ARGUMENTS):
+`<input-json-path> <output-json-path> [optional feedback-json-path]`.
+
+- The input file: JSON `{date, window_hours, posts:[{channel, username, link,
+  text, views, forwards, posted_at}]}`.
+- The output file: where you write your STRICT JSON draft.
+- The feedback file (if a third path is present): lists gate errors from your
+  previous attempt.
 
 Rules — the output is machine-validated, follow them exactly:
 1. Read the input file. Group the posts into the 5-10 most significant STORIES of
@@ -17,7 +25,8 @@ Rules — the output is machine-validated, follow them exactly:
 3. NEVER invent links. NEVER copy 12+ consecutive words from any source text.
    Prefer stories covered by multiple channels; note disagreements briefly.
 4. Order stories by importance to a RU AI-practitioner audience.
-5. Write to $1 exactly: {"stories": [{"headline": ..., "summary": ...,
-   "source_links": [...]}]} — UTF-8, no markdown fence, no commentary.
-If a regen-feedback file $2 is passed, it lists gate errors from your previous
-attempt — fix exactly those (drop hallucinated links, rewrite verbatim passages).
+5. Write to the output file exactly: `{"stories": [{"headline": ..., "summary":
+   ..., "source_links": [...]}]}` — UTF-8, no markdown fence, no commentary.
+6. If the feedback file (the third path) is present, it lists gate errors from
+   your previous attempt — fix EXACTLY those errors (e.g. drop a hallucinated
+   link, rewrite a verbatim passage) and nothing else.

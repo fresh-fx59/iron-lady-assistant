@@ -87,6 +87,19 @@ def test_gate_malformed_input_json_is_input_error(state, capsys):
     assert out["status"] == "input-error"
 
 
+def test_gate_non_dict_input_json_is_input_error(state, capsys):
+    input_path = state / "drafts" / "list-input.json"
+    input_path.parent.mkdir(parents=True, exist_ok=True)
+    input_path.write_text(json.dumps([1, 2, 3]))
+    draft_path = _write_draft(state, _stories(1))
+    rc = main(["gate", "--draft", str(draft_path), "--input", str(input_path), "--date", "2026-07-14"])
+    assert rc == 1
+    lines = capsys.readouterr().out.strip().splitlines()
+    assert len(lines) == 1
+    out = json.loads(lines[0])
+    assert out["status"] == "input-error"
+
+
 def test_gate_missing_draft_file_exits_nonzero(state, capsys):
     input_path = _write_input(state, [("https://t.me/chan/1", "длинный исходный текст " * 10)])
     missing_draft = state / "drafts" / "does-not-exist.json"

@@ -1,8 +1,10 @@
 """tests/test_telegram_aggregator_publish.py"""
 from __future__ import annotations
 
+import pytest
+
 from src.telegram_aggregator_gates import Story
-from src.telegram_aggregator_publish import render_messages
+from src.telegram_aggregator_publish import DigestLedger, publish_next, render_messages
 
 FOOTER = "🤖 Дайджест: отбор автоматический, курирование вручную."
 
@@ -36,3 +38,64 @@ def test_render_splits_at_story_boundary():
     joined = "".join(msgs)
     for i in range(12):
         assert f"Сюжет {i}" in joined                        # nothing lost in the split
+
+
+class FakeTransport:
+    def __init__(self, fail_at=None):
+        self.calls = []
+        self._fail_at = fail_at
+
+    def send_message(self, chat, text):
+        if self._fail_at is not None and len(self.calls) == self._fail_at:
+            raise RuntimeError("boom")
+        self.calls.append((chat, text))
+        return len(self.calls)
+
+
+def _ledger(tmp_path):
+    return DigestLedger(tmp_path / "ledger.db")
+
+
+def test_ledger_flow_and_publish(tmp_path):
+    ledger = _ledger(tmp_path)
+    ledger.upsert_draft("2026-07-14", ["msg one", "msg two"])
+    assert publish_next(ledger, FakeTransport(), "@chan")["status"] == "skipped"  # not approved
+    assert ledger.approve() == "2026-07-14"
+    transport = FakeTransport()
+    result = publish_next(ledger, transport, "@chan")
+    assert result == {"status": "posted", "date_key": "2026-07-14", "messages": 2}
+    assert [c[1] for c in transport.calls] == ["msg one", "msg two"]
+    # once posted, nothing further to publish
+    assert publish_next(ledger, transport, "@chan")["status"] == "skipped"
+
+
+def test_publish_dry_run_reverts(tmp_path, capsys):
+    ledger = _ledger(tmp_path)
+    ledger.upsert_draft("2026-07-14", ["msg"])
+    ledger.approve()
+    result = publish_next(ledger, None, None, dry_run=True)
+    assert result["status"] == "dry-run"
+    assert "msg" in capsys.readouterr().out
+    # still approved -> a later real publish can pick it up
+    assert ledger.next_approved() is not None
+
+
+def test_stuck_sending_blocks(tmp_path):
+    ledger = _ledger(tmp_path)
+    ledger.upsert_draft("2026-07-13", ["a"])
+    ledger.approve()
+    assert ledger.begin_send("2026-07-13")            # simulate crash mid-send
+    ledger.upsert_draft("2026-07-14", ["b"])
+    ledger.approve()
+    result = publish_next(ledger, FakeTransport(), "@chan")
+    assert result["status"] == "blocked"
+
+
+def test_upsert_same_day_replaces_pending(tmp_path):
+    ledger = _ledger(tmp_path)
+    ledger.upsert_draft("2026-07-14", ["v1"])
+    ledger.upsert_draft("2026-07-14", ["v2", "v2b"])
+    ledger.approve()
+    transport = FakeTransport()
+    publish_next(ledger, transport, "@chan")
+    assert [c[1] for c in transport.calls] == ["v2", "v2b"]

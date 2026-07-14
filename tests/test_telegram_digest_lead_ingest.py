@@ -5,6 +5,8 @@ role-filtered incremental collect, and per-source error isolation.
 """
 
 import sqlite3
+import threading
+import time
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -322,3 +324,77 @@ def test_render_briefing_shows_only_digest_role(tmp_path) -> None:
     assert "digest visible line" in briefing
     assert "Secret Lead Group" not in briefing
     assert "lead private line" not in briefing
+
+
+# ── (f) concurrency: WAL + busy_timeout let a 2nd conn coexist ───────────────
+def test_connect_applies_wal_and_busy_timeout(tmp_path) -> None:
+    """Every connection opts into WAL + a 5s busy_timeout so the proxy (a 2nd
+    reader/writer) and the M2 collect timer don't collide on 'database is locked'."""
+    store = TelegramDigestStore(tmp_path / "digest.db")
+    con = store._connect()
+    try:
+        assert con.execute("PRAGMA journal_mode").fetchone()[0].lower() == "wal"
+        assert con.execute("PRAGMA busy_timeout").fetchone()[0] == 5000
+    finally:
+        con.close()
+
+
+def test_reader_coexists_with_open_writer(tmp_path) -> None:
+    """In WAL mode a reader on a 2nd connection does NOT raise 'database is
+    locked' while another connection holds an open write transaction."""
+    store = TelegramDigestStore(tmp_path / "digest.db")
+    writer = store._connect()
+    reader = store._connect()
+    try:
+        writer.execute("BEGIN IMMEDIATE")  # takes the write lock and holds it
+        writer.execute(
+            "INSERT INTO lead_senders(sender_id, username, name, is_bot, resolved_at) "
+            "VALUES (1, 'a', 'A', 0, '2026-07-14T00:00:00+00:00')"
+        )
+        # Reader must succeed immediately despite the open write txn (WAL).
+        rows = reader.execute("SELECT COUNT(*) AS c FROM lead_senders").fetchall()
+        assert rows[0]["c"] == 0  # sees the pre-write snapshot, but does NOT lock
+    finally:
+        writer.rollback()
+        writer.close()
+        reader.close()
+
+
+def test_second_writer_waits_on_busy_timeout_not_immediate_lock(tmp_path) -> None:
+    """A 2nd writer meeting a held write lock BLOCKS on busy_timeout until the
+    holder commits, instead of instantly raising OperationalError. Without
+    busy_timeout the upsert below would raise 'database is locked' at once."""
+    store = TelegramDigestStore(tmp_path / "digest.db")
+    holding = threading.Event()
+    release = threading.Event()
+
+    def hold_writer() -> None:
+        con = store._connect()
+        try:
+            con.execute("BEGIN IMMEDIATE")
+            con.execute(
+                "INSERT INTO lead_senders(sender_id, username, name, is_bot, resolved_at) "
+                "VALUES (1, 'a', 'A', 0, '2026-07-14T00:00:00+00:00')"
+            )
+            holding.set()
+            release.wait(3.0)
+            con.commit()
+        finally:
+            con.close()
+
+    t = threading.Thread(target=hold_writer)
+    t.start()
+    assert holding.wait(3.0), "background writer never took the lock"
+
+    # Release the holder shortly after the main writer starts waiting.
+    threading.Timer(0.3, release.set).start()
+    start = time.monotonic()
+    store.upsert_lead_sender(sender_id=2, username="b", name="B", is_bot=False)  # must NOT raise
+    elapsed = time.monotonic() - start
+    t.join(3.0)
+
+    assert release.is_set()
+    assert elapsed >= 0.2, "upsert returned too fast — it did not wait on the lock"
+    # Both writes landed.
+    assert store.get_lead_sender(1) is not None
+    assert store.get_lead_sender(2) is not None

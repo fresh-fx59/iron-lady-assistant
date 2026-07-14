@@ -527,8 +527,12 @@ class TelegramProxy:
         self._import_chat_invite_request = None
         self._chat_invite_already_cls = None
         self._join_store: JoinStore | None = None
-        # Read-only view of the digest db for the lead-candidate feed + the
-        # lead-sender identity cache. Lazily opened; never a 2nd Telethon client.
+        # Digest-db handle for the lead-candidate feed + the lead-sender identity
+        # cache. NOT read-only: the feed reads, but resolve_sender WRITES the
+        # lead_senders cache — so the proxy is a second reader AND writer of the
+        # db the M2 collect timer also writes (WAL + busy_timeout in
+        # TelegramDigestStore._connect let them coexist). Lazily opened; never a
+        # 2nd Telethon client.
         self._digest_store: TelegramDigestStore | None = None
         self._join_lock = asyncio.Lock()  # serialises join passes (loop vs manual tick)
         self._join_task: asyncio.Task | None = None
@@ -846,7 +850,7 @@ class TelegramProxy:
         return self._digest_store
 
     def lead_candidates(self, *, since_id: int, limit: int) -> dict[str, Any]:
-        """Page the lead-candidate feed from the digest db (read-only).
+        """Page the lead-candidate feed from the digest db (this call only reads).
 
         Returns the contract envelope ``{items, max_id, count}``. ``max_id`` is
         the largest rowid returned so the caller can pass it straight back as the

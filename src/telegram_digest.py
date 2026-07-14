@@ -94,6 +94,16 @@ class TelegramDigestStore:
     def _connect(self) -> sqlite3.Connection:
         con = sqlite3.connect(self._db_path)
         con.row_factory = sqlite3.Row
+        # This db is now shared by TWO processes: the M2 collect timer (writes
+        # digest_messages every 30m) and the proxy (reads the lead-candidate
+        # feed AND writes the lead_senders identity cache). Without these two
+        # PRAGMAs a reader/writer that meets a held lock raises "database is
+        # locked" immediately. busy_timeout makes it wait for the lock (up to 5s)
+        # instead; WAL lets readers and a writer coexist. Both are cheap and set
+        # once per connection (journal_mode=WAL is persisted in the db header, so
+        # re-issuing it is a no-op).
+        con.execute("PRAGMA busy_timeout=5000")
+        con.execute("PRAGMA journal_mode=WAL")
         return con
 
     def _init_db(self) -> None:
@@ -261,7 +271,7 @@ class TelegramDigestStore:
             row = con.execute("SELECT COUNT(*) AS count FROM digest_sources").fetchone()
             return int(row["count"] or 0)
 
-    # ── lead-candidate feed (read-only; consumed by the scorer) ───────
+    # ── lead-candidate feed (a read; consumed by the scorer) ──────────
     def lead_candidates(self, *, since_id: int = 0, limit: int = 500) -> list[dict[str, Any]]:
         """Return lead-group messages with a resolvable sender, after ``since_id``.
 
@@ -269,7 +279,9 @@ class TelegramDigestStore:
         table — the composite PK does not suppress it). Only sources tagged
         ``role='lead'`` and messages with a non-NULL ``sender_id`` are returned,
         ordered by rowid ASC so the caller can page forward by feeding back the
-        last ``id`` it saw. Read-only; opens no Telethon client.
+        last ``id`` it saw. This method only reads; it opens no Telethon client.
+        (Note the store as a whole is NOT read-only — ``upsert_lead_sender``
+        writes the ``lead_senders`` cache.)
         """
         since_id = max(0, int(since_id))
         limit = max(1, min(2000, int(limit)))

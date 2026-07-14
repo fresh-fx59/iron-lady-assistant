@@ -15,6 +15,7 @@ from typing import Any
 from aiohttp import web
 
 from . import config
+from .telegram_digest import TelegramDigestStore
 from .telegram_proxy_crypto import (
     TelegramProxyCredentials,
     decrypt_credentials,
@@ -526,6 +527,9 @@ class TelegramProxy:
         self._import_chat_invite_request = None
         self._chat_invite_already_cls = None
         self._join_store: JoinStore | None = None
+        # Read-only view of the digest db for the lead-candidate feed + the
+        # lead-sender identity cache. Lazily opened; never a 2nd Telethon client.
+        self._digest_store: TelegramDigestStore | None = None
         self._join_lock = asyncio.Lock()  # serialises join passes (loop vs manual tick)
         self._join_task: asyncio.Task | None = None
         # Set of dialog entity ids already joined — preloaded once per run for
@@ -834,6 +838,77 @@ class TelegramProxy:
                 raise web.HTTPForbidden(text="Direct chat access is disabled.")
             return
         raise web.HTTPBadRequest(text="Unsupported entity kind.")
+
+    # ── Lead-candidate feed + sender resolution ───────────────────
+    def _get_digest_store(self) -> TelegramDigestStore:
+        if self._digest_store is None:
+            self._digest_store = TelegramDigestStore()
+        return self._digest_store
+
+    def lead_candidates(self, *, since_id: int, limit: int) -> dict[str, Any]:
+        """Page the lead-candidate feed from the digest db (read-only).
+
+        Returns the contract envelope ``{items, max_id, count}``. ``max_id`` is
+        the largest rowid returned so the caller can pass it straight back as the
+        next ``since_id``; when nothing new is available it echoes ``since_id`` so
+        the cursor never rewinds.
+        """
+        store = self._get_digest_store()
+        items = store.lead_candidates(since_id=since_id, limit=limit)
+        # items are ordered by rowid ASC, so the last one carries the max rowid.
+        max_id = items[-1]["id"] if items else since_id
+        return {"items": items, "max_id": max_id, "count": len(items)}
+
+    async def resolve_sender(self, sender_id: int) -> dict[str, Any]:
+        """Resolve a lead sender's identity, caching the result in the digest db.
+
+        Cache hit ⇒ no network call (``cached=true``). Cache miss ⇒ one
+        ``get_entity`` on the EXISTING client, then cache. FloodWait/RPC/any
+        lookup error ⇒ a tolerant envelope with an ``error`` field at HTTP 200
+        (the caller treats an unresolved sender as acceptable); the failure is
+        NOT cached so a later retry can still succeed.
+        """
+        sender_id = int(sender_id)
+        store = self._get_digest_store()
+        cached = store.get_lead_sender(sender_id)
+        if cached is not None:
+            return {
+                "sender_id": sender_id,
+                "username": cached["username"],
+                "name": cached["name"],
+                "is_bot": bool(cached["is_bot"]),
+                "cached": True,
+            }
+        client = self._require_client()
+        try:
+            async with self._lock:
+                entity = await client.get_entity(sender_id)
+        except Exception as exc:  # noqa: BLE001 — fail open; caller tolerates
+            return {
+                "sender_id": sender_id,
+                "username": None,
+                "name": "",
+                "is_bot": False,
+                "error": type(exc).__name__,
+            }
+        username = getattr(entity, "username", None)
+        first = (getattr(entity, "first_name", None) or "").strip()
+        last = (getattr(entity, "last_name", None) or "").strip()
+        name = " ".join(part for part in (first, last) if part)
+        if not name:
+            # Channels/chats appearing as a sender expose a title, not a name.
+            name = (getattr(entity, "title", None) or "").strip()
+        is_bot = bool(getattr(entity, "bot", False))
+        store.upsert_lead_sender(
+            sender_id=sender_id, username=username, name=name, is_bot=is_bot
+        )
+        return {
+            "sender_id": sender_id,
+            "username": username,
+            "name": name,
+            "is_bot": is_bot,
+            "cached": False,
+        }
 
     # ── Paced, ban-safe JOIN ──────────────────────────────────────
     def _get_join_store(self) -> JoinStore:
@@ -1276,6 +1351,30 @@ async def _create_group(request: web.Request) -> web.Response:
     return web.json_response({"ok": True, "result": result})
 
 
+async def _leads_candidates(request: web.Request) -> web.Response:
+    _check_auth(request)
+    proxy: TelegramProxy = request.app["proxy"]
+    try:
+        since_id = max(0, int(request.query.get("since_id", "0")))
+    except ValueError:
+        raise web.HTTPBadRequest(text="since_id must be an integer.") from None
+    try:
+        limit = max(1, min(2000, int(request.query.get("limit", "500"))))
+    except ValueError:
+        raise web.HTTPBadRequest(text="limit must be an integer.") from None
+    return web.json_response(proxy.lead_candidates(since_id=since_id, limit=limit))
+
+
+async def _lead_user(request: web.Request) -> web.Response:
+    _check_auth(request)
+    proxy: TelegramProxy = request.app["proxy"]
+    try:
+        sender_id = int(request.match_info["sender_id"])
+    except (TypeError, ValueError):
+        raise web.HTTPBadRequest(text="sender_id must be an integer.") from None
+    return web.json_response(await proxy.resolve_sender(sender_id))
+
+
 async def _join_enqueue(request: web.Request) -> web.Response:
     _check_auth(request)
     proxy: TelegramProxy = request.app["proxy"]
@@ -1330,6 +1429,8 @@ def create_app() -> web.Application:
     app.router.add_get("/health", _health)
     app.router.add_get("/v1/channels", _list_channels)
     app.router.add_get("/v1/messages/{kind}/{entity_id}", _read_messages)
+    app.router.add_get("/v1/leads/candidates", _leads_candidates)
+    app.router.add_get("/v1/users/{sender_id}", _lead_user)
     app.router.add_post("/v1/telegram/createGroup", _create_group)
     app.router.add_post("/v1/join/enqueue", _join_enqueue)
     app.router.add_get("/v1/join/status", _join_status)

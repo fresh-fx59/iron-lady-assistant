@@ -17,8 +17,9 @@ The Telethon client is fully mocked — nothing here touches real Telegram.
 from __future__ import annotations
 
 import inspect
+import sqlite3
 import types
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
@@ -30,6 +31,7 @@ from telethon.errors import (
     UserAlreadyParticipantError,
 )
 
+import src.telegram_proxy as tp
 from src.telegram_proxy import (
     JoinStore,
     TelegramProxy,
@@ -133,11 +135,26 @@ class FakeClient:
         raise AssertionError(f"unexpected request marker {marker!r}")
 
 
-def _make_proxy(store: JoinStore, client: FakeClient, *, cap: int = 15) -> TelegramProxy:
+def _make_proxy(
+    store: JoinStore,
+    client: FakeClient,
+    *,
+    cap: int = 15,
+    min_delay: float = 0.0,
+    max_delay: float = 0.0,
+    max_attempts: int = 5,
+    retry_backoff: float = 0.0,
+) -> TelegramProxy:
     proxy = TelegramProxy()
     proxy._client = client
     proxy._join_store = store
     proxy._daily_cap = cap
+    # Pacing defaults to 0 so cap/floodwait/etc. tests can issue joins back-to-back;
+    # the pacing-specific tests pass a real min_delay to exercise the durable gate.
+    proxy._join_min_delay = min_delay
+    proxy._join_max_delay = max_delay
+    proxy._join_max_attempts = max_attempts
+    proxy._join_retry_backoff = retry_backoff
     proxy._join_channel_request = _join_req
     proxy._check_chat_invite_request = _check_req
     proxy._import_chat_invite_request = _import_req
@@ -460,3 +477,257 @@ def test_join_path_never_lists_or_invites_participants():
     )
     for name in banned:
         assert name not in sources, f"join path must never reference {name}"
+
+
+# ══ Adversarial-review fixes (PR #3) ═══════════════════════════════════
+# FINDING #1 — durable inter-join pacing, FINDING #2 — rolling 24h cap,
+# FINDING #3 — atomic increment, FINDING #4 — transient retry.
+# These MUST fail against the pre-fix code and pass after.
+
+
+# ── F1: durable inter-join pacing (survives restart) ──────────────
+@pytest.mark.asyncio
+async def test_pacing_gate_blocks_second_join_and_survives_restart(tmp_path):
+    db = tmp_path / "join.db"
+    store = JoinStore(db_path=db)
+    client = FakeClient()
+    proxy = _make_proxy(store, client, cap=15, min_delay=60, max_delay=60)
+    proxy.enqueue_targets(["@a", "@b"])
+
+    r1 = await proxy.join_tick()
+    assert r1["action"] == "joined"
+    assert len(client.join_calls) == 1
+
+    # A second pass immediately after is blocked by the DURABLE pacing gate,
+    # not by an in-memory sleep — no network join is issued.
+    r2 = await proxy.join_tick()
+    assert r2["action"] == "skipped"
+    assert r2["reason"] == "pacing"
+    assert len(client.join_calls) == 1
+
+    # Simulate a process restart: a brand-new store + proxy on the SAME db file
+    # must still honour the persisted next_join_allowed_at (jitter, not just floor).
+    store2 = JoinStore(db_path=db)
+    proxy2 = _make_proxy(store2, FakeClient(), cap=15, min_delay=60, max_delay=60)
+    assert store2.get_next_join_allowed_at() is not None
+    r3 = await proxy2.join_tick()
+    assert r3["action"] == "skipped"
+    assert r3["reason"] == "pacing"
+    assert proxy2._client.join_calls == []
+
+    # Once the persisted deadline passes, joining resumes.
+    store2.set_next_join_allowed_at(_utc_now() - timedelta(seconds=1))
+    r4 = await proxy2.join_tick()
+    assert r4["action"] == "joined"
+    assert len(proxy2._client.join_calls) == 1
+
+
+# ── F1: /tick burst issues a single network join ──────────────────
+@pytest.mark.asyncio
+async def test_tick_burst_within_min_delay_issues_single_join(tmp_path):
+    store = JoinStore(db_path=tmp_path / "join.db")
+    client = FakeClient()
+    proxy = _make_proxy(store, client, cap=15, min_delay=60, max_delay=60)
+    proxy.enqueue_targets([f"@c{i}" for i in range(30)])
+
+    results = [await proxy.join_tick() for _ in range(30)]
+    joined = [r for r in results if r["action"] == "joined"]
+    paced = [r for r in results if r.get("reason") == "pacing"]
+
+    # 30 rapid ticks within the pacing window → exactly ONE real join.
+    assert len(client.join_calls) == 1
+    assert len(joined) == 1
+    assert len(paced) == 29
+
+
+# ── F1 via the HTTP /v1/join/tick endpoint (no per-call sleep) ────
+@pytest.mark.asyncio
+async def test_http_tick_endpoint_burst_issues_single_join(tmp_path, monkeypatch):
+    from aiohttp.test_utils import TestClient, TestServer
+
+    import src.config as cfg
+
+    monkeypatch.setattr(cfg, "TELEGRAM_PROXY_API_KEY", "secret", raising=False)
+
+    store = JoinStore(db_path=tmp_path / "join.db")
+    client = FakeClient()
+    proxy = _make_proxy(store, client, cap=15, min_delay=60, max_delay=60)
+    proxy.enqueue_targets([f"@c{i}" for i in range(30)])
+
+    app = tp.create_app()
+    # Skip the real startup (connect to Telegram) and cleanup (disconnect the
+    # real client); inject our fake proxy directly.
+    app.on_startup.clear()
+    app.on_cleanup.clear()
+    app["proxy"] = proxy
+
+    server = TestServer(app)
+    http = TestClient(server)
+    await http.start_server()
+    try:
+        headers = {"Authorization": "Bearer secret"}
+        for _ in range(30):
+            resp = await http.post("/v1/join/tick", headers=headers)
+            assert resp.status == 200
+    finally:
+        await http.close()
+
+    assert len(client.join_calls) == 1
+
+
+# ── F2: rolling 24h cap (not a UTC calendar bucket) ───────────────
+@pytest.mark.asyncio
+async def test_rolling_window_cap_across_utc_midnight(tmp_path, monkeypatch):
+    db = tmp_path / "join.db"
+    store = JoinStore(db_path=db)
+
+    # 15 real joins at 23:59 on 2026-07-14 (just before UTC midnight).
+    t0 = datetime(2026, 7, 14, 23, 59, 0, tzinfo=timezone.utc)
+    for i in range(15):
+        store.upsert_pending(f"c{i}", "public")
+        store.commit_network_join(f"c{i}", entity_id=i + 1, ts=t0)
+
+    # 20 minutes later it is a NEW calendar day (2026-07-15) but still inside the
+    # rolling trailing 24h. A calendar bucket would reset to 0 and allow 15 more.
+    t1 = datetime(2026, 7, 15, 0, 20, 0, tzinfo=timezone.utc)
+    monkeypatch.setattr(tp, "_utc_now", lambda: t1)
+
+    client = FakeClient()
+    proxy = _make_proxy(store, client, cap=15)
+    proxy.enqueue_targets(["@fresh"])
+
+    result = await proxy.join_tick()
+    assert result["action"] == "skipped"
+    assert result["reason"] == "daily_cap_reached"
+    assert client.join_calls == []  # the 16th within 24h is refused
+
+    assert store.rolling_join_count(t1 - timedelta(hours=24)) == 15
+    # Proof the calendar bucket for the NEW day was empty (would have allowed it).
+    assert store.joined_today("2026-07-15") == 0
+
+
+# ── F3: atomic increment (rollback leaves no partial state) ───────
+class _ConnWrapper:
+    """Wrap a real sqlite connection but raise on a targeted statement, to
+    simulate a crash mid-transaction. Delegates transaction control so the real
+    connection still ROLLS BACK on the raised exception."""
+
+    def __init__(self, con: sqlite3.Connection, fail_substr: str):
+        self._con = con
+        self._fail_substr = fail_substr
+
+    def execute(self, sql, *args, **kwargs):
+        if self._fail_substr and self._fail_substr in sql:
+            raise sqlite3.OperationalError("simulated crash mid-transaction")
+        return self._con.execute(sql, *args, **kwargs)
+
+    def __enter__(self):
+        self._con.__enter__()
+        return self  # so `con.execute(...)` inside the with-block hits us
+
+    def __exit__(self, *exc):
+        return self._con.__exit__(*exc)
+
+    def __getattr__(self, name):
+        return getattr(self._con, name)
+
+
+def test_commit_network_join_is_atomic_and_durable(tmp_path):
+    db = tmp_path / "join.db"
+    store = JoinStore(db_path=db)
+    store.upsert_pending("a", "public")
+
+    # Simulate a crash between the network join and the status-commit: force the
+    # rolling-window INSERT to fail mid-transaction.
+    real_connect = JoinStore._connect.__get__(store, JoinStore)
+    store._connect = lambda: _ConnWrapper(real_connect(), "join_events")
+    with pytest.raises(sqlite3.OperationalError):
+        store.commit_network_join("a", entity_id=1)
+
+    # Nothing partial persisted: a fresh store (restart) sees the row still
+    # pending, the daily counter untouched, and NO rolling event.
+    store2 = JoinStore(db_path=db)
+    assert store2.count_by_status().get("pending") == 1
+    assert store2.count_by_status().get("joined") is None
+    assert store2.joined_today("2026-07-14") == 0
+    assert store2.rolling_join_count(_utc_now() - timedelta(hours=24)) == 0
+
+    # A clean commit records mark + counter + rolling ts atomically and durably.
+    store2.commit_network_join("a", entity_id=1)
+    store3 = JoinStore(db_path=db)
+    assert store3.count_by_status().get("joined") == 1
+    assert store3.rolling_join_count(_utc_now() - timedelta(hours=24)) == 1
+
+
+@pytest.mark.asyncio
+async def test_crash_before_commit_does_not_allow_cap_plus_one(tmp_path):
+    """cap real joins then a simulated restart: the rolling counter is durable so
+    the (cap+1)th join is refused (no cap+1 real joins slip through a crash)."""
+    db = tmp_path / "join.db"
+    store = JoinStore(db_path=db)
+    client = FakeClient()
+    proxy = _make_proxy(store, client, cap=2)
+    proxy.enqueue_targets(["@a", "@b", "@c"])
+
+    assert (await proxy.join_tick())["action"] == "joined"
+    assert (await proxy.join_tick())["action"] == "joined"
+
+    # Restart: brand-new store/proxy on the same db must still see the count.
+    store2 = JoinStore(db_path=db)
+    proxy2 = _make_proxy(store2, FakeClient(), cap=2)
+    r3 = await proxy2.join_tick()
+    assert r3["action"] == "skipped"
+    assert r3["reason"] == "daily_cap_reached"
+    assert proxy2._client.join_calls == []
+
+
+# ── F4: transient errors retry (bounded), then terminal ───────────
+@pytest.mark.asyncio
+async def test_transient_error_retries_then_terminal(tmp_path):
+    store = JoinStore(db_path=tmp_path / "join.db")
+    client = FakeClient()
+    # A transient failure on every attempt (network blip, not a terminal invite
+    # error) — must NOT be dropped permanently on the first failure.
+    client.raise_on_join["a"] = ConnectionError("temporary network blip")
+    proxy = _make_proxy(store, client, cap=15, max_attempts=3, retry_backoff=0)
+    proxy.enqueue_targets(["@a"])
+
+    r1 = await proxy.join_tick()
+    assert r1["action"] == "retry"
+    # Still re-offered by next_candidate (backoff=0 ⇒ retry_at already elapsed).
+    assert store.next_candidate() is not None
+
+    r2 = await proxy.join_tick()
+    assert r2["action"] == "retry"
+    assert store.next_candidate() is not None
+
+    # Third attempt hits the attempt cap → terminal 'failed', no longer offered.
+    r3 = await proxy.join_tick()
+    assert r3["action"] == "failed"
+    assert store.next_candidate() is None
+    assert store.count_by_status().get("failed") == 1
+
+    # All three attempts actually reached the network (target not silently dropped).
+    assert len(client.join_calls) == 3
+
+    # Terminal failures are surfaced in status so the drop is visible.
+    st = proxy.join_status()
+    assert any(row["target"] == "a" for row in st["failed"])
+
+
+@pytest.mark.asyncio
+async def test_terminal_invite_error_is_not_retried(tmp_path):
+    """A terminal InviteHashExpired stays 'dead' — it must not enter the retry
+    loop introduced for transient errors."""
+    store = JoinStore(db_path=tmp_path / "join.db")
+    client = FakeClient()
+    client.raise_on_join["DEADHASH"] = InviteHashExpiredError(request=None)
+    proxy = _make_proxy(store, client, cap=15, max_attempts=3, retry_backoff=0)
+    proxy.enqueue_targets(["t.me/+DEADHASH"])
+
+    r1 = await proxy.join_tick()
+    assert r1["action"] == "dead"
+    assert store.next_candidate() is None
+    assert store.count_by_status().get("dead") == 1
+    st = proxy.join_status()
+    assert any(row["target"] == "+DEADHASH" for row in st["dead"])

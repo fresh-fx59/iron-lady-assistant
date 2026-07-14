@@ -371,6 +371,16 @@ TELEGRAM_JOIN_MAX_DELAY_SECONDS: float = max(
 TELEGRAM_JOIN_IDLE_POLL_SECONDS: float = max(
     5.0, float(os.getenv("TELEGRAM_JOIN_IDLE_POLL_SECONDS", "60"))
 )
+# Transient-error retry: a network blip / one-off RPCError / temporary resolve
+# failure keeps a target retryable (with an exponential backoff) up to this many
+# attempts before it is marked terminally 'failed' — so a blip never silently
+# drops a target from the campaign. Backoff base doubles per attempt (capped 1h).
+TELEGRAM_JOIN_MAX_ATTEMPTS: int = max(
+    1, int(os.getenv("TELEGRAM_JOIN_MAX_ATTEMPTS", "5"))
+)
+TELEGRAM_JOIN_RETRY_BACKOFF_SECONDS: float = max(
+    0.0, float(os.getenv("TELEGRAM_JOIN_RETRY_BACKOFF_SECONDS", "300"))
+)
 # Background join loop. Harmless when the queue is empty (it just idles); it only
 # ever acts on targets an operator has explicitly enqueued.
 TELEGRAM_JOIN_LOOP_ENABLED: bool = (

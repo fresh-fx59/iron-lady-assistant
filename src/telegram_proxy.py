@@ -113,14 +113,24 @@ class JoinStore:
     """SQLite-backed, fully-resumable persistence for the paced join queue.
 
     Mirrors the ``TelegramDigestStore`` conventions (same ``memory/`` dir, same
-    connect/init pattern). Holds three tables:
+    connect/init pattern). Holds four tables:
 
-      * ``joins``               — one row per target, its status + outcome.
-      * ``join_daily_counter``  — per-UTC-day count of join *actions* actually
-        issued to Telegram. This is what enforces the daily cap and it PERSISTS,
-        so a restart can never reset the day's count and over-join.
+      * ``joins``               — one row per target, its status + outcome. Carries
+        an ``attempts`` counter and ``retry_at`` backoff so a TRANSIENT failure is
+        retried (bounded) rather than permanently dropped.
+      * ``join_events``         — one row per REAL network-join action (Unix-epoch
+        ts). The ROLLING trailing-24h count over this table is the AUTHORITATIVE
+        cap; a per-calendar-day bucket allowed ~2× cap across a UTC-midnight
+        rollover, so this replaces it for enforcement.
+      * ``join_daily_counter``  — per-UTC-day count, kept only as a secondary
+        DISPLAY metric now that the rolling window enforces the cap.
       * ``join_meta``           — small key/value store for the global
-        ``floodwait_until`` gate and the ``channels_too_much`` stop flag.
+        ``floodwait_until`` gate, the durable ``next_join_allowed_at`` pacing
+        deadline, and the ``channels_too_much`` stop flag.
+
+    Ban-safety invariant: the count + mark + rolling-ts for a real join are written
+    in ONE transaction (``commit_network_join``), so a crash can never keep the
+    real join while dropping the count.
     """
 
     def __init__(self, db_path: Path | None = None) -> None:
@@ -145,10 +155,18 @@ class JoinStore:
                     error TEXT,
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL,
-                    joined_at TEXT
+                    joined_at TEXT,
+                    attempts INTEGER NOT NULL DEFAULT 0,
+                    retry_at TEXT
                 )
                 """
             )
+            # Additive migration for dbs created before the transient-retry fix.
+            cols = {row["name"] for row in con.execute("PRAGMA table_info(joins)").fetchall()}
+            if "attempts" not in cols:
+                con.execute("ALTER TABLE joins ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0")
+            if "retry_at" not in cols:
+                con.execute("ALTER TABLE joins ADD COLUMN retry_at TEXT")
             con.execute(
                 "CREATE INDEX IF NOT EXISTS idx_joins_status ON joins(status, created_at)"
             )
@@ -159,6 +177,21 @@ class JoinStore:
                     count INTEGER NOT NULL DEFAULT 0
                 )
                 """
+            )
+            # ROLLING-window ledger: one row per REAL network-join action, stored as
+            # a Unix epoch (REAL) so the trailing-24h cap is a numeric comparison
+            # (no ISO string-sort pitfalls) and cannot be reset by a UTC-midnight
+            # rollover the way a per-calendar-day bucket can.
+            con.execute(
+                """
+                CREATE TABLE IF NOT EXISTS join_events (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    ts REAL NOT NULL
+                )
+                """
+            )
+            con.execute(
+                "CREATE INDEX IF NOT EXISTS idx_join_events_ts ON join_events(ts)"
             )
             con.execute(
                 """
@@ -213,18 +246,80 @@ class JoinStore:
             )
 
     def next_candidate(self) -> dict[str, Any] | None:
-        """Return the next retryable target (pending first, then floodwait)."""
+        """Return the next retryable target.
+
+        Ordering: fresh ``pending`` first, then ``floodwait`` (cleared by the
+        account-wide gate) and ``retry`` rows whose per-target backoff has
+        elapsed. A ``retry`` row still inside its backoff window is skipped so a
+        transient blip does not get hammered.
+        """
+        now_iso = _isoformat(_utc_now())
         with self._connect() as con:
             row = con.execute(
                 """
-                SELECT target, kind, status, entity_id
+                SELECT target, kind, status, entity_id, attempts
                 FROM joins
                 WHERE status IN ('pending', 'floodwait')
+                   OR (status = 'retry' AND (retry_at IS NULL OR retry_at <= ?))
                 ORDER BY (status = 'pending') DESC, created_at ASC
                 LIMIT 1
-                """
+                """,
+                (now_iso,),
             ).fetchone()
         return dict(row) if row is not None else None
+
+    def targets_by_status(self, status: str, limit: int = 50) -> list[dict[str, Any]]:
+        """Rows in a given terminal/retry status — surfaced in join_status so
+        dropped or retrying targets are visible, not silently lost."""
+        with self._connect() as con:
+            rows = con.execute(
+                """
+                SELECT target, kind, attempts, error, updated_at
+                FROM joins WHERE status = ?
+                ORDER BY updated_at DESC LIMIT ?
+                """,
+                (status, limit),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def mark_transient_retry(
+        self,
+        target: str,
+        *,
+        error: str | None,
+        max_attempts: int,
+        backoff_seconds: float,
+    ) -> tuple[str, int]:
+        """Bump the attempt counter for a TRANSIENT failure and keep the target
+        retryable with an (exponential) backoff until the cap is reached, then
+        mark it terminally ``failed``. Returns ``(status, attempts)``.
+
+        This is what stops a one-off network blip / RPCError from permanently
+        dropping a target from the campaign.
+        """
+        now = _utc_now()
+        with self._connect() as con:
+            row = con.execute(
+                "SELECT attempts FROM joins WHERE target = ?", (target,)
+            ).fetchone()
+            attempts = (int(row["attempts"]) if row and row["attempts"] is not None else 0) + 1
+            if attempts >= max_attempts:
+                status = "failed"
+                retry_at = None
+            else:
+                status = "retry"
+                delay = backoff_seconds * (2 ** (attempts - 1))
+                delay = min(delay, 3600.0)  # cap the backoff at 1h
+                retry_at = _isoformat(now + timedelta(seconds=delay))
+            con.execute(
+                """
+                UPDATE joins
+                SET status = ?, updated_at = ?, error = ?, attempts = ?, retry_at = ?
+                WHERE target = ?
+                """,
+                (status, _isoformat(now), error, attempts, retry_at, target),
+            )
+        return status, attempts
 
     def pending_targets(self, limit: int = 20) -> list[str]:
         with self._connect() as con:
@@ -277,6 +372,58 @@ class JoinStore:
             ).fetchone()
         return int(row["count"]) if row is not None else 0
 
+    # ── rolling-window cap (AUTHORITATIVE; Telegram limits are ROLLING) ──
+    def rolling_join_count(self, since: datetime) -> int:
+        """Count REAL network joins with ts strictly after ``since``. Call with
+        ``now - 24h`` to enforce the trailing-24h cap. This cannot be reset by a
+        UTC-midnight rollover the way the per-calendar-day counter can."""
+        with self._connect() as con:
+            row = con.execute(
+                "SELECT COUNT(*) AS n FROM join_events WHERE ts > ?",
+                (since.timestamp(),),
+            ).fetchone()
+        return int(row["n"] or 0)
+
+    def commit_network_join(
+        self,
+        target: str,
+        *,
+        status: str = "joined",
+        entity_id: int | None = None,
+        error: str | None = None,
+        joined: bool = True,
+        ts: datetime | None = None,
+    ) -> None:
+        """Record a REAL network-join action ATOMICALLY in ONE transaction:
+        mark the target row, append the rolling-window timestamp, and bump the
+        per-day display counter. Because the count is committed in the same
+        transaction as the mark, a crash can never keep the real join while
+        dropping the count (which would let the account do cap+1 real joins)."""
+        now = ts or _utc_now()
+        now_iso = _isoformat(now)
+        day = now.strftime("%Y-%m-%d")
+        with self._connect() as con:
+            con.execute(
+                """
+                UPDATE joins
+                SET status = ?,
+                    updated_at = ?,
+                    entity_id = COALESCE(?, entity_id),
+                    error = ?,
+                    joined_at = CASE WHEN ? THEN ? ELSE joined_at END
+                WHERE target = ?
+                """,
+                (status, now_iso, entity_id, error, 1 if joined else 0, now_iso, target),
+            )
+            con.execute("INSERT INTO join_events(ts) VALUES (?)", (now.timestamp(),))
+            con.execute(
+                """
+                INSERT INTO join_daily_counter(day, count) VALUES (?, 1)
+                ON CONFLICT(day) DO UPDATE SET count = count + 1
+                """,
+                (day,),
+            )
+
     # ── meta (floodwait gate + stop flag) ─────────────────────────
     def set_meta(self, key: str, value: str | None) -> None:
         with self._connect() as con:
@@ -300,6 +447,19 @@ class JoinStore:
 
     def get_floodwait_until(self) -> datetime | None:
         raw = self.get_meta("floodwait_until")
+        if not raw:
+            return None
+        try:
+            return datetime.fromisoformat(raw)
+        except ValueError:
+            return None
+
+    # ── durable inter-join pacing (survives restart, jitter and all) ──
+    def set_next_join_allowed_at(self, until: datetime | None) -> None:
+        self.set_meta("next_join_allowed_at", _isoformat(until) if until else None)
+
+    def get_next_join_allowed_at(self) -> datetime | None:
+        raw = self.get_meta("next_join_allowed_at")
         if not raw:
             return None
         try:
@@ -380,6 +540,10 @@ class TelegramProxy:
         self._join_min_delay = config.TELEGRAM_JOIN_MIN_DELAY_SECONDS
         self._join_max_delay = config.TELEGRAM_JOIN_MAX_DELAY_SECONDS
         self._join_idle_poll = config.TELEGRAM_JOIN_IDLE_POLL_SECONDS
+        # Transient-error retry: keep a target retryable (with backoff) up to this
+        # many attempts before giving up, so a network blip never silently drops it.
+        self._join_max_attempts = config.TELEGRAM_JOIN_MAX_ATTEMPTS
+        self._join_retry_backoff = config.TELEGRAM_JOIN_RETRY_BACKOFF_SECONDS
 
     def _acquire_session_lock(self) -> None:
         """Take an exclusive, non-blocking OS lock on the session lockfile.
@@ -714,15 +878,25 @@ class TelegramProxy:
 
     def join_status(self) -> dict[str, Any]:
         store = self._get_join_store()
-        day = _utc_now().strftime("%Y-%m-%d")
+        now = _utc_now()
+        day = now.strftime("%Y-%m-%d")
         floodwait_until = store.get_floodwait_until()
+        next_allowed = store.get_next_join_allowed_at()
         return {
             "counts_by_status": store.count_by_status(),
+            # Rolling trailing-24h count is what the cap is enforced on.
+            "joined_last_24h": store.rolling_join_count(now - timedelta(hours=24)),
+            # Per-calendar-day count kept ONLY as a secondary display metric.
             "joined_today": store.joined_today(day),
             "daily_cap": self._daily_cap,
             "floodwait_until": _isoformat(floodwait_until),
+            "next_join_allowed_at": _isoformat(next_allowed),
             "channels_too_much": store.get_meta("channels_too_much") == "1",
             "next_pending": store.pending_targets(limit=20),
+            # Surface non-success outcomes so dropped/retrying targets are visible.
+            "retry": store.targets_by_status("retry", limit=50),
+            "failed": store.targets_by_status("failed", limit=50),
+            "dead": store.targets_by_status("dead", limit=50),
         }
 
     async def join_tick(self) -> dict[str, Any]:
@@ -738,7 +912,21 @@ class TelegramProxy:
     async def _run_join_pass_locked(self) -> dict[str, Any]:
         store = self._get_join_store()
         now = _utc_now()
-        day = now.strftime("%Y-%m-%d")
+
+        # ── GATE 0: DURABLE inter-join pacing. The randomized spacing between
+        # joins is PERSISTED (next_join_allowed_at, jitter and all), so neither a
+        # process restart running a pass immediately on resume NOR a burst of
+        # rapid /v1/join/tick calls can fire joins back-to-back. Checked first,
+        # before any network work, so both the loop and /tick honour it.
+        next_allowed = store.get_next_join_allowed_at()
+        if next_allowed is not None and now < next_allowed:
+            return {
+                "action": "skipped",
+                "reason": "pacing",
+                "network": False,
+                "next_join_allowed_at": _isoformat(next_allowed),
+                "wait_s": max(0.0, (next_allowed - now).total_seconds()),
+            }
 
         # ── GATE 1: FloodWait. Re-checked before EVERY join; we NEVER retry
         # before the window elapses (an early retry escalates to PeerFloodError =
@@ -756,15 +944,17 @@ class TelegramProxy:
         if store.get_meta("channels_too_much") == "1":
             return {"action": "skipped", "reason": "channels_too_much", "network": False}
 
-        # ── GATE 3: DAILY CAP. Counted per UTC day and PERSISTED, so a restart
-        # cannot reset it and over-join. Checked before EVERY join.
-        joined_today = store.joined_today(day)
-        if joined_today >= self._daily_cap:
+        # ── GATE 3: ROLLING DAILY CAP. Telegram limits are ROLLING, not calendar
+        # — count real network joins in the trailing 24h and refuse at the cap.
+        # This is PERSISTED, so a restart cannot reset it, and a window straddling
+        # UTC midnight cannot do 2× cap (which a per-calendar-day bucket allowed).
+        joined_window = store.rolling_join_count(now - timedelta(hours=24))
+        if joined_window >= self._daily_cap:
             return {
                 "action": "skipped",
                 "reason": "daily_cap_reached",
                 "network": False,
-                "joined_today": joined_today,
+                "joined_last_24h": joined_window,
                 "daily_cap": self._daily_cap,
             }
 
@@ -776,7 +966,15 @@ class TelegramProxy:
         if candidate is None:
             return {"action": "idle", "reason": "no_pending", "network": False}
 
-        return await self._attempt_join(candidate, day)
+        result = await self._attempt_join(candidate)
+        # A network request actually reached Telegram → arm the DURABLE pacing
+        # deadline (persisted jitter) so the next pass — loop or /tick, even after
+        # a restart — waits out the full random gap before the next join.
+        if result.get("network"):
+            store.set_next_join_allowed_at(
+                _utc_now() + timedelta(seconds=self._join_delay_seconds())
+            )
+        return result
 
     async def _ensure_dialog_preload(self, *, force: bool = False) -> None:
         if self._joined_dialog_ids is not None and not force:
@@ -814,23 +1012,24 @@ class TelegramProxy:
             self._joined_dialog_ids = set()
         self._joined_dialog_ids.add(int(entity_id))
 
-    async def _attempt_join(self, candidate: dict[str, Any], day: str) -> dict[str, Any]:
+    async def _attempt_join(self, candidate: dict[str, Any]) -> dict[str, Any]:
         target = str(candidate["target"])
         kind = str(candidate["kind"])
         store = self._get_join_store()
         try:
             if kind == "public":
-                return await self._join_public(target, day)
+                return await self._join_public(target)
             if kind == "private":
-                return await self._join_private(target, day)
+                return await self._join_private(target)
             if kind == "linked":
-                return await self._join_linked(target, day)
+                return await self._join_linked(target)
+            # Unknown kind is a TERMINAL programming/data error, not transient.
             store.mark(target, "failed", error=f"unknown kind {kind}")
             return {"action": "failed", "target": target, "network": False, "error": "unknown kind"}
         except Exception as exc:  # noqa: BLE001 - dispatched by type below
-            return self._handle_join_error(target, exc, day)
+            return self._handle_join_error(target, exc)
 
-    async def _join_public(self, target: str, day: str) -> dict[str, Any]:
+    async def _join_public(self, target: str) -> dict[str, Any]:
         store = self._get_join_store()
         name = parse_public_username(target)
         entity = await self._get_entity_for_join(name)
@@ -840,14 +1039,14 @@ class TelegramProxy:
             return {"action": "joined", "target": target, "entity_id": entity_id,
                     "already": True, "network": False}
         await self._client_call(self._join_channel_request(entity))
-        store.increment_daily(day)
-        store.mark(target, "joined", entity_id=entity_id, joined=True)
+        # Count + mark + rolling-ts recorded ATOMICALLY (crash cannot drop the count).
+        store.commit_network_join(target, entity_id=entity_id)
         self._remember_joined(entity_id)
         linked = await self._discover_and_enqueue_linked(entity)
         return {"action": "joined", "target": target, "entity_id": entity_id,
                 "network": True, "linked_enqueued": linked}
 
-    async def _join_private(self, target: str, day: str) -> dict[str, Any]:
+    async def _join_private(self, target: str) -> dict[str, Any]:
         store = self._get_join_store()
         invite_hash = parse_invite_hash(target)
         info = await self._client_call(self._check_chat_invite_request(invite_hash))
@@ -863,10 +1062,9 @@ class TelegramProxy:
             return {"action": "joined", "target": target, "entity_id": entity_id,
                     "already": True, "network": False}
         result = await self._client_call(self._import_chat_invite_request(invite_hash))
-        store.increment_daily(day)
         chat = self._first_chat(result)
         entity_id = int(getattr(chat, "id", 0)) or None
-        store.mark(target, "joined", entity_id=entity_id, joined=True)
+        store.commit_network_join(target, entity_id=entity_id)
         self._remember_joined(entity_id)
         linked = None
         if chat is not None:
@@ -874,7 +1072,7 @@ class TelegramProxy:
         return {"action": "joined", "target": target, "entity_id": entity_id,
                 "network": True, "linked_enqueued": linked}
 
-    async def _join_linked(self, target: str, day: str) -> dict[str, Any]:
+    async def _join_linked(self, target: str) -> dict[str, Any]:
         store = self._get_join_store()
         linked_id = int(target.split(":", 1)[1])
         entity = self._entity_cache.get(("linked_join", linked_id))
@@ -886,8 +1084,7 @@ class TelegramProxy:
             return {"action": "joined", "target": target, "entity_id": entity_id,
                     "already": True, "network": False}
         await self._client_call(self._join_channel_request(entity))
-        store.increment_daily(day)
-        store.mark(target, "joined", entity_id=entity_id, joined=True)
+        store.commit_network_join(target, entity_id=entity_id)
         self._remember_joined(entity_id)
         return {"action": "joined", "target": target, "entity_id": entity_id, "network": True}
 
@@ -920,7 +1117,7 @@ class TelegramProxy:
         self._get_join_store().upsert_pending(f"id:{linked_id}", "linked")
         return linked_id
 
-    def _handle_join_error(self, target: str, exc: Exception, day: str) -> dict[str, Any]:
+    def _handle_join_error(self, target: str, exc: Exception) -> dict[str, Any]:
         from telethon.errors import (
             ChannelsTooMuchError,
             FloodWaitError,
@@ -932,10 +1129,9 @@ class TelegramProxy:
 
         store = self._get_join_store()
         # Already a participant → treat as success. A join request DID reach
-        # Telegram, so it counts toward today's cap.
+        # Telegram, so it counts toward the rolling cap (recorded atomically).
         if isinstance(exc, UserAlreadyParticipantError):
-            store.increment_daily(day)
-            store.mark(target, "joined", joined=True)
+            store.commit_network_join(target, status="joined", joined=True)
             return {"action": "joined", "target": target,
                     "already_participant": True, "network": True}
         # FloodWait → persist the deadline and STOP. Never retry before it passes.
@@ -951,23 +1147,40 @@ class TelegramProxy:
             store.set_meta("channels_too_much", "1")
             store.mark(target, "toomuch", error="channels too much")
             return {"action": "channels_too_much", "target": target, "network": False}
-        # Admin-approval invite links: request sent, awaiting approval.
+        # Admin-approval invite links: request sent, awaiting approval. The
+        # request reached Telegram, so it counts (recorded atomically).
         if isinstance(exc, InviteRequestSentError):
-            store.increment_daily(day)
-            store.mark(target, "request_sent", error="join request sent (awaiting approval)")
+            store.commit_network_join(
+                target, status="request_sent", joined=False,
+                error="join request sent (awaiting approval)",
+            )
             return {"action": "request_sent", "target": target, "network": True}
-        # Dead invite links.
+        # ── TERMINAL: dead invite links. Never retried.
         if isinstance(exc, (InviteHashExpiredError, InviteHashInvalidError)):
             store.mark(target, "dead", error=str(exc))
             return {"action": "dead", "target": target, "network": False, "error": str(exc)}
-        # Anything else → failed (kept in queue history, not retried automatically).
-        store.mark(target, "failed", error=str(exc))
-        return {"action": "failed", "target": target, "network": False, "error": str(exc)}
+        # ── TRANSIENT: network blip / one-off RPCError / temporary resolve
+        # failure. Keep the target RETRYABLE with a backoff + attempt counter so a
+        # transient error never silently drops it from the 63-chat campaign; it
+        # terminalizes to 'failed' only once the attempt cap is reached. The
+        # network request likely reached Telegram, so mark it as a network action
+        # → the pacing gate spaces the next attempt.
+        status, attempts = store.mark_transient_retry(
+            target,
+            error=str(exc),
+            max_attempts=self._join_max_attempts,
+            backoff_seconds=self._join_retry_backoff,
+        )
+        action = "retry" if status == "retry" else "failed"
+        return {"action": action, "target": target, "network": True,
+                "error": str(exc), "attempts": attempts}
 
     async def _join_loop(self) -> None:
-        """Background driver: run one pass, then sleep. The 60–300s randomized
-        sleep between actual joins is the ban-safety pacing; idle/blocked passes
-        poll on a shorter interval so a cleared FloodWait resumes promptly."""
+        """Background driver: run one pass, then sleep until the next action is
+        due. Pacing between real joins is DURABLE (persisted next_join_allowed_at),
+        so the loop sleeps until that deadline — bounded to a 300s poll so a
+        cleared FloodWait / pacing window resumes promptly — instead of running a
+        pass immediately on resume (which would burst joins across restarts)."""
         logger.info("telegram-proxy join loop started")
         while True:
             try:
@@ -977,11 +1190,22 @@ class TelegramProxy:
             except Exception:  # pragma: no cover - defensive
                 logger.exception("join pass failed")
                 result = {"action": "error", "network": False}
-            if result.get("network"):
-                delay = self._join_delay_seconds()
-            else:
-                delay = self._join_idle_poll
-            await asyncio.sleep(delay)
+            delay = self._next_loop_delay(result)
+            await asyncio.sleep(max(1.0, delay))
+
+    def _next_loop_delay(self, result: dict[str, Any]) -> float:
+        """How long the background loop sleeps after a pass. Honors the DURABLE
+        pacing deadline (bounded poll) so spacing is identical across restarts."""
+        store = self._get_join_store()
+        next_allowed = store.get_next_join_allowed_at()
+        now = _utc_now()
+        if next_allowed is not None and next_allowed > now:
+            return min((next_allowed - now).total_seconds(), 300.0)
+        if result.get("network"):
+            # Defensive: a network action with no persisted deadline (should not
+            # happen) still spaces the next attempt.
+            return self._join_delay_seconds()
+        return self._join_idle_poll
 
 
 def _check_auth(request: web.Request) -> None:

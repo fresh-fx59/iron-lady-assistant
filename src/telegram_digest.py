@@ -48,6 +48,36 @@ def _peer_key(kind: str, entity_id: int) -> str:
     return f"{kind}:{entity_id}"
 
 
+def lead_message_link(peer_key: str, message_id: int) -> str:
+    """Derive a ``t.me`` deep link for a lead-group message from its ``peer_key``.
+
+    Lead groups are private supergroups the parser account joined; they carry no
+    public username, so the only stable deep link is the internal form
+    ``https://t.me/c/<internal_id>/<message_id>`` where ``internal_id`` is the
+    entity id with the ``-100`` marked-channel prefix stripped (Telethon stores
+    the raw positive id, but we normalise a marked id too for safety). Returns
+    ``''`` when the ``peer_key`` is not derivable (malformed / non-numeric id).
+    """
+    if not peer_key or ":" not in peer_key:
+        return ""
+    _, _, id_part = peer_key.rpartition(":")
+    id_part = id_part.strip()
+    if not id_part:
+        return ""
+    # Normalise to the positive internal id used in t.me/c/<id>/<msg> deep links.
+    if id_part.startswith("-100"):
+        internal = id_part[len("-100"):]
+    else:
+        internal = id_part.lstrip("-")
+    if not internal.isdigit():
+        return ""
+    try:
+        msg = int(message_id)
+    except (TypeError, ValueError):
+        return ""
+    return f"https://t.me/c/{internal}/{msg}"
+
+
 def _truncate(text: str, limit: int) -> str:
     compact = " ".join((text or "").split())
     if len(compact) <= limit:
@@ -64,6 +94,16 @@ class TelegramDigestStore:
     def _connect(self) -> sqlite3.Connection:
         con = sqlite3.connect(self._db_path)
         con.row_factory = sqlite3.Row
+        # This db is now shared by TWO processes: the M2 collect timer (writes
+        # digest_messages every 30m) and the proxy (reads the lead-candidate
+        # feed AND writes the lead_senders identity cache). Without these two
+        # PRAGMAs a reader/writer that meets a held lock raises "database is
+        # locked" immediately. busy_timeout makes it wait for the lock (up to 5s)
+        # instead; WAL lets readers and a writer coexist. Both are cheap and set
+        # once per connection (journal_mode=WAL is persisted in the db header, so
+        # re-issuing it is a no-op).
+        con.execute("PRAGMA busy_timeout=5000")
+        con.execute("PRAGMA journal_mode=WAL")
         return con
 
     def _init_db(self) -> None:
@@ -121,6 +161,22 @@ class TelegramDigestStore:
             )
             con.execute(
                 "CREATE INDEX IF NOT EXISTS idx_digest_messages_peer_time ON digest_messages(peer_key, posted_at DESC)"
+            )
+            # Sender-identity cache for the lead scorer. Additive CREATE TABLE IF
+            # NOT EXISTS (same pattern as the join tables) — the proxy resolves a
+            # flagged lead's sender via get_entity ONCE and caches it here so a
+            # re-scan never re-hits Telegram. Kept in the digest db alongside the
+            # lead messages it annotates.
+            con.execute(
+                """
+                CREATE TABLE IF NOT EXISTS lead_senders (
+                    sender_id INTEGER PRIMARY KEY,
+                    username TEXT,
+                    name TEXT,
+                    is_bot INTEGER,
+                    resolved_at TEXT
+                )
+                """
             )
 
     def upsert_source(
@@ -214,6 +270,93 @@ class TelegramDigestStore:
         with self._connect() as con:
             row = con.execute("SELECT COUNT(*) AS count FROM digest_sources").fetchone()
             return int(row["count"] or 0)
+
+    # ── lead-candidate feed (a read; consumed by the scorer) ──────────
+    def lead_candidates(self, *, since_id: int = 0, limit: int = 500) -> list[dict[str, Any]]:
+        """Return lead-group messages with a resolvable sender, after ``since_id``.
+
+        The stable incremental cursor is ``digest_messages.rowid`` (a plain rowid
+        table — the composite PK does not suppress it). Only sources tagged
+        ``role='lead'`` and messages with a non-NULL ``sender_id`` are returned,
+        ordered by rowid ASC so the caller can page forward by feeding back the
+        last ``id`` it saw. This method only reads; it opens no Telethon client.
+        (Note the store as a whole is NOT read-only — ``upsert_lead_sender``
+        writes the ``lead_senders`` cache.)
+        """
+        since_id = max(0, int(since_id))
+        limit = max(1, min(2000, int(limit)))
+        with self._connect() as con:
+            rows = con.execute(
+                """
+                SELECT m.rowid AS id, m.peer_key AS peer_key, s.title AS chat_title,
+                       m.message_id AS message_id, m.posted_at AS posted_at,
+                       m.sender_id AS sender_id, m.text AS text
+                FROM digest_messages m
+                JOIN digest_sources s ON s.peer_key = m.peer_key
+                WHERE s.role = ? AND m.sender_id IS NOT NULL AND m.rowid > ?
+                ORDER BY m.rowid ASC
+                LIMIT ?
+                """,
+                (LEAD_SOURCE_ROLE, since_id, limit),
+            ).fetchall()
+        items: list[dict[str, Any]] = []
+        for row in rows:
+            peer_key = str(row["peer_key"])
+            message_id = int(row["message_id"])
+            items.append(
+                {
+                    "id": int(row["id"]),
+                    "peer_key": peer_key,
+                    "chat_title": str(row["chat_title"] or ""),
+                    "message_id": message_id,
+                    "posted_at": str(row["posted_at"] or ""),
+                    "sender_id": int(row["sender_id"]),
+                    "text": str(row["text"] or ""),
+                    "link": lead_message_link(peer_key, message_id),
+                }
+            )
+        return items
+
+    # ── lead-sender identity cache ────────────────────────────────────
+    def get_lead_sender(self, sender_id: int) -> dict[str, Any] | None:
+        with self._connect() as con:
+            row = con.execute(
+                "SELECT sender_id, username, name, is_bot, resolved_at "
+                "FROM lead_senders WHERE sender_id = ?",
+                (int(sender_id),),
+            ).fetchone()
+        if row is None:
+            return None
+        return {
+            "sender_id": int(row["sender_id"]),
+            "username": row["username"],
+            "name": str(row["name"] or ""),
+            "is_bot": bool(row["is_bot"]),
+            "resolved_at": row["resolved_at"],
+        }
+
+    def upsert_lead_sender(
+        self,
+        *,
+        sender_id: int,
+        username: str | None,
+        name: str,
+        is_bot: bool,
+    ) -> None:
+        now = _isoformat(_utc_now())
+        with self._connect() as con:
+            con.execute(
+                """
+                INSERT INTO lead_senders(sender_id, username, name, is_bot, resolved_at)
+                VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(sender_id) DO UPDATE SET
+                    username = excluded.username,
+                    name = excluded.name,
+                    is_bot = excluded.is_bot,
+                    resolved_at = excluded.resolved_at
+                """,
+                (int(sender_id), username, name, 1 if is_bot else 0, now),
+            )
 
     def list_sources(self, roles: Sequence[str] | None = None) -> list[SourceRecord]:
         query = (

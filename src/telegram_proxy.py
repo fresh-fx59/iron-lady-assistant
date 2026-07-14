@@ -5,8 +5,10 @@ import fcntl
 import json
 import logging
 import os
+import random
+import sqlite3
 from dataclasses import asdict, dataclass
-from datetime import timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -20,6 +22,290 @@ from .telegram_proxy_crypto import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _utc_now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def _isoformat(value: datetime | None) -> str | None:
+    if value is None:
+        return None
+    return value.astimezone(timezone.utc).isoformat()
+
+
+# ── Join-target parsing ───────────────────────────────────────────
+# A target can arrive in many shapes; we normalise it to a canonical primary key
+# so re-enqueuing the same chat in a different shape is idempotent (one DB row).
+#   public  → bare, lower-cased username        ("foo")
+#   private → "+" + case-sensitive invite hash  ("+ABCdef")   (hashes are base64url)
+#   linked  → "id:<entity_id>"   (discovered discussion group behind a channel)
+_TME_HOSTS = ("t.me/", "telegram.me/", "telesco.pe/")
+
+
+def _strip_scheme_host(raw: str) -> str:
+    """Drop a leading ``https://``/``http://`` scheme and a ``t.me/`` style host.
+
+    Case-insensitive on scheme/host only — the remaining path (which may be a
+    case-sensitive invite hash) is returned untouched.
+    """
+    s = (raw or "").strip()
+    low = s.lower()
+    for scheme in ("https://", "http://"):
+        if low.startswith(scheme):
+            s = s[len(scheme):]
+            low = s.lower()
+            break
+    for host in _TME_HOSTS:
+        if low.startswith(host):
+            s = s[len(host):]
+            break
+    return s.strip()
+
+
+def classify_target(raw: str) -> str:
+    """Return ``"private"`` for invite-link shapes, else ``"public"``."""
+    s = (raw or "").strip().lower()
+    if "joinchat/" in s:
+        return "private"
+    if _strip_scheme_host(raw).startswith("+"):
+        return "private"
+    return "public"
+
+
+def parse_invite_hash(raw: str) -> str:
+    """Extract the invite hash from any private-link shape.
+
+    Handles ``t.me/+HASH``, ``https://t.me/+HASH``, ``t.me/joinchat/HASH``,
+    ``https://t.me/joinchat/HASH``, bare ``+HASH`` and a bare hash. Strips through
+    ``/joinchat/`` or ``+``, then drops any leading ``+``. Case is preserved
+    (invite hashes are case-sensitive).
+    """
+    s = (raw or "").strip()
+    if "/joinchat/" in s:
+        s = s.split("/joinchat/", 1)[1]
+    elif "joinchat/" in s:
+        s = s.split("joinchat/", 1)[1]
+    if "+" in s:
+        s = s.split("+", 1)[1]
+    s = s.lstrip("+").strip().strip("/")
+    # Drop any trailing path/query noise, keep the first segment.
+    s = s.split("/", 1)[0].split("?", 1)[0]
+    return s
+
+
+def parse_public_username(raw: str) -> str:
+    """Extract the bare username from any public-link shape (``@foo``/``t.me/foo``)."""
+    s = _strip_scheme_host(raw).lstrip("@").strip().strip("/")
+    s = s.split("/", 1)[0].split("?", 1)[0]
+    return s
+
+
+def normalize_target(raw: str) -> tuple[str, str]:
+    """Return ``(kind, canonical_target)`` — the stable primary key for the queue."""
+    kind = classify_target(raw)
+    if kind == "private":
+        return "private", "+" + parse_invite_hash(raw)
+    return "public", parse_public_username(raw).lower()
+
+
+class JoinStore:
+    """SQLite-backed, fully-resumable persistence for the paced join queue.
+
+    Mirrors the ``TelegramDigestStore`` conventions (same ``memory/`` dir, same
+    connect/init pattern). Holds three tables:
+
+      * ``joins``               — one row per target, its status + outcome.
+      * ``join_daily_counter``  — per-UTC-day count of join *actions* actually
+        issued to Telegram. This is what enforces the daily cap and it PERSISTS,
+        so a restart can never reset the day's count and over-join.
+      * ``join_meta``           — small key/value store for the global
+        ``floodwait_until`` gate and the ``channels_too_much`` stop flag.
+    """
+
+    def __init__(self, db_path: Path | None = None) -> None:
+        self._db_path = Path(db_path) if db_path else config.TELEGRAM_PROXY_JOIN_DB_PATH
+        self._db_path.parent.mkdir(parents=True, exist_ok=True)
+        self._init_db()
+
+    def _connect(self) -> sqlite3.Connection:
+        con = sqlite3.connect(self._db_path)
+        con.row_factory = sqlite3.Row
+        return con
+
+    def _init_db(self) -> None:
+        with self._connect() as con:
+            con.execute(
+                """
+                CREATE TABLE IF NOT EXISTS joins (
+                    target TEXT PRIMARY KEY,
+                    kind TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    entity_id INTEGER,
+                    error TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    joined_at TEXT
+                )
+                """
+            )
+            con.execute(
+                "CREATE INDEX IF NOT EXISTS idx_joins_status ON joins(status, created_at)"
+            )
+            con.execute(
+                """
+                CREATE TABLE IF NOT EXISTS join_daily_counter (
+                    day TEXT PRIMARY KEY,
+                    count INTEGER NOT NULL DEFAULT 0
+                )
+                """
+            )
+            con.execute(
+                """
+                CREATE TABLE IF NOT EXISTS join_meta (
+                    key TEXT PRIMARY KEY,
+                    value TEXT
+                )
+                """
+            )
+
+    # ── queue mutations ───────────────────────────────────────────
+    def upsert_pending(self, target: str, kind: str) -> bool:
+        """Insert a pending row; leave an existing row untouched. Idempotent.
+
+        Returns ``True`` iff a new row was created (so callers can tell enqueued
+        from skipped). A re-enqueue never resets a joined/dead/failed row.
+        """
+        now = _isoformat(_utc_now())
+        with self._connect() as con:
+            cur = con.execute(
+                """
+                INSERT INTO joins(target, kind, status, created_at, updated_at)
+                VALUES (?, ?, 'pending', ?, ?)
+                ON CONFLICT(target) DO NOTHING
+                """,
+                (target, kind, now, now),
+            )
+            return cur.rowcount == 1
+
+    def mark(
+        self,
+        target: str,
+        status: str,
+        *,
+        entity_id: int | None = None,
+        error: str | None = None,
+        joined: bool = False,
+    ) -> None:
+        now = _isoformat(_utc_now())
+        with self._connect() as con:
+            con.execute(
+                """
+                UPDATE joins
+                SET status = ?,
+                    updated_at = ?,
+                    entity_id = COALESCE(?, entity_id),
+                    error = ?,
+                    joined_at = CASE WHEN ? THEN ? ELSE joined_at END
+                WHERE target = ?
+                """,
+                (status, now, entity_id, error, 1 if joined else 0, now, target),
+            )
+
+    def next_candidate(self) -> dict[str, Any] | None:
+        """Return the next retryable target (pending first, then floodwait)."""
+        with self._connect() as con:
+            row = con.execute(
+                """
+                SELECT target, kind, status, entity_id
+                FROM joins
+                WHERE status IN ('pending', 'floodwait')
+                ORDER BY (status = 'pending') DESC, created_at ASC
+                LIMIT 1
+                """
+            ).fetchone()
+        return dict(row) if row is not None else None
+
+    def pending_targets(self, limit: int = 20) -> list[str]:
+        with self._connect() as con:
+            rows = con.execute(
+                """
+                SELECT target FROM joins
+                WHERE status IN ('pending', 'floodwait')
+                ORDER BY (status = 'pending') DESC, created_at ASC
+                LIMIT ?
+                """,
+                (limit,),
+            ).fetchall()
+        return [str(row["target"]) for row in rows]
+
+    def count_by_status(self) -> dict[str, int]:
+        with self._connect() as con:
+            rows = con.execute(
+                "SELECT status, COUNT(*) AS n FROM joins GROUP BY status"
+            ).fetchall()
+        return {str(row["status"]): int(row["n"]) for row in rows}
+
+    def pending_count(self) -> int:
+        with self._connect() as con:
+            row = con.execute(
+                "SELECT COUNT(*) AS n FROM joins WHERE status = 'pending'"
+            ).fetchone()
+        return int(row["n"] or 0)
+
+    # ── daily counter (cap enforcement, restart-safe) ─────────────
+    def joined_today(self, day: str) -> int:
+        with self._connect() as con:
+            row = con.execute(
+                "SELECT count FROM join_daily_counter WHERE day = ?",
+                (day,),
+            ).fetchone()
+        return int(row["count"]) if row is not None else 0
+
+    def increment_daily(self, day: str) -> int:
+        with self._connect() as con:
+            con.execute(
+                """
+                INSERT INTO join_daily_counter(day, count) VALUES (?, 1)
+                ON CONFLICT(day) DO UPDATE SET count = count + 1
+                """,
+                (day,),
+            )
+            row = con.execute(
+                "SELECT count FROM join_daily_counter WHERE day = ?",
+                (day,),
+            ).fetchone()
+        return int(row["count"]) if row is not None else 0
+
+    # ── meta (floodwait gate + stop flag) ─────────────────────────
+    def set_meta(self, key: str, value: str | None) -> None:
+        with self._connect() as con:
+            con.execute(
+                """
+                INSERT INTO join_meta(key, value) VALUES (?, ?)
+                ON CONFLICT(key) DO UPDATE SET value = excluded.value
+                """,
+                (key, value),
+            )
+
+    def get_meta(self, key: str) -> str | None:
+        with self._connect() as con:
+            row = con.execute(
+                "SELECT value FROM join_meta WHERE key = ?", (key,)
+            ).fetchone()
+        return None if row is None else row["value"]
+
+    def set_floodwait_until(self, until: datetime | None) -> None:
+        self.set_meta("floodwait_until", _isoformat(until) if until else None)
+
+    def get_floodwait_until(self) -> datetime | None:
+        raw = self.get_meta("floodwait_until")
+        if not raw:
+            return None
+        try:
+            return datetime.fromisoformat(raw)
+        except ValueError:
+            return None
 
 
 @dataclass(frozen=True)
@@ -72,6 +358,28 @@ class TelegramProxy:
         self._session_lock_fd: int | None = None
         self._allowed_channel_ids = set(config.TELEGRAM_PROXY_ALLOWED_CHANNEL_IDS)
         self._allowed_chat_ids = set(config.TELEGRAM_PROXY_ALLOWED_CHAT_IDS)
+        # ── Paced join capability ────────────────────────────────
+        # Telethon v1 request/type classes are loaded in _start_locked (kept None
+        # until then; tests inject fakes directly).
+        self._join_channel_request = None
+        self._check_chat_invite_request = None
+        self._import_chat_invite_request = None
+        self._chat_invite_already_cls = None
+        self._join_store: JoinStore | None = None
+        self._join_lock = asyncio.Lock()  # serialises join passes (loop vs manual tick)
+        self._join_task: asyncio.Task | None = None
+        # Set of dialog entity ids already joined — preloaded once per run for
+        # idempotency (skip targets we are already in). None ⇒ not yet loaded.
+        self._joined_dialog_ids: set[int] | None = None
+        # Daily cap clamped defensively at the hard ceiling — an over-large value
+        # can never take effect. Tests may override in place.
+        self._daily_cap = min(
+            config._HARD_MAX_JOIN_DAILY_CAP,
+            max(1, int(config.TELEGRAM_JOIN_DAILY_CAP)),
+        )
+        self._join_min_delay = config.TELEGRAM_JOIN_MIN_DELAY_SECONDS
+        self._join_max_delay = config.TELEGRAM_JOIN_MAX_DELAY_SECONDS
+        self._join_idle_poll = config.TELEGRAM_JOIN_IDLE_POLL_SECONDS
 
     def _acquire_session_lock(self) -> None:
         """Take an exclusive, non-blocking OS lock on the session lockfile.
@@ -114,6 +422,10 @@ class TelegramProxy:
         except Exception:
             self._release_session_lock()
             raise
+        # Bring up the background join loop only after the session is live. It is
+        # inert until an operator enqueues targets, so it is safe to always run.
+        if config.TELEGRAM_JOIN_LOOP_ENABLED and self._join_task is None:
+            self._join_task = asyncio.create_task(self._join_loop())
 
     async def _start_locked(self) -> None:
         creds = self._load_credentials()
@@ -122,8 +434,13 @@ class TelegramProxy:
             from telethon.sessions import StringSession
             from telethon.tl.functions.channels import GetFullChannelRequest
             from telethon.tl.functions.channels import CreateChannelRequest, InviteToChannelRequest
+            from telethon.tl.functions.channels import JoinChannelRequest
             from telethon.tl.functions.messages import ExportChatInviteRequest
-            from telethon.tl.types import Channel
+            from telethon.tl.functions.messages import (
+                CheckChatInviteRequest,
+                ImportChatInviteRequest,
+            )
+            from telethon.tl.types import Channel, ChatInviteAlready
         except Exception as exc:  # pragma: no cover - dependency failure
             raise RuntimeError(f"Telethon import failed: {exc}") from exc
 
@@ -141,12 +458,26 @@ class TelegramProxy:
         self._create_channel_request = CreateChannelRequest
         self._invite_to_channel_request = InviteToChannelRequest
         self._export_chat_invite_request = ExportChatInviteRequest
+        self._join_channel_request = JoinChannelRequest
+        self._check_chat_invite_request = CheckChatInviteRequest
+        self._import_chat_invite_request = ImportChatInviteRequest
+        self._chat_invite_already_cls = ChatInviteAlready
         await self._client.connect()
         if not await self._client.is_user_authorized():
             raise RuntimeError("Telegram proxy user session is not authorized.")
 
     async def stop(self) -> None:
         try:
+            task = self._join_task
+            self._join_task = None
+            if task is not None:
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
+                except Exception:  # pragma: no cover - defensive
+                    logger.debug("join loop raised on shutdown", exc_info=True)
             if self._client is not None:
                 await self._client.disconnect()
         finally:
@@ -340,6 +671,318 @@ class TelegramProxy:
             return
         raise web.HTTPBadRequest(text="Unsupported entity kind.")
 
+    # ── Paced, ban-safe JOIN ──────────────────────────────────────
+    def _get_join_store(self) -> JoinStore:
+        if self._join_store is None:
+            self._join_store = JoinStore()
+        return self._join_store
+
+    def _join_delay_seconds(self) -> float:
+        """Randomized human-like delay BETWEEN joins (ban-safety pacing)."""
+        return random.uniform(self._join_min_delay, self._join_max_delay)
+
+    def enqueue_targets(self, targets: list[str]) -> dict[str, Any]:
+        """Upsert pending rows (idempotent). Classifies public vs private by shape."""
+        store = self._get_join_store()
+        enqueued = 0
+        skipped = 0
+        seen: set[str] = set()
+        for raw in targets:
+            if raw is None:
+                continue
+            text = str(raw).strip()
+            if not text:
+                continue
+            kind, canonical = normalize_target(text)
+            if not canonical or canonical in {"+"}:
+                skipped += 1
+                continue
+            if canonical in seen:
+                # Duplicate within the same request payload — count once.
+                skipped += 1
+                continue
+            seen.add(canonical)
+            if store.upsert_pending(canonical, kind):
+                enqueued += 1
+            else:
+                skipped += 1
+        return {
+            "enqueued": enqueued,
+            "skipped": skipped,
+            "total_pending": store.pending_count(),
+        }
+
+    def join_status(self) -> dict[str, Any]:
+        store = self._get_join_store()
+        day = _utc_now().strftime("%Y-%m-%d")
+        floodwait_until = store.get_floodwait_until()
+        return {
+            "counts_by_status": store.count_by_status(),
+            "joined_today": store.joined_today(day),
+            "daily_cap": self._daily_cap,
+            "floodwait_until": _isoformat(floodwait_until),
+            "channels_too_much": store.get_meta("channels_too_much") == "1",
+            "next_pending": store.pending_targets(limit=20),
+        }
+
+    async def join_tick(self) -> dict[str, Any]:
+        """Run ONE processing pass now (respecting cap + FloodWait). Testable step."""
+        return await self._run_join_pass()
+
+    async def _run_join_pass(self) -> dict[str, Any]:
+        # Serialise passes so a manual /tick can never race the background loop
+        # into issuing two joins back-to-back (which would defeat the pacing).
+        async with self._join_lock:
+            return await self._run_join_pass_locked()
+
+    async def _run_join_pass_locked(self) -> dict[str, Any]:
+        store = self._get_join_store()
+        now = _utc_now()
+        day = now.strftime("%Y-%m-%d")
+
+        # ── GATE 1: FloodWait. Re-checked before EVERY join; we NEVER retry
+        # before the window elapses (an early retry escalates to PeerFloodError =
+        # multi-day / permanent ban).
+        floodwait_until = store.get_floodwait_until()
+        if floodwait_until is not None and now < floodwait_until:
+            return {
+                "action": "skipped",
+                "reason": "floodwait",
+                "network": False,
+                "floodwait_until": _isoformat(floodwait_until),
+            }
+
+        # ── GATE 2: account hit the ~500-dialog ceiling; stop for good.
+        if store.get_meta("channels_too_much") == "1":
+            return {"action": "skipped", "reason": "channels_too_much", "network": False}
+
+        # ── GATE 3: DAILY CAP. Counted per UTC day and PERSISTED, so a restart
+        # cannot reset it and over-join. Checked before EVERY join.
+        joined_today = store.joined_today(day)
+        if joined_today >= self._daily_cap:
+            return {
+                "action": "skipped",
+                "reason": "daily_cap_reached",
+                "network": False,
+                "joined_today": joined_today,
+                "daily_cap": self._daily_cap,
+            }
+
+        # Idempotency: preload the ids of dialogs we are already in (once per run)
+        # so we skip targets already joined without issuing a join request.
+        await self._ensure_dialog_preload()
+
+        candidate = store.next_candidate()
+        if candidate is None:
+            return {"action": "idle", "reason": "no_pending", "network": False}
+
+        return await self._attempt_join(candidate, day)
+
+    async def _ensure_dialog_preload(self, *, force: bool = False) -> None:
+        if self._joined_dialog_ids is not None and not force:
+            return
+        ids: set[int] = set()
+        client = self._require_client()
+        async with self._lock:
+            async for dialog in client.iter_dialogs(limit=None):
+                entity = getattr(dialog, "entity", None)
+                entity_id = getattr(entity, "id", None)
+                if entity_id is not None:
+                    ids.add(int(entity_id))
+        self._joined_dialog_ids = ids
+
+    async def _client_call(self, request: Any) -> Any:
+        client = self._require_client()
+        async with self._lock:
+            return await client(request)
+
+    async def _get_entity_for_join(self, ref: Any) -> Any:
+        client = self._require_client()
+        async with self._lock:
+            return await client.get_entity(ref)
+
+    def _is_already_joined(self, entity: Any) -> bool:
+        entity_id = getattr(entity, "id", None)
+        if entity_id is None or self._joined_dialog_ids is None:
+            return False
+        return int(entity_id) in self._joined_dialog_ids
+
+    def _remember_joined(self, entity_id: int | None) -> None:
+        if entity_id is None:
+            return
+        if self._joined_dialog_ids is None:
+            self._joined_dialog_ids = set()
+        self._joined_dialog_ids.add(int(entity_id))
+
+    async def _attempt_join(self, candidate: dict[str, Any], day: str) -> dict[str, Any]:
+        target = str(candidate["target"])
+        kind = str(candidate["kind"])
+        store = self._get_join_store()
+        try:
+            if kind == "public":
+                return await self._join_public(target, day)
+            if kind == "private":
+                return await self._join_private(target, day)
+            if kind == "linked":
+                return await self._join_linked(target, day)
+            store.mark(target, "failed", error=f"unknown kind {kind}")
+            return {"action": "failed", "target": target, "network": False, "error": "unknown kind"}
+        except Exception as exc:  # noqa: BLE001 - dispatched by type below
+            return self._handle_join_error(target, exc, day)
+
+    async def _join_public(self, target: str, day: str) -> dict[str, Any]:
+        store = self._get_join_store()
+        name = parse_public_username(target)
+        entity = await self._get_entity_for_join(name)
+        entity_id = int(getattr(entity, "id", 0)) or None
+        if self._is_already_joined(entity):
+            store.mark(target, "joined", entity_id=entity_id, joined=True)
+            return {"action": "joined", "target": target, "entity_id": entity_id,
+                    "already": True, "network": False}
+        await self._client_call(self._join_channel_request(entity))
+        store.increment_daily(day)
+        store.mark(target, "joined", entity_id=entity_id, joined=True)
+        self._remember_joined(entity_id)
+        linked = await self._discover_and_enqueue_linked(entity)
+        return {"action": "joined", "target": target, "entity_id": entity_id,
+                "network": True, "linked_enqueued": linked}
+
+    async def _join_private(self, target: str, day: str) -> dict[str, Any]:
+        store = self._get_join_store()
+        invite_hash = parse_invite_hash(target)
+        info = await self._client_call(self._check_chat_invite_request(invite_hash))
+        # Already a member — the invite check resolves the chat; skip the import
+        # entirely (no join request issued, so it does NOT count toward the cap).
+        if self._chat_invite_already_cls is not None and isinstance(
+            info, self._chat_invite_already_cls
+        ):
+            chat = getattr(info, "chat", None)
+            entity_id = int(getattr(chat, "id", 0)) or None
+            store.mark(target, "joined", entity_id=entity_id, joined=True)
+            self._remember_joined(entity_id)
+            return {"action": "joined", "target": target, "entity_id": entity_id,
+                    "already": True, "network": False}
+        result = await self._client_call(self._import_chat_invite_request(invite_hash))
+        store.increment_daily(day)
+        chat = self._first_chat(result)
+        entity_id = int(getattr(chat, "id", 0)) or None
+        store.mark(target, "joined", entity_id=entity_id, joined=True)
+        self._remember_joined(entity_id)
+        linked = None
+        if chat is not None:
+            linked = await self._discover_and_enqueue_linked(chat)
+        return {"action": "joined", "target": target, "entity_id": entity_id,
+                "network": True, "linked_enqueued": linked}
+
+    async def _join_linked(self, target: str, day: str) -> dict[str, Any]:
+        store = self._get_join_store()
+        linked_id = int(target.split(":", 1)[1])
+        entity = self._entity_cache.get(("linked_join", linked_id))
+        if entity is None:
+            entity = await self._get_entity_for_join(linked_id)
+        entity_id = int(getattr(entity, "id", 0)) or linked_id
+        if self._is_already_joined(entity):
+            store.mark(target, "joined", entity_id=entity_id, joined=True)
+            return {"action": "joined", "target": target, "entity_id": entity_id,
+                    "already": True, "network": False}
+        await self._client_call(self._join_channel_request(entity))
+        store.increment_daily(day)
+        store.mark(target, "joined", entity_id=entity_id, joined=True)
+        self._remember_joined(entity_id)
+        return {"action": "joined", "target": target, "entity_id": entity_id, "network": True}
+
+    @staticmethod
+    def _first_chat(result: Any) -> Any:
+        chats = getattr(result, "chats", None) or []
+        return chats[0] if chats else None
+
+    async def _discover_and_enqueue_linked(self, entity: Any) -> int | None:
+        """After joining a BROADCAST channel, enqueue its linked discussion group.
+
+        The real leads live in the discussion chat, so we chain-enqueue it as a
+        fresh pending target (it will be joined later, paced like any other).
+        """
+        if not getattr(entity, "broadcast", False):
+            return None
+        try:
+            full = await self._client_call(self._get_full_channel_request(entity))
+            linked_id = getattr(full.full_chat, "linked_chat_id", None)
+        except Exception:
+            logger.debug("linked-chat discovery failed", exc_info=True)
+            return None
+        if not linked_id:
+            return None
+        linked_id = int(linked_id)
+        for chat in getattr(full, "chats", None) or []:
+            if int(getattr(chat, "id", 0)) == linked_id:
+                self._entity_cache[("linked_join", linked_id)] = chat
+                break
+        self._get_join_store().upsert_pending(f"id:{linked_id}", "linked")
+        return linked_id
+
+    def _handle_join_error(self, target: str, exc: Exception, day: str) -> dict[str, Any]:
+        from telethon.errors import (
+            ChannelsTooMuchError,
+            FloodWaitError,
+            InviteHashExpiredError,
+            InviteHashInvalidError,
+            InviteRequestSentError,
+            UserAlreadyParticipantError,
+        )
+
+        store = self._get_join_store()
+        # Already a participant → treat as success. A join request DID reach
+        # Telegram, so it counts toward today's cap.
+        if isinstance(exc, UserAlreadyParticipantError):
+            store.increment_daily(day)
+            store.mark(target, "joined", joined=True)
+            return {"action": "joined", "target": target,
+                    "already_participant": True, "network": True}
+        # FloodWait → persist the deadline and STOP. Never retry before it passes.
+        if isinstance(exc, FloodWaitError):
+            seconds = int(getattr(exc, "seconds", 0) or 0)
+            until = _utc_now() + timedelta(seconds=seconds)
+            store.set_floodwait_until(until)
+            store.mark(target, "floodwait", error=f"floodwait {seconds}s")
+            return {"action": "floodwait", "target": target, "seconds": seconds,
+                    "floodwait_until": _isoformat(until), "network": False}
+        # Dialog ceiling hit — mark and stop the whole campaign.
+        if isinstance(exc, ChannelsTooMuchError):
+            store.set_meta("channels_too_much", "1")
+            store.mark(target, "toomuch", error="channels too much")
+            return {"action": "channels_too_much", "target": target, "network": False}
+        # Admin-approval invite links: request sent, awaiting approval.
+        if isinstance(exc, InviteRequestSentError):
+            store.increment_daily(day)
+            store.mark(target, "request_sent", error="join request sent (awaiting approval)")
+            return {"action": "request_sent", "target": target, "network": True}
+        # Dead invite links.
+        if isinstance(exc, (InviteHashExpiredError, InviteHashInvalidError)):
+            store.mark(target, "dead", error=str(exc))
+            return {"action": "dead", "target": target, "network": False, "error": str(exc)}
+        # Anything else → failed (kept in queue history, not retried automatically).
+        store.mark(target, "failed", error=str(exc))
+        return {"action": "failed", "target": target, "network": False, "error": str(exc)}
+
+    async def _join_loop(self) -> None:
+        """Background driver: run one pass, then sleep. The 60–300s randomized
+        sleep between actual joins is the ban-safety pacing; idle/blocked passes
+        poll on a shorter interval so a cleared FloodWait resumes promptly."""
+        logger.info("telegram-proxy join loop started")
+        while True:
+            try:
+                result = await self._run_join_pass()
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # pragma: no cover - defensive
+                logger.exception("join pass failed")
+                result = {"action": "error", "network": False}
+            if result.get("network"):
+                delay = self._join_delay_seconds()
+            else:
+                delay = self._join_idle_poll
+            await asyncio.sleep(delay)
+
 
 def _check_auth(request: web.Request) -> None:
     expected = config.TELEGRAM_PROXY_API_KEY
@@ -409,6 +1052,44 @@ async def _create_group(request: web.Request) -> web.Response:
     return web.json_response({"ok": True, "result": result})
 
 
+async def _join_enqueue(request: web.Request) -> web.Response:
+    _check_auth(request)
+    proxy: TelegramProxy = request.app["proxy"]
+    try:
+        payload = await request.json()
+    except Exception:
+        raise web.HTTPBadRequest(text="Invalid JSON body.") from None
+
+    targets_raw = payload.get("targets", [])
+    if isinstance(targets_raw, str):
+        targets = [item.strip() for item in targets_raw.split(",") if item.strip()]
+    elif isinstance(targets_raw, list):
+        targets = [str(item).strip() for item in targets_raw if str(item).strip()]
+    else:
+        raise web.HTTPBadRequest(text="`targets` must be a list or comma string.")
+
+    result = proxy.enqueue_targets(targets)
+    return web.json_response({"ok": True, **result})
+
+
+async def _join_status(request: web.Request) -> web.Response:
+    _check_auth(request)
+    proxy: TelegramProxy = request.app["proxy"]
+    return web.json_response(proxy.join_status())
+
+
+async def _join_tick(request: web.Request) -> web.Response:
+    _check_auth(request)
+    proxy: TelegramProxy = request.app["proxy"]
+    try:
+        result = await proxy.join_tick()
+    except web.HTTPException:
+        raise
+    except Exception as exc:
+        raise web.HTTPBadGateway(text=f"Join tick failed: {exc}") from exc
+    return web.json_response({"ok": True, "result": result})
+
+
 async def _startup(app: web.Application) -> None:
     proxy = TelegramProxy()
     await proxy.start()
@@ -426,6 +1107,9 @@ def create_app() -> web.Application:
     app.router.add_get("/v1/channels", _list_channels)
     app.router.add_get("/v1/messages/{kind}/{entity_id}", _read_messages)
     app.router.add_post("/v1/telegram/createGroup", _create_group)
+    app.router.add_post("/v1/join/enqueue", _join_enqueue)
+    app.router.add_get("/v1/join/status", _join_status)
+    app.router.add_post("/v1/join/tick", _join_tick)
     app.on_startup.append(_startup)
     app.on_cleanup.append(_cleanup)
     return app

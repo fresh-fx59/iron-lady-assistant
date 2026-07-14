@@ -337,6 +337,45 @@ PROACTIVE_TOPIC_SESSIONS_PATH: Path = Path(
 LIFECYCLE_DB_PATH: Path = MEMORY_DIR / "lifecycle.db"
 TELEGRAM_DIGEST_DB_PATH: Path = MEMORY_DIR / "telegram_digest.db"
 TELEGRAM_DIGEST_BRIEF_PATH: Path = MEMORY_DIR / "telegram_digest_brief.md"
+
+# ── Paced, ban-safe channel/group JOIN queue ─────────────────
+# Persistent queue + counters for the @giedi_0 parser account joining ~63 target
+# chats over SEVERAL DAYS without tripping Telegram anti-spam. The join runs
+# INSIDE the proxy process on the EXISTING (flock-owned) session — never a second
+# client — pacing joins slowly and stopping hard on FloodWait. See telegram_proxy.py.
+TELEGRAM_PROXY_JOIN_DB_PATH: Path = Path(
+    os.path.expanduser(
+        os.getenv(
+            "TELEGRAM_PROXY_JOIN_DB_PATH",
+            str(MEMORY_DIR / "telegram_join.db"),
+        )
+    )
+)
+# Daily cap counted per UTC day, PERSISTED across restarts. Default 15, HARD max
+# 20 — a higher env value is clamped, never honoured (over-joining = ban).
+_HARD_MAX_JOIN_DAILY_CAP = 20
+TELEGRAM_JOIN_DAILY_CAP: int = min(
+    _HARD_MAX_JOIN_DAILY_CAP,
+    max(1, int(os.getenv("TELEGRAM_JOIN_DAILY_CAP", "15"))),
+)
+# Randomized delay BETWEEN joins (random.uniform), seconds.
+TELEGRAM_JOIN_MIN_DELAY_SECONDS: float = max(
+    1.0, float(os.getenv("TELEGRAM_JOIN_MIN_DELAY_SECONDS", "60"))
+)
+TELEGRAM_JOIN_MAX_DELAY_SECONDS: float = max(
+    TELEGRAM_JOIN_MIN_DELAY_SECONDS,
+    float(os.getenv("TELEGRAM_JOIN_MAX_DELAY_SECONDS", "300")),
+)
+# How often the background loop re-checks when it is idle (no pending / cap hit /
+# inside a FloodWait window). Kept short so a cleared FloodWait resumes promptly.
+TELEGRAM_JOIN_IDLE_POLL_SECONDS: float = max(
+    5.0, float(os.getenv("TELEGRAM_JOIN_IDLE_POLL_SECONDS", "60"))
+)
+# Background join loop. Harmless when the queue is empty (it just idles); it only
+# ever acts on targets an operator has explicitly enqueued.
+TELEGRAM_JOIN_LOOP_ENABLED: bool = (
+    os.getenv("TELEGRAM_JOIN_LOOP_ENABLED", "1").strip().lower() not in {"0", "false", "no"}
+)
 # File-session FALLBACK (used only when no StringSession is configured). This
 # must be ABSOLUTE: a relative path would resolve against whatever cwd the proxy
 # happens to run under, silently creating a second, unauthorized session file.

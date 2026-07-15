@@ -429,3 +429,107 @@ async def test_users_bad_id_is_400(tmp_path, monkeypatch):
         assert resp.status == 400
     finally:
         await http.close()
+
+
+# ── resolve safety: prime-once, collision-reject, negative-cache ────
+class _NoEntityDialogClient:
+    """A client where NOTHING resolves: get_entity always raises ValueError and
+    the joined-dialogs sweep yields no entities. Counts get_entity calls and how
+    many times the (heavy, ban-sensitive) dialog enumeration is swept."""
+
+    def __init__(self):
+        self.get_calls = 0
+        self.dialog_sweeps = 0
+
+    async def get_entity(self, ref):  # noqa: ARG002
+        self.get_calls += 1
+        raise ValueError(f"Cannot find any entity corresponding to {ref!r}")
+
+    async def iter_dialogs(self, *, limit=None):  # noqa: ARG002
+        self.dialog_sweeps += 1
+        for _ in ():  # empty async generator — no joined dialogs
+            yield _
+
+
+@pytest.mark.asyncio
+async def test_unresolvable_ids_prime_dialogs_at_most_once(tmp_path):
+    """FIX 1 (prime-once): two DIFFERENT unresolvable ids must trigger the heavy
+    joined-dialogs enumeration only ONCE per process — a fresh sweep per miss is
+    the ban-risk this closes."""
+    store = TelegramDigestStore(db_path=tmp_path / "digest.db")
+    client = _NoEntityDialogClient()
+    proxy = tp.TelegramProxy()
+    proxy._digest_store = store
+    proxy._client = client
+
+    first = await proxy.resolve_sender(111222)
+    second = await proxy.resolve_sender(333444)   # a DIFFERENT unresolvable id
+    assert first["error"] == "LookupError"
+    assert second["error"] == "LookupError"
+    assert client.dialog_sweeps == 1              # primed once, never re-swept
+    # neither miss was cached in the db (a later retry can still resolve them)
+    assert store.get_lead_sender(111222) is None
+    assert store.get_lead_sender(333444) is None
+
+
+@pytest.mark.asyncio
+async def test_unresolvable_id_memoized_skips_second_attempt(tmp_path):
+    """FIX 3 (negative cache): a persistently-unresolvable id is served from the
+    in-memory memo on the second resolve — no second get_entity, no second sweep."""
+    store = TelegramDigestStore(db_path=tmp_path / "digest.db")
+    client = _NoEntityDialogClient()
+    proxy = tp.TelegramProxy()
+    proxy._digest_store = store
+    proxy._client = client
+
+    first = await proxy.resolve_sender(777)
+    assert first["error"] == "LookupError"
+    calls_after_first = client.get_calls
+    assert client.dialog_sweeps == 1
+    assert calls_after_first >= 1
+
+    second = await proxy.resolve_sender(777)      # same id → memoized short-circuit
+    assert second["error"] == "LookupError"
+    assert client.get_calls == calls_after_first  # NO new get_entity
+    assert client.dialog_sweeps == 1              # NO new dialog sweep
+
+
+@pytest.mark.asyncio
+async def test_peerchannel_fallback_rejects_id_mismatch(tmp_path):
+    """FIX 2 (collision guard): when the forced PeerChannel fallback resolves an
+    UNRELATED channel (different real id), the result is discarded — never cached
+    as the requested id's identity, so a numeric overlap can't mis-label a sender."""
+    from telethon.tl.types import PeerChannel
+
+    # requested id 555 is actually a USER; get_entity(555) raises, and the forced
+    # PeerChannel(555) resolves an unrelated channel whose real id is 999.
+    wrong = types.SimpleNamespace(
+        id=999, title="Unrelated Channel", username="unrelated",
+        broadcast=True, megagroup=False,
+    )
+
+    class _CollisionClient:
+        def __init__(self):
+            self.calls = 0
+
+        async def get_entity(self, ref):
+            self.calls += 1
+            if isinstance(ref, PeerChannel):
+                return wrong
+            raise ValueError(f"Cannot find any entity corresponding to {ref!r}")
+
+        async def iter_dialogs(self, *, limit=None):  # noqa: ARG002
+            for _ in ():
+                yield _
+
+    store = TelegramDigestStore(db_path=tmp_path / "digest.db")
+    proxy = tp.TelegramProxy()
+    proxy._digest_store = store
+    proxy._client = _CollisionClient()
+
+    body = await proxy.resolve_sender(555)
+    assert body["error"] == "LookupError"          # collision rejected → not found
+    assert body["kind"] is None
+    assert body["username"] is None
+    assert store.get_lead_sender(555) is None       # NOT cached under the requested id
+    assert store.get_lead_sender(999) is None       # unrelated channel never attributed

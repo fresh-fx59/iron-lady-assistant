@@ -7,6 +7,7 @@ import logging
 import os
 import random
 import sqlite3
+import time
 from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -506,6 +507,14 @@ def _message_payload(message: Any, entity_username: str | None) -> dict[str, Any
     }
 
 
+# A bare id that fails EVERY resolve tier (get_entity, marked PeerChannel, and the
+# joined-dialogs cache) is memoized as unresolvable for this long, so a
+# persistently-unresolvable sender returns the error envelope from the memo without
+# re-attempting get_entity / a dialog enumeration every run. Short TTL so a group we
+# later join (or a FloodWait that clears) can still resolve on a subsequent pass.
+_UNRESOLVABLE_MEMO_TTL_S = 300.0
+
+
 class TelegramProxy:
     def __init__(self) -> None:
         self._client = None
@@ -515,6 +524,14 @@ class TelegramProxy:
         self._invite_to_channel_request = None
         self._export_chat_invite_request = None
         self._entity_cache: dict[tuple[str, int], Any] = {}
+        # Prime-once guard: the joined-dialogs enumeration (iter_dialogs(limit=None))
+        # is a heavy, ban-sensitive full sweep — do it at most ONCE per process. Once
+        # primed, unresolvable-id misses serve from the existing _entity_cache and
+        # never trigger a fresh enumeration.
+        self._dialogs_primed = False
+        # Negative cache: entity_id -> monotonic expiry. Set when an id fails every
+        # resolve tier, so a persistently-unresolvable sender short-circuits.
+        self._unresolvable_ids: dict[int, float] = {}
         self._lock = asyncio.Lock()
         self._session_lock_fd: int | None = None
         self._allowed_channel_ids = set(config.TELEGRAM_PROXY_ALLOWED_CHANNEL_IDS)
@@ -816,6 +833,11 @@ class TelegramProxy:
     async def _prime_entity_cache_from_dialogs(self) -> None:
         client = self._require_client()
         async with self._lock:
+            # Prime-once: enumerate the joined dialogs at most once per process.
+            # A repeated resolve of an unresolvable id must NOT re-sweep every
+            # dialog — once primed, callers serve from the existing entity cache.
+            if self._dialogs_primed:
+                return
             async for dialog in client.iter_dialogs(limit=None):
                 entity = dialog.entity
                 entity_id = getattr(entity, "id", None)
@@ -829,6 +851,7 @@ class TelegramProxy:
                         self._entity_cache[("chat", entity_id)] = entity
                 else:
                     self._entity_cache[("chat", entity_id)] = entity
+            self._dialogs_primed = True
 
     def _authorize_entity(self, *, kind: str, entity_id: int) -> None:
         if kind == "channel":
@@ -949,6 +972,38 @@ class TelegramProxy:
             return None
         return PeerChannel(entity_id)
 
+    @staticmethod
+    def _entity_matches_id(entity: Any, entity_id: int) -> bool:
+        """True iff the resolved entity's real id equals the requested ``entity_id``.
+
+        Guards the PeerChannel fallback: forcing a possibly-USER bare id into a
+        channel peer can, on numeric id-space overlap, resolve an UNRELATED
+        channel — caching its title/username as this id's identity would mis-label
+        the sender. Real Telethon entities always carry ``.id``; an entity with no
+        discernible id (only a test stand-in) can't be verified and is accepted.
+        """
+        real = getattr(entity, "id", None)
+        if real is None:
+            return True
+        try:
+            return int(real) == int(entity_id)
+        except (TypeError, ValueError):
+            return False
+
+    def _is_unresolvable_memoized(self, entity_id: int) -> bool:
+        """True while ``entity_id`` is within its unresolvable-memo TTL. Expired
+        entries are dropped on read so the memo self-prunes."""
+        expiry = self._unresolvable_ids.get(entity_id)
+        if expiry is None:
+            return False
+        if time.monotonic() >= expiry:
+            self._unresolvable_ids.pop(entity_id, None)
+            return False
+        return True
+
+    def _memoize_unresolvable(self, entity_id: int) -> None:
+        self._unresolvable_ids[entity_id] = time.monotonic() + _UNRESOLVABLE_MEMO_TTL_S
+
     async def _dialog_entity_by_id(self, entity_id: int) -> Any:
         """Look an entity up by bare id in the joined-dialogs cache.
 
@@ -974,8 +1029,13 @@ class TelegramProxy:
           3. the joined-dialogs entity cache — a group we are a member of.
         A transient failure (FloodWait/RPC) from tier 1 propagates unchanged so
         the caller can fail open; only a "not found" (``ValueError``) falls
-        through to the cheaper local tiers.
+        through to the cheaper local tiers. An id that already failed every tier
+        recently short-circuits from the negative memo without any network work.
         """
+        # Negative cache: a persistently-unresolvable id returns the not-found
+        # error WITHOUT re-attempting get_entity or a dialog enumeration.
+        if self._is_unresolvable_memoized(entity_id):
+            raise LookupError(f"entity {entity_id} is not resolvable (memoized)")
         client = self._require_client()
         async with self._lock:
             try:
@@ -984,14 +1044,27 @@ class TelegramProxy:
                 peer = self._marked_channel_peer(entity_id)
                 if peer is not None:
                     try:
-                        return await client.get_entity(peer)
+                        resolved = await client.get_entity(peer)
                     except ValueError:
-                        pass
+                        resolved = None
+                    # Verify the coerced-channel resolution is actually THIS id — a
+                    # numeric id-space overlap could otherwise resolve an unrelated
+                    # channel and cache its identity for a different sender.
+                    if resolved is not None and self._entity_matches_id(resolved, entity_id):
+                        return resolved
+                    if resolved is not None:
+                        logger.warning(
+                            "resolve %s: PeerChannel fallback resolved a DIFFERENT id "
+                            "(%s) — discarding to avoid mis-labelling",
+                            entity_id, getattr(resolved, "id", None),
+                        )
         # Tier 3 primes from dialogs, which takes self._lock itself — so it must
         # run OUTSIDE the block above (asyncio.Lock is not re-entrant).
         entity = await self._dialog_entity_by_id(entity_id)
         if entity is not None:
             return entity
+        # Every tier failed — memoize so repeated misses don't re-do the work.
+        self._memoize_unresolvable(entity_id)
         raise LookupError(f"entity {entity_id} is not resolvable")
 
     async def resolve_sender(self, sender_id: int) -> dict[str, Any]:

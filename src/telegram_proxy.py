@@ -350,6 +350,16 @@ class JoinStore:
             ).fetchone()
         return int(row["n"] or 0)
 
+    def has_target(self, target: str) -> bool:
+        """True iff a row for ``target`` already exists in the queue (in ANY
+        status). Lets a caller tell a NEWLY-created row from an idempotent
+        re-enqueue without depending on ``upsert_pending``'s return value."""
+        with self._connect() as con:
+            row = con.execute(
+                "SELECT 1 FROM joins WHERE target = ? LIMIT 1", (target,)
+            ).fetchone()
+        return row is not None
+
     # ── daily counter (cap enforcement, restart-safe) ─────────────
     def joined_today(self, day: str) -> int:
         with self._connect() as con:
@@ -1164,6 +1174,74 @@ class TelegramProxy:
             "total_pending": store.pending_count(),
         }
 
+    async def sync_linked_discussions(self, *, limit: int = 500) -> dict[str, Any]:
+        """ENQUEUE-ONLY: for every BROADCAST channel the parser account is
+        ALREADY in, enqueue its linked discussion chat as a paced ``id:<n>``
+        join target so the existing paced loop can join it later (ban-safe,
+        ≤cap/day). This NEVER joins anything itself — no channel-join or
+        invite-import request is issued on this path; the paced join loop does
+        the joining.
+
+        Reuse, not reimplementation:
+          * ``list_channels`` supplies the broadcast-channel enumeration (it
+            already does one ``GetFullChannelRequest`` per channel and exposes
+            each channel's ``linked_chat_id``), and caches each channel entity
+            under ``("channel", id)``.
+          * ``_discover_and_enqueue_linked`` does the actual upsert of each
+            linked target (idempotent at the queue level).
+          * ``_ensure_dialog_preload`` supplies the joined-dialog id set — a
+            linked chat we are ALREADY a member of is skipped, never queued.
+
+        Runs under the existing single client + lock discipline: every network
+        read here goes through ``list_channels`` / ``_ensure_dialog_preload`` /
+        ``_discover_and_enqueue_linked``, each of which takes ``self._lock``
+        for its own client calls. No second Telethon client is created.
+
+        ``linked_ids`` lists only the NEWLY-queued linked ids (its length equals
+        ``linked_enqueued``); an already-queued-but-unjoined chat is counted in
+        neither ``linked_enqueued`` nor ``linked_already_joined``.
+        """
+        store = self._get_join_store()
+        # Preload the ids of dialogs we are already in (same idempotency source
+        # the join pass uses) so an already-joined linked chat is never queued.
+        await self._ensure_dialog_preload()
+        joined_ids = self._joined_dialog_ids or set()
+
+        records = await self.list_channels(limit=limit)
+
+        channels_scanned = 0
+        linked_enqueued = 0
+        linked_already_joined = 0
+        linked_ids: list[int] = []
+        for record in records:
+            channels_scanned += 1
+            linked_id = record.linked_chat_id
+            if not linked_id:
+                continue  # channel has no linked discussion chat
+            linked_id = int(linked_id)
+            if linked_id in joined_ids:
+                # Already a member of the discussion chat — do NOT queue it.
+                linked_already_joined += 1
+                continue
+            target = f"id:{linked_id}"
+            already_queued = store.has_target(target)
+            # list_channels cached the broadcast channel entity; fall back to a
+            # resolve only on the should-never-happen cache miss so the enqueue
+            # still routes through the EXISTING _discover_and_enqueue_linked.
+            entity = self._entity_cache.get(("channel", int(record.entity_id)))
+            if entity is None:
+                entity = await self._get_entity_for_join(int(record.entity_id))
+            enqueued_id = await self._discover_and_enqueue_linked(entity)
+            if enqueued_id is not None and not already_queued:
+                linked_enqueued += 1
+                linked_ids.append(int(enqueued_id))
+        return {
+            "channels_scanned": channels_scanned,
+            "linked_enqueued": linked_enqueued,
+            "linked_already_joined": linked_already_joined,
+            "linked_ids": linked_ids,
+        }
+
     def join_status(self) -> dict[str, Any]:
         store = self._get_join_store()
         now = _utc_now()
@@ -1608,6 +1686,25 @@ async def _join_enqueue(request: web.Request) -> web.Response:
     return web.json_response({"ok": True, **result})
 
 
+async def _join_sync_linked(request: web.Request) -> web.Response:
+    """ENQUEUE-ONLY sync: enqueue the linked discussion chats behind every
+    broadcast channel the account is already in. Never joins anything — the
+    paced loop does the joining."""
+    _check_auth(request)
+    proxy: TelegramProxy = request.app["proxy"]
+    try:
+        limit = max(1, min(500, int(request.query.get("limit", "500"))))
+    except ValueError:
+        raise web.HTTPBadRequest(text="limit must be an integer.") from None
+    try:
+        result = await proxy.sync_linked_discussions(limit=limit)
+    except web.HTTPException:
+        raise
+    except Exception as exc:
+        raise web.HTTPBadGateway(text=f"Sync linked failed: {exc}") from exc
+    return web.json_response({"ok": True, **result})
+
+
 async def _join_status(request: web.Request) -> web.Response:
     _check_auth(request)
     proxy: TelegramProxy = request.app["proxy"]
@@ -1646,6 +1743,7 @@ def create_app() -> web.Application:
     app.router.add_get("/v1/users/{sender_id}", _lead_user)
     app.router.add_post("/v1/telegram/createGroup", _create_group)
     app.router.add_post("/v1/join/enqueue", _join_enqueue)
+    app.router.add_post("/v1/join/sync-linked", _join_sync_linked)
     app.router.add_get("/v1/join/status", _join_status)
     app.router.add_post("/v1/join/tick", _join_tick)
     app.on_startup.append(_startup)

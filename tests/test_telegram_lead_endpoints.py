@@ -218,17 +218,23 @@ async def test_users_cache_hit_avoids_second_get_entity(tmp_path, monkeypatch):
         headers = {"Authorization": "Bearer secret"}
         first = await (await http.get("/v1/users/12345", headers=headers)).json()
         assert first == {
+            "id": 12345,
             "sender_id": 12345,
+            "kind": "user",
             "username": "jane",
+            "title": "Jane Doe",
             "name": "Jane Doe",
             "is_bot": False,
             "cached": False,
+            "error": None,
         }
         assert client.calls == 1
 
         # Second call is served from the cache — no new get_entity.
         second = await (await http.get("/v1/users/12345", headers=headers)).json()
         assert second["cached"] is True
+        assert second["kind"] == "user"
+        assert second["title"] == "Jane Doe"
         assert second["name"] == "Jane Doe"
         assert client.calls == 1
     finally:
@@ -258,15 +264,157 @@ async def test_users_floodwait_returns_200_with_error(tmp_path, monkeypatch):
         assert resp.status == 200  # NOT a 500
         body = await resp.json()
         assert body == {
+            "id": 777,
             "sender_id": 777,
+            "kind": None,
             "username": None,
+            "title": "",
             "name": "",
             "is_bot": False,
+            "cached": False,
             "error": "FloodWaitError",
         }
         # The failure is not cached, so a later retry still tries the network.
         assert store.get_lead_sender(777) is None
         assert client.calls == 1
+    finally:
+        await http.close()
+
+
+# ── /v1/users generalised to ANY entity: chat / channel / megagroup ─
+@pytest.mark.asyncio
+async def test_users_resolves_channel_megagroup(tmp_path, monkeypatch):
+    """A megagroup (Telethon Channel with megagroup=True) resolves to kind
+    'channel' with its title; a private group has username=None. The kind+title
+    are cached so a re-scan is served from the db with no 2nd get_entity."""
+    store = TelegramDigestStore(db_path=tmp_path / "digest.db")
+    entity = types.SimpleNamespace(
+        title="Private Lead Group", username=None, broadcast=False, megagroup=True
+    )
+    client = _CountingClient(entity)
+    proxy = tp.TelegramProxy()
+    proxy._digest_store = store
+    proxy._client = client
+
+    http = await _http_app(proxy, monkeypatch)
+    try:
+        headers = {"Authorization": "Bearer secret"}
+        first = await (await http.get("/v1/users/1976968455", headers=headers)).json()
+        assert first == {
+            "id": 1976968455,
+            "sender_id": 1976968455,
+            "kind": "channel",
+            "username": None,  # private megagroup has no public handle
+            "title": "Private Lead Group",
+            "name": "Private Lead Group",
+            "is_bot": False,
+            "cached": False,
+            "error": None,
+        }
+        assert client.calls == 1
+
+        # kind + title landed in the cache; a re-scan hits it (no new get_entity).
+        cached = store.get_lead_sender(1976968455)
+        assert cached["kind"] == "channel"
+        assert cached["title"] == "Private Lead Group"
+
+        second = await (await http.get("/v1/users/1976968455", headers=headers)).json()
+        assert second["cached"] is True
+        assert second["kind"] == "channel"
+        assert second["title"] == "Private Lead Group"
+        assert client.calls == 1
+    finally:
+        await http.close()
+
+
+@pytest.mark.asyncio
+async def test_users_resolves_public_broadcast_channel(tmp_path, monkeypatch):
+    """A public broadcast channel keeps its @username and resolves kind='channel'."""
+    store = TelegramDigestStore(db_path=tmp_path / "digest.db")
+    entity = types.SimpleNamespace(
+        title="Deals Channel", username="dealschan", broadcast=True, megagroup=False
+    )
+    proxy = tp.TelegramProxy()
+    proxy._digest_store = store
+    proxy._client = _CountingClient(entity)
+    http = await _http_app(proxy, monkeypatch)
+    try:
+        body = await (
+            await http.get("/v1/users/42", headers={"Authorization": "Bearer secret"})
+        ).json()
+        assert body["kind"] == "channel"
+        assert body["username"] == "dealschan"
+        assert body["title"] == "Deals Channel"
+        assert body["is_bot"] is False
+    finally:
+        await http.close()
+
+
+@pytest.mark.asyncio
+async def test_users_resolves_basic_group_chat(tmp_path, monkeypatch):
+    """A basic group (Telethon Chat: title, no broadcast/megagroup, no name)
+    resolves to kind 'chat' with username=None."""
+    store = TelegramDigestStore(db_path=tmp_path / "digest.db")
+    entity = types.SimpleNamespace(title="Small Group")  # Chat has no username attr
+    proxy = tp.TelegramProxy()
+    proxy._digest_store = store
+    proxy._client = _CountingClient(entity)
+    http = await _http_app(proxy, monkeypatch)
+    try:
+        body = await (
+            await http.get("/v1/users/555", headers={"Authorization": "Bearer secret"})
+        ).json()
+        assert body["kind"] == "chat"
+        assert body["username"] is None
+        assert body["title"] == "Small Group"
+        assert body["cached"] is False
+    finally:
+        await http.close()
+
+
+@pytest.mark.asyncio
+async def test_users_marked_id_fallback_resolves_channel(tmp_path, monkeypatch):
+    """A bare internal id that get_entity(id) cannot resolve is retried via its
+    -100-marked PeerChannel form — the fallback path required for megagroups."""
+    from telethon.tl.types import PeerChannel
+
+    entity = types.SimpleNamespace(
+        title="Marked Megagroup", username=None, broadcast=False, megagroup=True
+    )
+
+    class _MarkedClient:
+        def __init__(self):
+            self.calls = 0
+            self.seen = []
+
+        async def get_entity(self, ref):
+            self.calls += 1
+            self.seen.append(ref)
+            # The bare positive id is not directly resolvable; the marked
+            # PeerChannel form is.
+            if isinstance(ref, PeerChannel):
+                assert ref.channel_id == 1976968455
+                return entity
+            raise ValueError(f"Cannot find any entity corresponding to {ref!r}")
+
+    store = TelegramDigestStore(db_path=tmp_path / "digest.db")
+    client = _MarkedClient()
+    proxy = tp.TelegramProxy()
+    proxy._digest_store = store
+    proxy._client = client
+    http = await _http_app(proxy, monkeypatch)
+    try:
+        body = await (
+            await http.get(
+                "/v1/users/1976968455", headers={"Authorization": "Bearer secret"}
+            )
+        ).json()
+        assert body["kind"] == "channel"
+        assert body["title"] == "Marked Megagroup"
+        assert body["error"] is None
+        # Tier 1 (bare id) then tier 2 (PeerChannel) — exactly two attempts.
+        assert client.calls == 2
+        assert isinstance(client.seen[1], PeerChannel)
     finally:
         await http.close()
 
@@ -281,3 +429,107 @@ async def test_users_bad_id_is_400(tmp_path, monkeypatch):
         assert resp.status == 400
     finally:
         await http.close()
+
+
+# ── resolve safety: prime-once, collision-reject, negative-cache ────
+class _NoEntityDialogClient:
+    """A client where NOTHING resolves: get_entity always raises ValueError and
+    the joined-dialogs sweep yields no entities. Counts get_entity calls and how
+    many times the (heavy, ban-sensitive) dialog enumeration is swept."""
+
+    def __init__(self):
+        self.get_calls = 0
+        self.dialog_sweeps = 0
+
+    async def get_entity(self, ref):  # noqa: ARG002
+        self.get_calls += 1
+        raise ValueError(f"Cannot find any entity corresponding to {ref!r}")
+
+    async def iter_dialogs(self, *, limit=None):  # noqa: ARG002
+        self.dialog_sweeps += 1
+        for _ in ():  # empty async generator — no joined dialogs
+            yield _
+
+
+@pytest.mark.asyncio
+async def test_unresolvable_ids_prime_dialogs_at_most_once(tmp_path):
+    """FIX 1 (prime-once): two DIFFERENT unresolvable ids must trigger the heavy
+    joined-dialogs enumeration only ONCE per process — a fresh sweep per miss is
+    the ban-risk this closes."""
+    store = TelegramDigestStore(db_path=tmp_path / "digest.db")
+    client = _NoEntityDialogClient()
+    proxy = tp.TelegramProxy()
+    proxy._digest_store = store
+    proxy._client = client
+
+    first = await proxy.resolve_sender(111222)
+    second = await proxy.resolve_sender(333444)   # a DIFFERENT unresolvable id
+    assert first["error"] == "LookupError"
+    assert second["error"] == "LookupError"
+    assert client.dialog_sweeps == 1              # primed once, never re-swept
+    # neither miss was cached in the db (a later retry can still resolve them)
+    assert store.get_lead_sender(111222) is None
+    assert store.get_lead_sender(333444) is None
+
+
+@pytest.mark.asyncio
+async def test_unresolvable_id_memoized_skips_second_attempt(tmp_path):
+    """FIX 3 (negative cache): a persistently-unresolvable id is served from the
+    in-memory memo on the second resolve — no second get_entity, no second sweep."""
+    store = TelegramDigestStore(db_path=tmp_path / "digest.db")
+    client = _NoEntityDialogClient()
+    proxy = tp.TelegramProxy()
+    proxy._digest_store = store
+    proxy._client = client
+
+    first = await proxy.resolve_sender(777)
+    assert first["error"] == "LookupError"
+    calls_after_first = client.get_calls
+    assert client.dialog_sweeps == 1
+    assert calls_after_first >= 1
+
+    second = await proxy.resolve_sender(777)      # same id → memoized short-circuit
+    assert second["error"] == "LookupError"
+    assert client.get_calls == calls_after_first  # NO new get_entity
+    assert client.dialog_sweeps == 1              # NO new dialog sweep
+
+
+@pytest.mark.asyncio
+async def test_peerchannel_fallback_rejects_id_mismatch(tmp_path):
+    """FIX 2 (collision guard): when the forced PeerChannel fallback resolves an
+    UNRELATED channel (different real id), the result is discarded — never cached
+    as the requested id's identity, so a numeric overlap can't mis-label a sender."""
+    from telethon.tl.types import PeerChannel
+
+    # requested id 555 is actually a USER; get_entity(555) raises, and the forced
+    # PeerChannel(555) resolves an unrelated channel whose real id is 999.
+    wrong = types.SimpleNamespace(
+        id=999, title="Unrelated Channel", username="unrelated",
+        broadcast=True, megagroup=False,
+    )
+
+    class _CollisionClient:
+        def __init__(self):
+            self.calls = 0
+
+        async def get_entity(self, ref):
+            self.calls += 1
+            if isinstance(ref, PeerChannel):
+                return wrong
+            raise ValueError(f"Cannot find any entity corresponding to {ref!r}")
+
+        async def iter_dialogs(self, *, limit=None):  # noqa: ARG002
+            for _ in ():
+                yield _
+
+    store = TelegramDigestStore(db_path=tmp_path / "digest.db")
+    proxy = tp.TelegramProxy()
+    proxy._digest_store = store
+    proxy._client = _CollisionClient()
+
+    body = await proxy.resolve_sender(555)
+    assert body["error"] == "LookupError"          # collision rejected → not found
+    assert body["kind"] is None
+    assert body["username"] is None
+    assert store.get_lead_sender(555) is None       # NOT cached under the requested id
+    assert store.get_lead_sender(999) is None       # unrelated channel never attributed

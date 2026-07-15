@@ -184,8 +184,8 @@ def test_notify_operator_resolves_file_delivered_token(tmp_path, monkeypatch):
 
     token_file = tmp_path / "tok"
     token_file.write_text("file-token-123\n")
-    monkeypatch.delenv("IRONLADY_NOTIFY_BOT_TOKEN", raising=False)
-    monkeypatch.setenv("IRONLADY_NOTIFY_BOT_TOKEN_FILE", str(token_file))
+    monkeypatch.delenv("AGGREGATOR_ALERT_BOT_TOKEN", raising=False)
+    monkeypatch.setenv("AGGREGATOR_ALERT_BOT_TOKEN_FILE", str(token_file))
     monkeypatch.setenv("AGGREGATOR_OPERATOR_CHAT_ID", "42")
 
     captured = {}

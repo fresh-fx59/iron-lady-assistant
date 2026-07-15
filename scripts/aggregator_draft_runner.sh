@@ -69,9 +69,11 @@ run_draft() {
 # fine: pipefail makes the pipeline's exit status the rightmost non-zero exit
 # (the python gate command), not tee's — so a gate-failed/parse-error/
 # input-error exit from the CLI still trips `if ! gate`.
+# --auto-approve: hands-off daily flow (operator 2026-07-15) — a gated draft is
+# approved immediately; publish at 07:47 posts it. No draft-ready pings.
 gate() {
   "$PY" -m src.telegram_aggregator_tool gate \
-    --draft "$DRAFT" --input "$INPUT" --date "$TODAY" \
+    --draft "$DRAFT" --input "$INPUT" --date "$TODAY" --auto-approve \
     | tee "$STATE_DIR/drafts/$TODAY-gate.json"
 }
 
@@ -96,27 +98,6 @@ EOF
   exit 1; }
 fi
 
-"$PY" - "$TODAY" <<'EOF'
-import json, sys
-from src.telegram_aggregator import resolve_paths
-from src.telegram_aggregator_publish import DigestLedger, notify_operator
-today = sys.argv[1]
-paths = resolve_paths()
-# Best-effort preview: an unreadable/malformed gate or draft file must not
-# crash the runner — fall back to a plain "draft ready, see state dir" ping
-# instead (notify_operator itself never raises either way).
-try:
-    gate = json.loads((paths.drafts_dir / f"{today}-gate.json").read_text())
-    preview = "\n".join(
-        f"• {s['headline']}" for s in json.loads((paths.drafts_dir / f"{today}-draft.json").read_text())["stories"]
-    )
-    notify_operator(
-        f"📰 Черновик дайджеста {today} готов: {gate['stories']} сюжетов, {gate['messages']} сообщ.\n{preview}\n\n"
-        f"Одобрить: aggregator approve  (затем publish в 07:47 UTC)"
-    )
-except Exception:
-    notify_operator(
-        f"📰 Черновик дайджеста {today} готов — см. {paths.drafts_dir}.\n"
-        f"Одобрить: aggregator approve  (затем publish в 07:47 UTC)"
-    )
-EOF
+# No success notify (operator 2026-07-15: alerts on problems only — the daily
+# post itself is the success signal). The approved draft publishes at 07:47 UTC.
+echo "draft gated + auto-approved for $TODAY; publish fires 07:47 UTC" >>"$LOG_DIR/$TODAY-runner.log"

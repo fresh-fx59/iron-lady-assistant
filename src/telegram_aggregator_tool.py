@@ -97,14 +97,29 @@ def _cmd_gate(args: argparse.Namespace) -> int:
     if not result.ok:
         _print({"status": "gate-failed", "errors": result.errors})
         return 1
-    messages = render_messages(result.stories, date_label=date_label, footer=FOOTER)
+    # ONE message per day, hard rule (operator 2026-07-15). Stories arrive
+    # importance-ordered from the draft; trim from the tail until the whole
+    # digest fits a single Telegram message.
+    kept = list(result.stories)
+    messages = render_messages(kept, date_label=date_label, footer=FOOTER)
+    while len(messages) > 1 and len(kept) > 1:
+        kept.pop()
+        messages = render_messages(kept, date_label=date_label, footer=FOOTER)
+    if len(messages) > 1:
+        _print({"status": "gate-failed", "errors": ["single story cannot fit one message"]})
+        return 1
     ledger = DigestLedger(paths.state_dir / "ledger.db")
     ledger.upsert_draft(date_key, messages)
+    status = "pending"
+    if args.auto_approve:
+        ledger.approve(date_key)
+        status = "approved"
     _print(
         {
-            "status": "pending",
+            "status": status,
             "date_key": date_key,
-            "stories": len(result.stories),
+            "stories": len(kept),
+            "trimmed_to_fit": len(result.stories) - len(kept),
             "messages": len(messages),
             "dropped": result.errors,
         }
@@ -129,9 +144,9 @@ def _cmd_publish(args: argparse.Namespace) -> int:
     transport = BotApiTransport(token) if token else None
     result = publish_next(ledger, transport, chat or None, dry_run=args.dry_run)
     _print(result)
-    if result["status"] == "posted":
-        notify_operator(f"✅ Дайджест {result['date_key']} опубликован ({result['messages']} сообщ.)")
-    elif result["status"] in ("failed", "blocked"):
+    # Problems-only alerting (operator 2026-07-15): success is silent — the
+    # published post itself is the signal.
+    if result["status"] in ("failed", "blocked"):
         notify_operator(f"❌ Публикация дайджеста: {result['status']} — {result.get('error', 'см. журнал')}")
     return 0 if result["status"] in ("posted", "dry-run", "skipped") else 1
 
@@ -165,6 +180,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--draft", required=True)
     p.add_argument("--input", required=True)
     p.add_argument("--date", default=None)
+    p.add_argument("--auto-approve", action="store_true")
     p.set_defaults(func=_cmd_gate)
 
     p = sub.add_parser("approve")

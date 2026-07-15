@@ -178,6 +178,19 @@ class TelegramDigestStore:
                 )
                 """
             )
+            # Additive migration: the cache now holds ANY resolved Telegram
+            # entity (user/chat/channel), not just message senders, so it carries
+            # a display ``title`` and its ``kind``. ADD COLUMN with no default is a
+            # metadata-only change in SQLite (no table rewrite); legacy rows read
+            # back with NULL title/kind and get_lead_sender falls title→name for
+            # them, so old cached users keep resolving exactly as before.
+            sender_cols = {
+                row["name"] for row in con.execute("PRAGMA table_info(lead_senders)").fetchall()
+            }
+            if "title" not in sender_cols:
+                con.execute("ALTER TABLE lead_senders ADD COLUMN title TEXT")
+            if "kind" not in sender_cols:
+                con.execute("ALTER TABLE lead_senders ADD COLUMN kind TEXT")
 
     def upsert_source(
         self,
@@ -321,18 +334,25 @@ class TelegramDigestStore:
     def get_lead_sender(self, sender_id: int) -> dict[str, Any] | None:
         with self._connect() as con:
             row = con.execute(
-                "SELECT sender_id, username, name, is_bot, resolved_at "
+                "SELECT sender_id, username, name, is_bot, resolved_at, title, kind "
                 "FROM lead_senders WHERE sender_id = ?",
                 (int(sender_id),),
             ).fetchone()
         if row is None:
             return None
+        name = str(row["name"] or "")
+        # Legacy rows predate the title column — fall back to the stored name so a
+        # cache hit on an old user still yields a display label.
+        title = row["title"]
+        title = str(title) if title is not None else name
         return {
             "sender_id": int(row["sender_id"]),
             "username": row["username"],
-            "name": str(row["name"] or ""),
+            "name": name,
             "is_bot": bool(row["is_bot"]),
             "resolved_at": row["resolved_at"],
+            "title": title,
+            "kind": row["kind"],
         }
 
     def upsert_lead_sender(
@@ -342,20 +362,27 @@ class TelegramDigestStore:
         username: str | None,
         name: str,
         is_bot: bool,
+        title: str | None = None,
+        kind: str | None = None,
     ) -> None:
+        # title defaults to name so a caller that only knows a display name (or an
+        # older caller that never learned about titles) still populates the column.
+        title = name if title is None else title
         now = _isoformat(_utc_now())
         with self._connect() as con:
             con.execute(
                 """
-                INSERT INTO lead_senders(sender_id, username, name, is_bot, resolved_at)
-                VALUES (?, ?, ?, ?, ?)
+                INSERT INTO lead_senders(sender_id, username, name, is_bot, resolved_at, title, kind)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(sender_id) DO UPDATE SET
                     username = excluded.username,
                     name = excluded.name,
                     is_bot = excluded.is_bot,
-                    resolved_at = excluded.resolved_at
+                    resolved_at = excluded.resolved_at,
+                    title = excluded.title,
+                    kind = excluded.kind
                 """,
-                (int(sender_id), username, name, 1 if is_bot else 0, now),
+                (int(sender_id), username, name, 1 if is_bot else 0, now, title, kind),
             )
 
     def list_sources(self, roles: Sequence[str] | None = None) -> list[SourceRecord]:

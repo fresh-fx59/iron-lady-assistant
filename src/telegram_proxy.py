@@ -863,56 +863,192 @@ class TelegramProxy:
         max_id = items[-1]["id"] if items else since_id
         return {"items": items, "max_id": max_id, "count": len(items)}
 
+    @staticmethod
+    def _entity_kind(entity: Any) -> str:
+        """Classify a resolved Telethon entity as ``user``/``chat``/``channel``.
+
+        Duck-typed so it works on both real Telethon types and the lightweight
+        fakes tests inject:
+          * a **Channel** (broadcast channel OR megagroup) carries the
+            ``broadcast``/``megagroup`` flags — a megagroup is a Channel with
+            ``megagroup=True``, so both map to ``channel``;
+          * a basic-group **Chat** has a ``title`` but no personal name;
+          * everything else is a **User**.
+        """
+        if hasattr(entity, "broadcast") or hasattr(entity, "megagroup"):
+            return "channel"
+        has_person_name = bool(getattr(entity, "first_name", None)) or bool(
+            getattr(entity, "last_name", None)
+        )
+        if getattr(entity, "title", None) and not has_person_name:
+            return "chat"
+        return "user"
+
+    @classmethod
+    def _entity_identity(cls, entity: Any) -> tuple[str, str | None, str, bool]:
+        """Return ``(kind, username, title, is_bot)`` for a resolved entity.
+
+        ``title`` is the display label: a user's ``"<first> <last>"`` trimmed,
+        else the chat/channel ``title``. ``username`` is ``None`` for a private
+        group / a basic group with no public handle.
+        """
+        kind = cls._entity_kind(entity)
+        username = getattr(entity, "username", None)
+        is_bot = bool(getattr(entity, "bot", False))
+        if kind == "user":
+            first = (getattr(entity, "first_name", None) or "").strip()
+            last = (getattr(entity, "last_name", None) or "").strip()
+            title = " ".join(part for part in (first, last) if part)
+            if not title:  # deleted account / name-less user
+                title = (getattr(entity, "title", None) or "").strip()
+        else:
+            title = (getattr(entity, "title", None) or "").strip()
+        return kind, username, title, is_bot
+
+    @staticmethod
+    def _entity_envelope(
+        entity_id: int,
+        *,
+        kind: str | None,
+        username: str | None,
+        title: str,
+        is_bot: bool,
+        cached: bool,
+        error: str | None = None,
+    ) -> dict[str, Any]:
+        """The uniform resolve envelope shared by hit/miss/error paths.
+
+        Backward-compat: ``sender_id`` (== ``id``) and ``name`` (== ``title``)
+        are kept so existing callers keep working; every key is always present.
+        """
+        return {
+            "id": entity_id,
+            "sender_id": entity_id,
+            "kind": kind,
+            "username": username,
+            "title": title,
+            "name": title,
+            "is_bot": is_bot,
+            "cached": cached,
+            "error": error,
+        }
+
+    @staticmethod
+    def _marked_channel_peer(entity_id: int) -> Any:
+        """The ``-100``-prefixed marked (``PeerChannel``) form of a bare id.
+
+        A bare internal id (e.g. a megagroup ``1976968455``) does not always
+        resolve directly; retried as its marked channel peer it does. Returns
+        ``None`` for a non-positive id (already marked/invalid).
+        """
+        if entity_id <= 0:
+            return None
+        try:
+            from telethon.tl.types import PeerChannel
+        except Exception:  # pragma: no cover - dependency failure
+            return None
+        return PeerChannel(entity_id)
+
+    async def _dialog_entity_by_id(self, entity_id: int) -> Any:
+        """Look an entity up by bare id in the joined-dialogs cache.
+
+        The joined lead groups are already in ``iter_dialogs``, so priming the
+        cache is cheap and hits no per-entity Telegram lookup (no ban risk).
+        """
+        for (_kind, cached_id), entity in self._entity_cache.items():
+            if cached_id == entity_id:
+                return entity
+        await self._prime_entity_cache_from_dialogs()
+        for (_kind, cached_id), entity in self._entity_cache.items():
+            if cached_id == entity_id:
+                return entity
+        return None
+
+    async def _resolve_entity_identity(self, entity_id: int) -> Any:
+        """Resolve ANY Telegram entity (user/chat/channel) on the EXISTING client.
+
+        Cheapest tier first:
+          1. ``get_entity(id)`` — users and any peer already in the session;
+          2. ``get_entity(PeerChannel(id))`` — a bare chat/channel internal id
+             via its ``-100``-marked form;
+          3. the joined-dialogs entity cache — a group we are a member of.
+        A transient failure (FloodWait/RPC) from tier 1 propagates unchanged so
+        the caller can fail open; only a "not found" (``ValueError``) falls
+        through to the cheaper local tiers.
+        """
+        client = self._require_client()
+        async with self._lock:
+            try:
+                return await client.get_entity(entity_id)
+            except ValueError:
+                peer = self._marked_channel_peer(entity_id)
+                if peer is not None:
+                    try:
+                        return await client.get_entity(peer)
+                    except ValueError:
+                        pass
+        # Tier 3 primes from dialogs, which takes self._lock itself — so it must
+        # run OUTSIDE the block above (asyncio.Lock is not re-entrant).
+        entity = await self._dialog_entity_by_id(entity_id)
+        if entity is not None:
+            return entity
+        raise LookupError(f"entity {entity_id} is not resolvable")
+
     async def resolve_sender(self, sender_id: int) -> dict[str, Any]:
-        """Resolve a lead sender's identity, caching the result in the digest db.
+        """Resolve ANY Telegram entity's identity, caching it in the digest db.
+
+        Generalised from message-sender resolution: the same ``get_entity`` path
+        resolves a user, a basic-group chat, or a channel/megagroup, so the lead
+        scorer can resolve BOTH a lead's sender and its group through one call.
 
         Cache hit ⇒ no network call (``cached=true``). Cache miss ⇒ one
-        ``get_entity`` on the EXISTING client, then cache. FloodWait/RPC/any
-        lookup error ⇒ a tolerant envelope with an ``error`` field at HTTP 200
-        (the caller treats an unresolved sender as acceptable); the failure is
-        NOT cached so a later retry can still succeed.
+        ``get_entity`` on the EXISTING client (with a marked-id + dialogs-cache
+        fallback), then cache. FloodWait/RPC/any lookup error ⇒ a tolerant
+        envelope with an ``error`` field at HTTP 200 (the caller treats an
+        unresolved entity as acceptable); the failure is NOT cached so a later
+        retry can still succeed.
         """
         sender_id = int(sender_id)
         store = self._get_digest_store()
         cached = store.get_lead_sender(sender_id)
         if cached is not None:
-            return {
-                "sender_id": sender_id,
-                "username": cached["username"],
-                "name": cached["name"],
-                "is_bot": bool(cached["is_bot"]),
-                "cached": True,
-            }
-        client = self._require_client()
+            return self._entity_envelope(
+                sender_id,
+                kind=cached["kind"],
+                username=cached["username"],
+                title=cached["title"],
+                is_bot=bool(cached["is_bot"]),
+                cached=True,
+            )
         try:
-            async with self._lock:
-                entity = await client.get_entity(sender_id)
+            entity = await self._resolve_entity_identity(sender_id)
         except Exception as exc:  # noqa: BLE001 — fail open; caller tolerates
-            return {
-                "sender_id": sender_id,
-                "username": None,
-                "name": "",
-                "is_bot": False,
-                "error": type(exc).__name__,
-            }
-        username = getattr(entity, "username", None)
-        first = (getattr(entity, "first_name", None) or "").strip()
-        last = (getattr(entity, "last_name", None) or "").strip()
-        name = " ".join(part for part in (first, last) if part)
-        if not name:
-            # Channels/chats appearing as a sender expose a title, not a name.
-            name = (getattr(entity, "title", None) or "").strip()
-        is_bot = bool(getattr(entity, "bot", False))
+            return self._entity_envelope(
+                sender_id,
+                kind=None,
+                username=None,
+                title="",
+                is_bot=False,
+                cached=False,
+                error=type(exc).__name__,
+            )
+        kind, username, title, is_bot = self._entity_identity(entity)
         store.upsert_lead_sender(
-            sender_id=sender_id, username=username, name=name, is_bot=is_bot
+            sender_id=sender_id,
+            username=username,
+            name=title,
+            is_bot=is_bot,
+            title=title,
+            kind=kind,
         )
-        return {
-            "sender_id": sender_id,
-            "username": username,
-            "name": name,
-            "is_bot": is_bot,
-            "cached": False,
-        }
+        return self._entity_envelope(
+            sender_id,
+            kind=kind,
+            username=username,
+            title=title,
+            is_bot=is_bot,
+            cached=False,
+        )
 
     # ── Paced, ban-safe JOIN ──────────────────────────────────────
     def _get_join_store(self) -> JoinStore:

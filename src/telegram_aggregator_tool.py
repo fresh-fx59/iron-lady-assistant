@@ -99,7 +99,9 @@ def _cmd_gate(args: argparse.Namespace) -> int:
         return 1
     # ONE message per day, hard rule (operator 2026-07-15). Stories arrive
     # importance-ordered from the draft; trim from the tail until the whole
-    # digest fits a single Telegram message.
+    # digest fits a single Telegram message. Deliberately NO min-stories floor
+    # here: a 1-2 story digest of important news beats no digest, and the
+    # trimmed_to_fit count in the gate JSON keeps the trim visible.
     kept = list(result.stories)
     messages = render_messages(kept, date_label=date_label, footer=FOOTER)
     while len(messages) > 1 and len(kept) > 1:
@@ -112,8 +114,10 @@ def _cmd_gate(args: argparse.Namespace) -> int:
     ledger.upsert_draft(date_key, messages)
     status = "pending"
     if args.auto_approve:
-        ledger.approve(date_key)
-        status = "approved"
+        # approve() returns None when the row was NOT pending — e.g. today's
+        # digest already posted and a runner re-run upserted nothing. Report
+        # what actually happened instead of claiming "approved".
+        status = "approved" if ledger.approve(date_key) else "already-final"
     _print(
         {
             "status": status,

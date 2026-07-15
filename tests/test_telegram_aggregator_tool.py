@@ -169,3 +169,37 @@ def test_gate_single_message_trims_and_auto_approves(state, capsys):
     item = ledger.next_approved()
     assert item is not None and item[0] == "2026-07-14"
     assert len(item[1]) == 1 and len(item[1][0]) <= 4000
+
+
+def test_gate_trim_below_three_is_allowed_and_rerun_after_posted_reports_final(state, capsys):
+    """The one-message rule outranks the 3-story gate floor (intentional); a
+    same-day re-run after publishing must not lie about approving."""
+    links = [(f"https://t.me/chan/{i}", "длинный исходный текст про ИИ " * 10) for i in range(3)]
+    input_path = _write_input(state, links)
+    huge = [
+        {"headline": ("Сюжет " + str(i) + " х" * 100)[:118], "summary": "с" * 399,
+         "source_links": [f"https://t.me/chan/{i}"]}
+        for i in range(3)
+    ]
+    # Inflate per-story size via max links? Keep single link; force trim by many stories instead.
+    many = [
+        {"headline": f"Сюжет {i}", "summary": "с" * 399, "source_links": ["https://t.me/chan/0"]}
+        for i in range(3)
+    ]
+    draft_path = _write_draft(state, many * 4)  # 12 near-max stories -> must trim hard
+    rc = main(["gate", "--draft", str(draft_path), "--input", str(input_path),
+               "--date", "2026-07-14", "--auto-approve"])
+    assert rc == 0
+    out = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
+    assert out["messages"] == 1 and out["status"] == "approved"
+
+    # simulate published, then a re-run: upsert no-ops, approve returns None
+    ledger = DigestLedger(state / "ledger.db")
+    key, _ = ledger.next_approved()
+    assert ledger.begin_send(key)
+    ledger.mark_posted(key)
+    rc = main(["gate", "--draft", str(draft_path), "--input", str(input_path),
+               "--date", "2026-07-14", "--auto-approve"])
+    assert rc == 0
+    out = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
+    assert out["status"] == "already-final"

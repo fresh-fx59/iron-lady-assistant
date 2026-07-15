@@ -175,3 +175,30 @@ def test_publish_dry_run_reverts_via_public_method(tmp_path):
     ledger.revert_to_approved("2026-07-14")
     row = _row(tmp_path, "2026-07-14")
     assert row["status"] == "approved"
+
+
+def test_notify_operator_resolves_file_delivered_token(tmp_path, monkeypatch):
+    """Regression: the runner heredocs call notify_operator with only the
+    *_FILE env set (2026-07-15 silent-False bug) — it must self-resolve."""
+    import src.telegram_aggregator_publish as pub
+
+    token_file = tmp_path / "tok"
+    token_file.write_text("file-token-123\n")
+    monkeypatch.delenv("IRONLADY_NOTIFY_BOT_TOKEN", raising=False)
+    monkeypatch.setenv("IRONLADY_NOTIFY_BOT_TOKEN_FILE", str(token_file))
+    monkeypatch.setenv("AGGREGATOR_OPERATOR_CHAT_ID", "42")
+
+    captured = {}
+
+    class CapturingTransport:
+        def __init__(self, token):
+            captured["token"] = token
+
+        def send_message(self, chat, text):
+            captured["chat"] = chat
+            captured["text"] = text
+            return 1
+
+    monkeypatch.setattr(pub, "BotApiTransport", CapturingTransport)
+    assert pub.notify_operator("привет") is True
+    assert captured == {"token": "file-token-123", "chat": "42", "text": "привет"}

@@ -307,6 +307,12 @@ def publish_next(
 
 def notify_operator(text: str) -> bool:
     """Operator ping via the iron-lady bot token — plain code, no LLM in the path."""
+    # Resolve *_FILE-delivered secrets here, not at call sites: the runner's
+    # python heredocs call this directly and (2026-07-15 bug) got a silent False
+    # because only IRONLADY_NOTIFY_BOT_TOKEN_FILE was set in the unit env.
+    from .telegram_aggregator import load_file_env
+
+    load_file_env()
     token = os.getenv("IRONLADY_NOTIFY_BOT_TOKEN", "").strip()
     chat_id = os.getenv("AGGREGATOR_OPERATOR_CHAT_ID", "").strip()
     if not token or not chat_id:

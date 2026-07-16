@@ -22,7 +22,19 @@ mkdir -p "$LOG_DIR"
 exec 9>"$STATE_DIR/draft-runner.lock"
 flock -n 9 || { echo "another draft run is active; exiting"; exit 0; }
 
-git -C "$REPO_DIR" pull --ff-only 2>>"$LOG_DIR/$TODAY-runner.log" || true
+# Deploy step. When AGGREGATOR_DEPLOY_REF is set (a reviewed commit SHA or tag),
+# check that EXACT ref out instead of advancing to whatever is newest on
+# origin/main. This makes a deploy a deliberate act: new code runs only after the
+# ref is bumped to a reviewed commit, closing the "a merge to main auto-executes
+# here (as a passwordless-sudo user) within 24h" gap. Branch protection keeps main
+# reviewed; the pin keeps the DEPLOY chosen rather than automatic. Unset = the
+# original `pull --ff-only` behavior, so this is a no-op until the ref is set.
+if [ -n "${AGGREGATOR_DEPLOY_REF:-}" ]; then
+  git -C "$REPO_DIR" fetch --quiet origin 2>>"$LOG_DIR/$TODAY-runner.log" || true
+  git -C "$REPO_DIR" checkout --quiet --force "$AGGREGATOR_DEPLOY_REF" 2>>"$LOG_DIR/$TODAY-runner.log" || true
+else
+  git -C "$REPO_DIR" pull --ff-only 2>>"$LOG_DIR/$TODAY-runner.log" || true
+fi
 
 cd "$REPO_DIR"
 INPUT="$STATE_DIR/drafts/$TODAY-input.json"

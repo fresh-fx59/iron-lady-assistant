@@ -303,6 +303,10 @@ TELEGRAM_DIGEST_COLLECT_INTERVAL_MINUTES: int = max(
     int(os.getenv("TELEGRAM_DIGEST_COLLECT_INTERVAL_MINUTES", "180")),
 )
 TELEGRAM_DIGEST_WINDOW_HOURS: int = max(1, int(os.getenv("TELEGRAM_DIGEST_WINDOW_HOURS", "24")))
+# Name the daily digest prompts address the summary to. Kept configurable so the
+# public code carries no real recipient name; set DIGEST_RECIPIENT_NAME in your
+# private .env. Neutral default keeps the prompt grammatical when unset.
+DIGEST_RECIPIENT_NAME: str = os.getenv("DIGEST_RECIPIENT_NAME", "the user").strip() or "the user"
 
 # ── Memory system ─────────────────────────────────────────
 _raw_memory_dir = os.getenv("MEMORY_DIR") or None

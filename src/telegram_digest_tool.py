@@ -31,7 +31,7 @@ def _build_daily_prompt(brief_path: Path) -> str:
     return (
         "[[SCHEDULE_DELIVER]]\n"
         "USE_TOOL: edge-tts-safe\n"
-        "You are preparing Samarin's daily Telegram digest for Alex.\n"
+        f"You are preparing {config.DIGEST_RECIPIENT_NAME}'s daily Telegram digest.\n"
         f"Read the latest collected briefing from: {brief_path}\n"
         "Write in Russian.\n"
         "Keep it short and executive: 5-10 bullets max, then a one-sentence conclusion.\n"

@@ -1,10 +1,10 @@
 # Server Setup Guide
 
-Reproducible setup for Alex's server. Follow this if migrating to a new server.
+Reproducible setup for your server. Follow this if migrating to a new server.
 
 ## Server Info
 
-- **IP**: 31.220.78.216
+- **IP**: 203.0.113.10
 - **OS**: Ubuntu 24.04.4 LTS (Noble Numbat)
 - **Kernel**: 6.8.0-101-generic
 - **User**: `claude-developer` (UID 1000, groups: sudo, docker)
@@ -87,7 +87,7 @@ cd /home/claude-developer
 git clone https://github.com/fresh-fx59/claude-code-as-assistant.git
 cd claude-code-as-assistant
 cp .env.example .env
-# Edit .env: set TELEGRAM_BOT_TOKEN, ALLOWED_USER_IDS=314102923, DEFAULT_MODEL=haiku
+# Edit .env: set TELEGRAM_BOT_TOKEN, ALLOWED_USER_IDS=<your-telegram-user-id>, DEFAULT_MODEL=haiku
 ```
 
 ### Create work directory
@@ -227,7 +227,7 @@ docker compose restart
 
 Access web UI via SSH tunnel:
 ```bash
-ssh -L 8384:localhost:8384 claude-developer@31.220.78.216
+ssh -L 8384:localhost:8384 <user>@<your-server-ip>
 # Then open http://localhost:8384 in browser
 ```
 
@@ -250,12 +250,12 @@ Docker containers running:
 
 ## 6. Cloudflare Free Geo Steering (Implemented 2026-02-27)
 
-Target zone: `aiengineerhelper.com`
+Target zone: `example.com`
 
 Goal:
 - Keep Cloudflare in front
-- Route `RU` traffic to monitoring origin (`45.151.30.146`)
-- Route non-`RU` traffic to primary origin (`31.220.78.216`)
+- Route `RU` traffic to monitoring origin (`198.51.100.20`)
+- Route non-`RU` traffic to primary origin (`203.0.113.10`)
 
 ### Implementation
 
@@ -263,28 +263,28 @@ Goal:
 - Worker script: `geo-origin-steering`
 - Script source in repo: `tools/cloudflare/geo-origin-steering.js`
 - Worker routes:
-  - `aiengineerhelper.com/*`
-  - `crossposter.aiengineerhelper.com/*`
+  - `example.com/*`
+  - `crossposter.example.com/*`
 - Internal DNS records used by `resolveOverride`:
-  - `cf-origin-main.aiengineerhelper.com -> 31.220.78.216` (proxied)
-  - `cf-origin-ru.aiengineerhelper.com -> 45.151.30.146` (proxied)
+  - `cf-origin-main.example.com -> 203.0.113.10` (proxied)
+  - `cf-origin-ru.example.com -> 198.51.100.20` (proxied)
 - Response debug headers from Worker:
   - `X-Origin-Selected: main|ru|main-fallback|ru-fallback`
   - `X-CF-Country: <country code>`
 
 ### Monitoring server path
 
-`45.151.30.146` currently handles:
-- `:80` HTTP reverse proxy to `31.220.78.216:80` for:
-  - `aiengineerhelper.com`
-  - `crossposter.aiengineerhelper.com`
-- `:443` TLS passthrough (`nginx stream`) to `31.220.78.216:443` based on SNI for the same hostnames
+`198.51.100.20` currently handles:
+- `:80` HTTP reverse proxy to `203.0.113.10:80` for:
+  - `example.com`
+  - `crossposter.example.com`
+- `:443` TLS passthrough (`nginx stream`) to `203.0.113.10:443` based on SNI for the same hostnames
 
 ### TLS notes
 
 - Both origins present Cloudflare Origin CA cert with SAN:
-  - `aiengineerhelper.com`
-  - `*.aiengineerhelper.com`
+  - `example.com`
+  - `*.example.com`
 - Cloudflare SSL mode should be `Full (strict)`.
 - API token used on 2026-02-27 did not have zone SSL settings permission (`error 9109`), so SSL mode must be verified/set in dashboard or with a broader token.
 
@@ -292,15 +292,15 @@ Goal:
 
 ```bash
 # Edge result should include worker headers
-curl -sSI https://aiengineerhelper.com | grep -iE 'x-origin-selected|x-cf-country|^HTTP'
-curl -sSI https://crossposter.aiengineerhelper.com | grep -iE 'x-origin-selected|x-cf-country|^HTTP'
+curl -sSI https://example.com | grep -iE 'x-origin-selected|x-cf-country|^HTTP'
+curl -sSI https://crossposter.example.com | grep -iE 'x-origin-selected|x-cf-country|^HTTP'
 
 # Confirm monitoring origin ports are open
-nc -zv 45.151.30.146 80 443
+nc -zv 198.51.100.20 80 443
 
 # Direct origin checks (Origin CA is not publicly trusted; use -k for local probe)
-curl -k -sSI --resolve aiengineerhelper.com:443:31.220.78.216 https://aiengineerhelper.com | head
-curl -k -sSI --resolve aiengineerhelper.com:443:45.151.30.146 https://aiengineerhelper.com | head
+curl -k -sSI --resolve example.com:443:203.0.113.10 https://example.com | head
+curl -k -sSI --resolve example.com:443:198.51.100.20 https://example.com | head
 ```
 
 ## Ports Summary

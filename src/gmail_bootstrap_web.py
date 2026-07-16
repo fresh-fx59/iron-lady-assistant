@@ -537,7 +537,7 @@ def _render_session_html(base_url: str, session: GmailBootstrapSession) -> str:
                 "<ol>",
                 "<li>Open Google Cloud Console and select the same project as your uploaded bootstrap OAuth client.</li>",
                 "<li>Go to <strong>OAuth consent screen</strong> and set publishing status to <strong>Testing</strong>.</li>",
-                "<li>Add your Gmail account to <strong>Test users</strong> (for example <code>fresh.fx59@gmail.com</code>).</li>",
+                "<li>Add your Gmail account to <strong>Test users</strong> (for example <code>you@example.com</code>).</li>",
                 "<li>Go to <strong>Credentials</strong> and create an <strong>OAuth client ID</strong> (Web application).</li>",
                 f"<li>Add redirect URI <code>{html.escape(google_callback_uri)}</code> exactly.</li>",
                 "<li>Download the OAuth client JSON and upload it below.</li>",

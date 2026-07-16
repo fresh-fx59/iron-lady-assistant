@@ -537,6 +537,8 @@ sudo systemctl daemon-reload
 sudo systemctl enable --now telegram-proxy.service
 ```
 
+For a **public** daily digest published to its own Telegram channel (collect from source channels via the read proxy → LLM draft → deterministic gates → Bot API publish, with a crash-safe 2-phase ledger), see [docs/telegram-aggregator.md](docs/telegram-aggregator.md).
+
 ### F08 Governance Validator (Monitor-Only)
 
 Use this validator during rollout to ensure F08 remains in non-interfering mode while baseline data accumulates:

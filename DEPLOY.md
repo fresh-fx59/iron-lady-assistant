@@ -1,6 +1,6 @@
 # Deployment
 
-This app runs on **contabo (`vmi3085355`)** as NixOS-managed systemd units. It is **NOT**
+This app runs on **your NixOS host (`<your-host>`)** as NixOS-managed systemd units. It is **NOT**
 deployed via a `deploy.sh` / GitHub Action (those were removed 2026-07-14 — they targeted a
 pre-migration host and a dead path `/home/claude-developer/claude-code-as-assistant`, and
 following them would have deployed nothing).

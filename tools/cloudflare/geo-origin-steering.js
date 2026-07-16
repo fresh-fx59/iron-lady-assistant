@@ -6,8 +6,8 @@ async function handleRequest(request) {
   const country = request.cf && request.cf.country ? request.cf.country : "XX";
   const isRu = country === "RU";
 
-  const primary = "cf-origin-main.aiengineerhelper.com";
-  const ru = "cf-origin-ru.aiengineerhelper.com";
+  const primary = "cf-origin-main.example.com";
+  const ru = "cf-origin-ru.example.com";
 
   const first = isRu ? ru : primary;
   const second = isRu ? primary : ru;

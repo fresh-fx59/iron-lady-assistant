@@ -450,7 +450,7 @@ class TelegramDigestStore:
                 f"Window hours: {window_hours}",
                 f"Sources with activity: {len(sources)}",
                 "",
-                "Summarize this into a short Russian digest for Samarin.",
+                f"Summarize this into a short Russian digest for {config.DIGEST_RECIPIENT_NAME}.",
                 "Cover what happened over the last window across channel posts and linked discussion chats.",
                 "Focus on important events, what people discussed, repeated signals across sources, and what changed.",
                 "Include only a few source links when they are truly important.",

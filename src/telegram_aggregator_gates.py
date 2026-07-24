@@ -124,8 +124,10 @@ def run_gates(
     *,
     known_links: set[str],
     source_texts: list[str],
+    blocked_links: set[str] = frozenset(),
     min_stories: int = 3,
     max_stories: int = 12,
+    window_days: int = 7,
 ) -> GateResult:
     surviving: list[Story] = []
     errors: list[str] = []
@@ -145,6 +147,16 @@ def run_gates(
             continue
         if any(link not in known_links for link in story.source_links):
             errors.append(f"drop '{label}': unknown link (not in collected window)")
+            continue
+        # Deterministic cross-day backstop: drop ONLY when EVERY source link
+        # already shipped in the rolling window — that story is fully covered. A
+        # genuinely-new story that merely re-shares one still-in-window url but
+        # also cites fresh ones is kept (source_links is guaranteed non-empty by
+        # the 1-8 check above, so all() is safe / never vacuously true).
+        if all(link in blocked_links for link in story.source_links):
+            errors.append(
+                f"drop '{label}': source already published in last {window_days} days"
+            )
             continue
         if _has_verbatim_overlap(f"{story.headline} {story.summary}", source_texts):
             errors.append(f"drop '{label}': verbatim overlap with a source")

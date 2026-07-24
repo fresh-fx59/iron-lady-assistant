@@ -205,6 +205,7 @@ def build_draft_input(
     *,
     window_hours: int = 24,
     max_posts: int = 150,
+    recent_headlines: list[dict] | None = None,
 ) -> dict[str, Any]:
     cutoff = (_utc_now() - timedelta(hours=window_hours)).isoformat()
     con = sqlite3.connect(store._db_path)  # noqa: SLF001 — same-package, own db file
@@ -247,4 +248,7 @@ def build_draft_input(
         "date": _utc_now().date().isoformat(),
         "window_hours": window_hours,
         "posts": posts,
+        # Prior-window shipped headlines: the LLM must not repeat these (A1
+        # semantic dedup). Kept ledger-free / pure — the CLI supplies the list.
+        "recent_headlines": recent_headlines or [],
     }

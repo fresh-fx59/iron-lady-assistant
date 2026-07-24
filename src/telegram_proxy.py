@@ -882,16 +882,19 @@ class TelegramProxy:
             self._digest_store = TelegramDigestStore()
         return self._digest_store
 
-    def lead_candidates(self, *, since_id: int, limit: int) -> dict[str, Any]:
+    def lead_candidates(
+        self, *, since_id: int, limit: int, since_ts: str | None = None
+    ) -> dict[str, Any]:
         """Page the lead-candidate feed from the digest db (this call only reads).
 
         Returns the contract envelope ``{items, max_id, count}``. ``max_id`` is
         the largest rowid returned so the caller can pass it straight back as the
         next ``since_id``; when nothing new is available it echoes ``since_id`` so
-        the cursor never rewinds.
+        the cursor never rewinds. ``since_ts`` is an optional recency floor passed
+        through to the store (skips the months-old backlog — see its docstring).
         """
         store = self._get_digest_store()
-        items = store.lead_candidates(since_id=since_id, limit=limit)
+        items = store.lead_candidates(since_id=since_id, since_ts=since_ts, limit=limit)
         # items are ordered by rowid ASC, so the last one carries the max rowid.
         max_id = items[-1]["id"] if items else since_id
         return {"items": items, "max_id": max_id, "count": len(items)}
@@ -1653,7 +1656,11 @@ async def _leads_candidates(request: web.Request) -> web.Response:
         limit = max(1, min(2000, int(request.query.get("limit", "500"))))
     except ValueError:
         raise web.HTTPBadRequest(text="limit must be an integer.") from None
-    return web.json_response(proxy.lead_candidates(since_id=since_id, limit=limit))
+    # Optional recency floor (ISO-8601 UTC). Empty/missing → no floor (back-compat).
+    since_ts = (request.query.get("since_ts") or "").strip() or None
+    return web.json_response(
+        proxy.lead_candidates(since_id=since_id, limit=limit, since_ts=since_ts)
+    )
 
 
 async def _lead_user(request: web.Request) -> web.Response:

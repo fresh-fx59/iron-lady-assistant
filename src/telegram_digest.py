@@ -285,7 +285,9 @@ class TelegramDigestStore:
             return int(row["count"] or 0)
 
     # ── lead-candidate feed (a read; consumed by the scorer) ──────────
-    def lead_candidates(self, *, since_id: int = 0, limit: int = 500) -> list[dict[str, Any]]:
+    def lead_candidates(
+        self, *, since_id: int = 0, since_ts: str | None = None, limit: int = 500
+    ) -> list[dict[str, Any]]:
         """Return lead-group messages with a resolvable sender, after ``since_id``.
 
         The stable incremental cursor is ``digest_messages.rowid`` (a plain rowid
@@ -295,22 +297,37 @@ class TelegramDigestStore:
         last ``id`` it saw. This method only reads; it opens no Telethon client.
         (Note the store as a whole is NOT read-only — ``upsert_lead_sender``
         writes the ``lead_senders`` cache.)
+
+        ``since_ts`` is an OPTIONAL recency floor (ISO-8601 UTC string). When set,
+        only messages with ``posted_at >= since_ts`` are returned. This lets the
+        scorer skip the huge months-old backlog every joined group carries (read
+        on join) that a rowid-only cursor would otherwise have to crawl oldest-
+        first — the bug that starved the feed for 8 days (2026-07-24). It is a
+        COARSE floor: the caller keeps the exact recency decision, so pass a floor
+        with margin below the real cutoff. ``posted_at`` is stored as an ISO-8601
+        UTC string, so a lexicographic ``>=`` is chronological.
         """
         since_id = max(0, int(since_id))
         limit = max(1, min(2000, int(limit)))
+        where = "s.role = ? AND m.sender_id IS NOT NULL AND m.rowid > ?"
+        params: list[Any] = [LEAD_SOURCE_ROLE, since_id]
+        if since_ts:
+            where += " AND m.posted_at >= ?"
+            params.append(str(since_ts))
+        params.append(limit)
         with self._connect() as con:
             rows = con.execute(
-                """
+                f"""
                 SELECT m.rowid AS id, m.peer_key AS peer_key, s.title AS chat_title,
                        m.message_id AS message_id, m.posted_at AS posted_at,
                        m.sender_id AS sender_id, m.text AS text
                 FROM digest_messages m
                 JOIN digest_sources s ON s.peer_key = m.peer_key
-                WHERE s.role = ? AND m.sender_id IS NOT NULL AND m.rowid > ?
+                WHERE {where}
                 ORDER BY m.rowid ASC
                 LIMIT ?
                 """,
-                (LEAD_SOURCE_ROLE, since_id, limit),
+                tuple(params),
             ).fetchall()
         items: list[dict[str, Any]] = []
         for row in rows:

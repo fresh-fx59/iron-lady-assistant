@@ -153,3 +153,42 @@ def test_gate_source_links_count_boundary():
     assert ok_story in result.stories
     assert too_many not in result.stories
     assert any("1-8 source links" in e for e in result.errors)
+
+
+def test_gate_url_backstop_drops_only_when_all_links_published():
+    """The url backstop drops ONLY when EVERY source link already shipped. A
+    genuinely-new story that re-shares one still-in-window url but ALSO cites a
+    fresh one is kept (FIX 2: any() -> all())."""
+    # links [already-published, fresh] -> KEPT (partially new)
+    partial = Story(**_story(headline="Частично новый сюжет", source_links=[LINK_A, LINK_B]))
+    # links all already-published -> DROPPED
+    all_pub = Story(**_story(headline="Полностью старый сюжет", source_links=[LINK_A]))
+    good = [Story(**_story(source_links=[LINK_B])), Story(**_story(source_links=[LINK_B]))]
+    result = run_gates(
+        good + [partial, all_pub],
+        known_links=KNOWN,
+        source_texts=[],
+        blocked_links={LINK_A},
+    )
+    assert partial in result.stories
+    assert all_pub not in result.stories
+    assert any("already published" in e for e in result.errors)
+
+
+def test_gate_drop_message_interpolates_window_days():
+    """FIX 3: the drop message reports the configured window, not a hardcoded 7."""
+    dropped = Story(**_story(headline="Старый сюжет", source_links=[LINK_A]))
+    good = [Story(**_story(source_links=[LINK_B])) for _ in range(3)]
+    result = run_gates(
+        good + [dropped],
+        known_links=KNOWN,
+        source_texts=[],
+        blocked_links={LINK_A},
+        window_days=14,
+    )
+    assert any("last 14 days" in e for e in result.errors)
+    # default keeps "7"
+    result7 = run_gates(
+        good + [dropped], known_links=KNOWN, source_texts=[], blocked_links={LINK_A}
+    )
+    assert any("last 7 days" in e for e in result7.errors)

@@ -34,6 +34,14 @@ class TelegramProxyClient:
         payload = await self._get("/v1/channels", params={"limit": str(limit)})
         return [ProxyChannel(**item) for item in payload.get("channels", [])]
 
+    async def list_dialogs(self, *, limit: int = 500, with_linked: bool = False) -> list[dict[str, Any]]:
+        """Raw dicts on purpose: /v1/dialogs grows fields, callers read by key."""
+        payload = await self._get(
+            "/v1/dialogs",
+            params={"limit": str(limit), "with_linked": "1" if with_linked else "0"},
+        )
+        return list(payload.get("dialogs", []))
+
     async def read_messages(
         self,
         *,

@@ -490,6 +490,58 @@ class ProxyChannelRecord:
     linked_chat_username: str | None
 
 
+@dataclass(frozen=True)
+class ProxyDialogRecord:
+    entity_id: int
+    title: str
+    kind: str  # channel | megagroup | group | user | bot
+    username: str | None
+    usernames: list[str]
+    is_broadcast: bool
+    is_megagroup: bool
+    participants_count: int | None
+    linked_chat_id: int | None
+
+
+def _dialog_usernames(entity: Any) -> list[str]:
+    """Every ACTIVE public handle on an entity, primary first.
+
+    Telegram now allows several handles per peer: the extras live in
+    `entity.usernames` (Username objects with .username/.active) while the
+    legacy `entity.username` can be EMPTY even though the peer is public
+    (@oestick, 12 925 subs, resolves to nothing if you only read the legacy
+    field). Read both, defensively — items may be plain strings.
+    """
+    out: list[str] = []
+    seen: set[str] = set()
+
+    def _add(name: str) -> None:
+        cleaned = name.strip().lstrip("@")
+        if cleaned and cleaned.lower() not in seen:
+            seen.add(cleaned.lower())
+            out.append(cleaned)
+
+    _add(str(getattr(entity, "username", None) or ""))
+    for item in getattr(entity, "usernames", None) or []:
+        if getattr(item, "active", True) is False:
+            continue
+        _add(str(item if isinstance(item, str) else (getattr(item, "username", None) or "")))
+    return out
+
+
+def _dialog_kind(entity: Any) -> str:
+    """Peer shape, duck-typed so a forbidden/partial entity still classifies."""
+    if getattr(entity, "broadcast", False):
+        return "channel"
+    if getattr(entity, "megagroup", False):
+        return "megagroup"
+    if getattr(entity, "title", None) is not None:
+        return "group"  # legacy Chat, gigagroup, or a Channel with neither flag
+    if getattr(entity, "bot", False):
+        return "bot"
+    return "user"  # includes self / Saved Messages
+
+
 def _json_safe(value: Any) -> Any:
     return json.loads(json.dumps(value, ensure_ascii=False, default=str))
 
@@ -747,6 +799,51 @@ class TelegramProxy:
                         linked_chat_id=int(linked_chat_id) if linked_chat_id else None,
                         linked_chat_title=linked_chat_title.strip() if linked_chat_title else None,
                         linked_chat_username=linked_chat_username,
+                    )
+                )
+            return records
+
+    async def list_dialogs(self, *, limit: int, with_linked: bool = False) -> list[ProxyDialogRecord]:
+        """READ-ONLY enumeration of EVERY dialog the account is in.
+
+        `list_channels` filters to broadcast=True, so a hand-joined group is
+        invisible to every audit that goes through it. This is the unfiltered
+        view. It never joins, leaves, sends, or mutates anything; the only
+        optional round trip is GetFullChannel for `linked_chat_id`, and only for
+        broadcast channels (nothing else can have a discussion group).
+        """
+        client = self._require_client()
+        async with self._lock:
+            records: list[ProxyDialogRecord] = []
+            async for dialog in client.iter_dialogs(limit=limit):
+                entity = getattr(dialog, "entity", None)
+                if entity is None:
+                    continue
+                entity_id = int(getattr(entity, "id", 0) or 0)
+                kind = _dialog_kind(entity)
+                handles = _dialog_usernames(entity)
+                count = getattr(entity, "participants_count", None)
+                linked_chat_id: Any = None
+                if with_linked and kind == "channel":
+                    try:
+                        full = await client(self._get_full_channel_request(entity))
+                        linked_chat_id = getattr(full.full_chat, "linked_chat_id", None)
+                    except Exception:
+                        logger.debug("no linked chat for dialog=%s", entity_id, exc_info=True)
+                records.append(
+                    ProxyDialogRecord(
+                        entity_id=entity_id,
+                        title=(
+                            str(getattr(entity, "title", None) or getattr(dialog, "name", None) or "").strip()
+                            or f"dialog:{entity_id}"
+                        ),
+                        kind=kind,
+                        username=handles[0] if handles else None,
+                        usernames=handles,
+                        is_broadcast=bool(getattr(entity, "broadcast", False)),
+                        is_megagroup=bool(getattr(entity, "megagroup", False)),
+                        participants_count=int(count) if isinstance(count, int) else None,
+                        linked_chat_id=int(linked_chat_id) if linked_chat_id else None,
                     )
                 )
             return records
@@ -1601,6 +1698,24 @@ async def _list_channels(request: web.Request) -> web.Response:
     return web.json_response({"channels": [asdict(record) for record in records]})
 
 
+async def _list_dialogs(request: web.Request) -> web.Response:
+    """Read-only: every dialog, including the groups /v1/channels filters out."""
+    _check_auth(request)
+    proxy: TelegramProxy = request.app["proxy"]
+    try:
+        limit = max(1, min(1000, int(request.query.get("limit", "500"))))
+    except ValueError:
+        raise web.HTTPBadRequest(text="limit must be an integer.") from None
+    with_linked = request.query.get("with_linked", "0").strip().lower() in {"1", "true", "yes", "on"}
+    try:
+        records = await proxy.list_dialogs(limit=limit, with_linked=with_linked)
+    except web.HTTPException:
+        raise
+    except Exception as exc:
+        raise web.HTTPBadGateway(text=f"List dialogs failed: {exc}") from exc
+    return web.json_response({"dialogs": [asdict(record) for record in records]})
+
+
 async def _read_messages(request: web.Request) -> web.Response:
     _check_auth(request)
     proxy: TelegramProxy = request.app["proxy"]
@@ -1745,6 +1860,7 @@ def create_app() -> web.Application:
     app = web.Application()
     app.router.add_get("/health", _health)
     app.router.add_get("/v1/channels", _list_channels)
+    app.router.add_get("/v1/dialogs", _list_dialogs)
     app.router.add_get("/v1/messages/{kind}/{entity_id}", _read_messages)
     app.router.add_get("/v1/leads/candidates", _leads_candidates)
     app.router.add_get("/v1/users/{sender_id}", _lead_user)

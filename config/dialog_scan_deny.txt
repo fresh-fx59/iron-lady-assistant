@@ -1,0 +1,22 @@
+# dialog-scan deny list — ONE file, edit it to extend.
+#
+# The daily scanner (src/telegram_dialog_scan.py) QUARANTINES any new dialog that
+# matches a rule here: it is reported to the operator but never enrolled into the
+# news digest or the lead pipeline. Add-only in spirit — deleting a line just
+# re-opens that dialog to auto-enrolment on the next run.
+#
+# Rule forms (one per line, `#` comments and blanks ignored):
+#   @handle        deny by exact username (with or without the @)
+#   handle         same thing
+#   id:-1001234    deny by numeric entity id (the only handle-less form)
+#   word:крипто    case-insensitive substring of the title OR any username
+#   re:^travel     regular expression over "title + usernames"
+#
+# Built-in defaults (DEFAULT_DENY_RULES_TEXT in the module) always apply and are
+# the floor: the operator's personal channels @zhkparusa, @pifagortrade,
+# @slezisatoshisliv2, @travelbelka_cards, @startupoftheday plus their keywords.
+# This file only ADDS. The operator's own publishing channels
+# (@ai_daily_summary, @ai_in_modern_world) are hard-coded never-enroll and do not
+# depend on this file at all.
+#
+# Operator additions below this line:

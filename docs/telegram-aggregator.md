@@ -36,7 +36,29 @@ sources.txt ──► collect ──► render-input ──► draft (LLM) ─�
 5. **Approve** — the gated digest is marked `approved` (either automatically in the
    hands-off daily flow, or by an operator command).
 6. **Publish** — a two-phase, crash-safe publish sends the approved digest to the
-   channel through a Bot API bot.
+   channel through a Bot API bot, as **one post = image + full text**.
+
+---
+
+## One post = image + full text
+
+A digest day with a hero image ships as a **single** `sendRichMessage` post
+(**Bot API 10.2**, 2026-07-14): the PNG is uploaded in the same multipart request
+and placed as a media block inside a rich-HTML document that carries the whole
+digest — the rich-message text ceiling is **32768** chars, not the 1024 a photo
+caption allows.
+
+Before this, an image day posted **twice**: `sendPhoto` with a short caption, then
+the digest as separate `sendMessage`s — because a real digest measures 1292–3097
+chars and never fit the 1024-char caption. `render_rich_html` rebuilds the
+one-document form from `render_messages`' output (same wording, links and
+escaping — the text is the *approved* text, verbatim), wrapping each block in
+`<p>` and the footer in `<footer>`.
+
+Degrade rungs, tried **only** when the previous one proved nothing reached
+Telegram (see the ledger section): `rich` → `photo + text` (the old plan, also
+used when a digest would exceed the 32768 cap) → `text-only`. No image at all ⇒
+text-only, unchanged.
 
 ---
 
@@ -131,16 +153,23 @@ pending ──approve──► approved ──begin_send──► sending ──
 - `upsert_draft` writes the rendered messages as **`pending`**.
 - `approve` moves the newest pending digest to **`approved`**.
 - `publish_next` takes the oldest approved digest, flips it to **`sending`**, sends
-  each message (paced ~1s apart, honoring one `retry_after` on a 429), records the
-  running `sent_count`, and finally marks it **`posted`**.
+  the planned ops (one rich post on an image day; otherwise each message paced ~1s
+  apart, honoring one `retry_after` on a 429), records the running `sent_count`,
+  and finally marks it **`posted`**.
 - **Blocks on crash.** If a send dies mid-way, the row is deliberately left in
   `sending` (not auto-reverted, not auto-failed). On the next run, any stuck
   `sending` row makes `publish_next` return **`blocked`** and refuse to publish
   anything — because some messages of that digest may already be live in the public
   channel, and blindly retrying would double-post. A human inspects `sent_count`
   and clears the row before publishing resumes.
-- **Dry-run** prints the messages and reverts the row to `approved` without
-  sending, so you can preview safely.
+- **Degrade only on proof.** A media send that *proves* nothing reached Telegram
+  (unreadable file, DNS/connection error, `sendRichMessage` 404 = method absent)
+  drops to the next plan, because the digest demonstrably has not gone out. Every
+  **ambiguous** failure — any HTTP status Telegram answered with, a read timeout —
+  stops the chain and leaves the row `sending`: re-sending could double-post.
+- **Dry-run** prints the plan (for a rich post: chat, image path, char count, and
+  the rich HTML) and reverts the row to `approved` without sending, so you can
+  preview safely.
 
 ---
 

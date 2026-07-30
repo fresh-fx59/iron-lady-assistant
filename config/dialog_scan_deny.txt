@@ -20,3 +20,12 @@
 # depend on this file at all.
 #
 # Operator additions below this line:
+
+# Music-producers chat: the linked chat of @erdman_music, which is still a news
+# source, so the classifier would auto-enroll this into the digest's chat
+# allowlist. A music-production chat carries no AI/dev signal. Found by the
+# 2026-07-30 live dry-run — the first concrete instance of the poisoning path the
+# deny list exists for. (Open question for the operator: @erdman_music itself is
+# arguably off-topic for an AI digest and has been silent since 2026-07-14.)
+@Music_Producers_Chat
+id:1609072825

@@ -228,6 +228,24 @@ class TelegramDigestStore:
             ).fetchone()
             return int(row["max_message_id"] or 0)
 
+    def last_seen_message_id(self, peer_key: str) -> int:
+        """The watermark written by ``mark_collected`` — everything *seen*, not kept.
+
+        ``last_message_id`` derives its cursor from the stored rows, which is right
+        for a lane that keeps every message it reads. A lane that admits only a
+        subset (the aggregator's discussion-chat lane: a hard per-run cap plus a
+        quality gate) needs the read cursor to advance past the messages it
+        deliberately dropped, or the next pass re-reads and re-gates the same
+        window forever and the chat effectively stalls.
+        """
+        with self._connect() as con:
+            row = con.execute(
+                "SELECT COALESCE(last_collected_message_id, 0) AS watermark "
+                "FROM digest_sources WHERE peer_key = ?",
+                (peer_key,),
+            ).fetchone()
+        return int(row["watermark"] or 0) if row else 0
+
     def insert_message(
         self,
         *,

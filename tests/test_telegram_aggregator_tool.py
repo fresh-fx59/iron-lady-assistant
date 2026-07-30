@@ -308,3 +308,106 @@ def test_gate_no_image_when_disabled(state, monkeypatch, capsys):
     assert out["image"] is False
     ledger = DigestLedger(state / "ledger.db")
     assert ledger.image_path_for("2026-07-14") is None
+
+
+# ── discussion-chat lane: default OFF, dry-run, opt-in ────────────
+class _ChatFakeProxyClient:
+    """Records every read so a test can prove the chat lane stayed dormant."""
+
+    instances: list["_ChatFakeProxyClient"] = []
+
+    def __init__(self, *, base_url=None, api_key=None, timeout_seconds=None):  # noqa: ARG002
+        self.reads: list[dict] = []
+        self.list_calls = 0
+        _ChatFakeProxyClient.instances.append(self)
+
+    async def list_channels(self, *, limit):  # noqa: ARG002
+        self.list_calls += 1
+        return [
+            type(
+                "Ch", (), {
+                    "entity_id": 10, "username": "hyperllm", "title": "HyperLLM",
+                    "linked_chat_id": 3850100303, "linked_chat_title": "HyperAI",
+                    "linked_chat_username": "hyper_llm",
+                },
+            )()
+        ]
+
+    async def read_messages(self, *, kind, entity_id, min_id, limit, recent_first=False):
+        self.reads.append({"kind": kind, "entity_id": entity_id})
+        if kind != "linked_chat":
+            return []
+        long_text = "Вышла новая модель, разбор бенчмарков и цены подробно. " * 5
+        return [
+            {"message_id": 1, "posted_at": "2026-07-30T10:00:00+00:00", "sender_id": 7,
+             "views": None, "forwards": None, "replies": None,
+             "link": "https://t.me/hyper_llm/1",
+             "text": long_text + " https://example.com/x", "raw_json": {"_": "Message", "id": 1}},
+            {"message_id": 2, "posted_at": "2026-07-30T10:05:00+00:00", "sender_id": 8,
+             "views": None, "forwards": None, "replies": None,
+             "link": "https://t.me/hyper_llm/2", "text": "ага", "raw_json": {"_": "Message", "id": 2}},
+        ]
+
+
+@pytest.fixture()
+def chat_client(monkeypatch):
+    _ChatFakeProxyClient.instances.clear()
+    monkeypatch.setattr(telegram_aggregator_tool, "TelegramProxyClient", _ChatFakeProxyClient)
+    return _ChatFakeProxyClient
+
+
+def _sources(state, channels="@hyperllm\n", chats=None):
+    state.mkdir(parents=True, exist_ok=True)
+    (state / "sources.txt").write_text(channels)
+    if chats is not None:
+        (state / "chat_sources.txt").write_text(chats)
+
+
+def test_collect_ignores_chats_until_the_allowlist_exists(state, chat_client, capsys):
+    """Default OFF: no chat_sources.txt -> the chat lane never reads a chat."""
+    _sources(state)
+    assert main(["collect"]) == 0
+    out = json.loads(capsys.readouterr().out)
+    assert "chats" not in out
+    assert all(r["kind"] == "channel" for r in chat_client.instances[0].reads)
+
+
+def test_collect_ignores_an_empty_chat_allowlist(state, chat_client, capsys):
+    _sources(state, chats="# only comments\n\n")
+    assert main(["collect"]) == 0
+    out = json.loads(capsys.readouterr().out)
+    assert "chats" not in out
+    assert all(r["kind"] == "channel" for r in chat_client.instances[0].reads)
+
+
+def test_collect_runs_the_chat_lane_once_the_allowlist_is_filled(state, chat_client, capsys):
+    _sources(state, chats="@hyper_llm\n")
+    assert main(["collect"]) == 0
+    out = json.loads(capsys.readouterr().out)
+    assert out["chats"]["resolved"] == 1
+    assert out["chats"]["collected_messages"] == 1
+    assert any(r["kind"] == "linked_chat" for r in chat_client.instances[0].reads)
+    # ONE dialog sweep for both lanes (list_channels is ~60 RPCs on this account)
+    assert chat_client.instances[0].list_calls == 1
+
+
+def test_chats_dry_run_reports_without_writing(state, chat_client, capsys):
+    _sources(state, chats="@hyper_llm\n")
+    assert main(["chats-dry-run"]) == 0
+    out = json.loads(capsys.readouterr().out)
+    assert out["dry_run"] is True
+    report = out["chats"][0]
+    assert report["seen"] == 2 and report["admitted"] == 1
+    assert report["rejected"] == {"too-short": 1}
+    assert report["texts"][0]["message_id"] == 1
+    assert not (state / "aggregator.db").exists() or True  # db file may exist; rows must not
+    from src.telegram_aggregator import AGG_ROLE
+    from src.telegram_digest import TelegramDigestStore
+    assert TelegramDigestStore(state / "aggregator.db").list_sources(roles=(AGG_ROLE,)) == []
+
+
+def test_chats_dry_run_without_an_allowlist_is_an_error(state, chat_client, capsys):
+    _sources(state)
+    assert main(["chats-dry-run"]) == 1
+    out = json.loads(capsys.readouterr().out)
+    assert out["status"] == "error"

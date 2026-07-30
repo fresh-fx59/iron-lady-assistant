@@ -104,12 +104,102 @@ bare_username
 `t.me/+invite` links are skipped (those are not resolvable usernames). The reader
 account must have **joined** each source channel before collection can resolve it.
 
+Channels with **several handles** (Telegram's multi-username feature) keep the
+legacy `Channel.username` empty and list every handle in `Channel.usernames`. The
+proxy reads the legacy attribute first and falls back to the first *active*
+`usernames` entry, so such a channel resolves from its configured handle and its
+posts get real `t.me` links. Without that fallback a fully public, already-joined
+channel silently resolves to nothing on every run *and* its messages come back with
+`link: None` (which the draft input drops) — invisible in both directions.
+
+### Discussion-chat sources (optional, default OFF)
+
+A **second, separate** allowlist file — `chat_sources.txt` beside `sources.txt`
+(override with `AGGREGATOR_CHAT_SOURCES_PATH`) — lets named *discussion chats* feed
+the digest. It is deliberately a different file: the broadcast list stays clean, and
+a chat is only ever ingested because a human wrote it down. There is no "all joined
+chats" mode.
+
+The file is the flag: **no file, or a file that parses to nothing ⇒ the chat lane
+never runs**, so deploying this code cannot change the digest by itself.
+
+Accepted line forms, and what each maps to:
+
+| line | maps to |
+|------|---------|
+| `@hyper_llm`, `t.me/hyper_llm`, `hyper_llm` | a **public chat handle**, resolved against the `linked_chat_username` of a joined channel |
+| `-1001788662720` | the `-100`-marked id a Telegram client shows |
+| `1788662720`, `id:1788662720` | the bare internal (positive) entity id |
+| `t.me/c/1788662720/12` | the internal deep link of a handle-less chat |
+
+The id forms exist because a linked discussion group usually has **no public
+username** (33 of 55 linked chats in the live dialogs). Such a chat is
+**corpus-only**: the proxy cannot build a `t.me/<handle>/<id>` link for it, the
+draft input drops link-less rows, and the draft gates only accept that link shape —
+so its messages are ingested and visible to later analysis but can never be cited
+in a published digest. The dry-run reports `citable: false` for those. **Prefer
+chats that have a handle.**
+
+**What gets in — an input gate, in this order.** All of it is plain code; the
+ingest path never calls an LLM.
+
+1. **The allowlist** (above).
+2. **A deterministic quality gate** (`chat_admission_verdict`), rejecting:
+   `service` (join/leave/pin), `via-bot` (inline-bot output), `nested-reply` (a
+   reply to another *comment* — in a linked group every top-level comment carries
+   `reply_to` pointing at the auto-forwarded parent post, and only a reply-to-a-reply
+   sets a *different* `reply_to_top_id`, so dropping all replies would make a linked
+   chat contribute nothing), `too-short` (under `CHAT_MIN_CHARS`, 200 — 2.5× the
+   channel floor: a message must be a paragraph for the drafter to summarise and for
+   the no-verbatim gate to have real source text), `no-carrier` (news arrives in a
+   chat as a **link** or as a **forward**; a long opinion with neither is the chatter
+   this lane must not import).
+3. **Dedup against the corpus**, three ways, all reusing what already exists:
+   `forward-of-tracked-channel` (the parent-post echo, and any forward from a
+   channel already in the corpus — we hold the original, with its view count),
+   `duplicate-text` (the same `_dedup_key` normalisation `build_draft_input` uses:
+   NFKC + lower + collapsed whitespace), and `echo-of-corpus-post` (a manual repost
+   that *prepends* the source link shifts the first 120 chars, so the text key
+   misses; the quoted `t.me/<channel>/<id>` is exact identity). Admitted items feed
+   back into the index, so two chats echoing one story in the same run collapse.
+4. **A hard per-chat cap per collect run** (`CHAT_MAX_PER_RUN`, 2), applied *after*
+   the gate, keeping the batch's best candidates (carries a link → longer → newer).
+   This is the load-bearing bound. Measured: the news corpus takes ~70 messages/day
+   across 53 channels (median channel ~1.3/day) while chat candidates run 28–205
+   messages/day each and the busiest joined chats reach 536/day. The gate admits ~2%
+   of a talk chat but **74%** of a feed-mirror chat that mostly forwards — so the
+   gate alone does not bound a chat. `collect` runs 5×/day, so cap 2 ⇒ **≤10
+   messages/day from any one chat**: ~14% of the channel baseline, ~7× a median
+   channel, a 95% cut of the loudest chat's raw rate.
+
+Chat rows carry `views = NULL`, so `build_draft_input`'s views-DESC ordering puts
+them last: they can only ever fill slots the channels left empty under
+`--max-posts`. Each post in the draft input is labelled `origin: "channel" | "chat"`
+— derived from `digest_sources.kind`, so marking origin needed no new column and no
+migration.
+
+Reads are **recency-first** from a watermark that advances past every message
+*seen*, not just the ones admitted — a cap must never turn into a stalled cursor
+that re-reads the same window forever. A burst larger than `--chat-read-limit`
+(150) therefore skips its oldest excess on purpose: the digest only looks at the
+last 24h.
+
+**Preview before enabling** — the dry-run reads and gates exactly like a real run
+but writes nothing (no source row, no message, no watermark) and prints the admitted
+text per chat:
+
+```bash
+python -m src.telegram_aggregator_tool chats-dry-run \
+  [--chat-read-limit 150] [--chat-max-per-run 2]
+```
+
 ### Environment variables
 
 | Variable | Purpose |
 |----------|---------|
 | `AGGREGATOR_STATE_DIR` | Directory holding the aggregator DB, drafts, ledger, and logs. Point it at a writable path you control. |
 | `AGGREGATOR_SOURCES_PATH` | Path to the sources file (defaults to `<state_dir>/sources.txt`). |
+| `AGGREGATOR_CHAT_SOURCES_PATH` | Path to the optional discussion-chat allowlist (defaults to `<state_dir>/chat_sources.txt`). Absent/empty ⇒ the chat lane is OFF. |
 | `TELEGRAM_PROXY_BASE_URL` | Base URL of the read proxy (e.g. `http://127.0.0.1:8787`). |
 | `TELEGRAM_PROXY_API_KEY` | Bearer token for the read proxy. |
 | `TELEGRAM_AGGREGATOR_BOT_TOKEN` | Bot API token of the **poster** bot (must be a channel admin). |
@@ -192,7 +282,8 @@ python -m src.telegram_aggregator_tool publish
 Manual pipeline stepping (normally the daily runner does this for you):
 
 ```bash
-python -m src.telegram_aggregator_tool collect
+python -m src.telegram_aggregator_tool collect        # channels, + chats if allowlisted
+python -m src.telegram_aggregator_tool chats-dry-run  # preview the chat lane, writes nothing
 python -m src.telegram_aggregator_tool render-input --out "$STATE/drafts/$DATE-input.json"
 # ...LLM writes $STATE/drafts/$DATE-draft.json via the /aggregator-digest skill...
 python -m src.telegram_aggregator_tool gate \

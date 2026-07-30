@@ -494,7 +494,50 @@ def _json_safe(value: Any) -> Any:
     return json.loads(json.dumps(value, ensure_ascii=False, default=str))
 
 
-def _message_payload(message: Any, entity_username: str | None) -> dict[str, Any]:
+def entity_username(entity: Any) -> str | None:
+    """The entity's public handle — legacy attribute FIRST, then ``usernames``.
+
+    Telegram's multi-username feature (channels/users may hold several handles)
+    puts every handle in ``Channel.usernames`` — a list of ``Username`` objects
+    carrying ``.username`` and ``.active`` — and leaves the legacy scalar
+    ``Channel.username`` EMPTY on such an entity. Reading only the legacy slot
+    therefore made a perfectly public, already-joined channel look handle-less:
+    @oestick ("AI и грабли", 12 925 subs) resolved to nothing on every collect
+    run and its messages got ``link=None`` (which the digest input drops).
+
+    Verified on the live @giedi_0 dialogs (2026-07-30, read-only): 3 of 60
+    broadcast dialogs have an empty legacy ``username``; one of them is entity
+    1741956568 "AI и грабли", and the join ledger shows it was joined by the
+    PUBLIC handle ``oestick`` — a handle that resolves publicly while the legacy
+    attribute is empty is exactly the multi-username shape.
+
+    Deliberately defensive rather than assertive about the cause: any entity
+    shape without a usable handle (no ``usernames`` attribute, a non-iterable,
+    entries without ``.username``, or only ``active=False`` entries — e.g. a
+    private invite-only channel, which genuinely has no public handle) returns
+    ``None``, exactly as before.
+    """
+    legacy = (getattr(entity, "username", None) or "").strip()
+    if legacy:
+        return legacy
+    candidates = getattr(entity, "usernames", None) or []
+    try:
+        iterator = list(candidates)
+    except TypeError:
+        return None
+    for candidate in iterator:
+        name = (getattr(candidate, "username", None) or "").strip()
+        if not name:
+            continue
+        # `active` may be absent on a stubbed/older type — treat missing as active
+        # (a handle we can see is better than a handle we drop), False as inactive.
+        if getattr(candidate, "active", True) is False:
+            continue
+        return name
+    return None
+
+
+def _message_payload(message: Any, handle: str | None) -> dict[str, Any]:
     replies = None
     reply_info = getattr(message, "replies", None)
     if reply_info is not None:
@@ -511,7 +554,7 @@ def _message_payload(message: Any, entity_username: str | None) -> dict[str, Any
         "views": getattr(message, "views", None),
         "forwards": getattr(message, "forwards", None),
         "replies": replies,
-        "link": f"https://t.me/{entity_username}/{message.id}" if entity_username else None,
+        "link": f"https://t.me/{handle}/{message.id}" if handle else None,
         "text": (getattr(message, "message", None) or "").strip(),
         "raw_json": _json_safe(message.to_dict()),
     }
@@ -706,7 +749,7 @@ class TelegramProxy:
                 if getattr(entity, "broadcast", False):
                     if lookup_value:
                         entity_id = str(int(entity.id))
-                        username = (getattr(entity, "username", None) or "").strip().lower()
+                        username = (entity_username(entity) or "").strip().lower()
                         title = (getattr(entity, "title", None) or "").strip().lower()
                         if lookup_value not in {entity_id, username, title}:
                             continue
@@ -729,7 +772,7 @@ class TelegramProxy:
                         if linked_entity is None:
                             linked_entity = await client.get_entity(int(linked_chat_id))
                         linked_chat_title = getattr(linked_entity, "title", None)
-                        linked_chat_username = getattr(linked_entity, "username", None)
+                        linked_chat_username = entity_username(linked_entity)
                         self._entity_cache[("linked_chat", int(linked_chat_id))] = linked_entity
                 except Exception:
                     logger.debug(
@@ -743,7 +786,7 @@ class TelegramProxy:
                     ProxyChannelRecord(
                         entity_id=int(entity.id),
                         title=(getattr(entity, "title", None) or "Unnamed channel").strip(),
-                        username=getattr(entity, "username", None),
+                        username=entity_username(entity),
                         linked_chat_id=int(linked_chat_id) if linked_chat_id else None,
                         linked_chat_title=linked_chat_title.strip() if linked_chat_title else None,
                         linked_chat_username=linked_chat_username,
@@ -762,7 +805,10 @@ class TelegramProxy:
     ) -> list[dict[str, Any]]:
         client = self._require_client()
         entity = await self._resolve_entity(kind=kind, entity_id=entity_id)
-        username = getattr(entity, "username", None)
+        # Same multi-username fallback as list_channels: the t.me link in every
+        # payload is built from this handle, and a link-less row is dropped by the
+        # digest input — so a legacy-attribute-only read silently muted @oestick.
+        username = entity_username(entity)
         items: list[dict[str, Any]] = []
         iter_kwargs: dict[str, Any] = {
             "limit": limit,
@@ -929,7 +975,10 @@ class TelegramProxy:
         group / a basic group with no public handle.
         """
         kind = cls._entity_kind(entity)
-        username = getattr(entity, "username", None)
+        # Multi-username entities keep the legacy scalar empty (see entity_username):
+        # users can hold several handles too, so the lead-sender label used the same
+        # blind read and would show a handle-less user that in fact has one.
+        username = entity_username(entity)
         is_bot = bool(getattr(entity, "bot", False))
         if kind == "user":
             first = (getattr(entity, "first_name", None) or "").strip()

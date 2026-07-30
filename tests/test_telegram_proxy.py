@@ -169,3 +169,163 @@ async def test_read_messages_falls_back_to_dialog_cache_when_entity_lookup_by_id
     assert seen_kwargs["min_id"] == 110
     assert seen_kwargs["reverse"] is True
     assert messages[0]["message_id"] == 111
+
+
+# ── multi-username channels (Telegram's Channel.usernames) ────────
+# @oestick ("AI и грабли", 12 925 subs) is joined and readable, yet its legacy
+# `Channel.username` is EMPTY: the handle lives in `Channel.usernames` (a list of
+# Username objects with .username/.active), so every configured-source lookup and
+# every t.me link built from the legacy attribute silently resolved to nothing.
+class _MultiUsernameChannel:
+    def __init__(self, entity_id, title, usernames, *, username=None, broadcast=True):
+        self.id = entity_id
+        self.title = title
+        self.username = username
+        self.usernames = usernames
+        self.broadcast = broadcast
+
+
+def _uname(name, active=True):
+    return types.SimpleNamespace(username=name, active=active)
+
+
+@pytest.mark.asyncio
+async def test_list_channels_falls_back_to_the_active_multi_username() -> None:
+    entity = _MultiUsernameChannel(
+        1741956568, "AI и грабли", [_uname("old_handle", active=False), _uname("oestick")]
+    )
+
+    class FakeClient:
+        async def iter_dialogs(self, *, limit=None):  # noqa: ARG002
+            yield types.SimpleNamespace(entity=entity)
+
+        async def __call__(self, request):  # noqa: ARG002
+            return types.SimpleNamespace(full_chat=types.SimpleNamespace(linked_chat_id=None))
+
+    proxy = TelegramProxy()
+    proxy._client = FakeClient()
+    proxy._channel_cls = _MultiUsernameChannel
+    proxy._get_full_channel_request = lambda entity: entity
+
+    records = await proxy.list_channels(limit=10)
+
+    assert [r.username for r in records] == ["oestick"]
+    assert records[0].entity_id == 1741956568
+
+
+@pytest.mark.asyncio
+async def test_list_channels_prefers_the_legacy_username_when_present() -> None:
+    entity = _MultiUsernameChannel(
+        11, "Legacy", [_uname("secondary")], username="primary_handle"
+    )
+
+    class FakeClient:
+        async def iter_dialogs(self, *, limit=None):  # noqa: ARG002
+            yield types.SimpleNamespace(entity=entity)
+
+        async def __call__(self, request):  # noqa: ARG002
+            return types.SimpleNamespace(full_chat=types.SimpleNamespace(linked_chat_id=None))
+
+    proxy = TelegramProxy()
+    proxy._client = FakeClient()
+    proxy._channel_cls = _MultiUsernameChannel
+    proxy._get_full_channel_request = lambda entity: entity
+
+    records = await proxy.list_channels(limit=10)
+    assert [r.username for r in records] == ["primary_handle"]
+
+
+@pytest.mark.asyncio
+async def test_list_channels_lookup_matches_a_multi_username() -> None:
+    entity = _MultiUsernameChannel(1741956568, "AI и грабли", [_uname("oestick")])
+
+    class FakeClient:
+        async def iter_dialogs(self, *, limit=None):  # noqa: ARG002
+            yield types.SimpleNamespace(entity=entity)
+
+        async def __call__(self, request):  # noqa: ARG002
+            return types.SimpleNamespace(full_chat=types.SimpleNamespace(linked_chat_id=None))
+
+    proxy = TelegramProxy()
+    proxy._client = FakeClient()
+    proxy._channel_cls = _MultiUsernameChannel
+    proxy._get_full_channel_request = lambda entity: entity
+
+    records = await proxy.list_channels(limit=10, lookup="oestick")
+    assert [r.entity_id for r in records] == [1741956568]
+
+
+@pytest.mark.asyncio
+async def test_list_channels_reads_a_linked_chat_multi_username() -> None:
+    linked = _MultiUsernameChannel(200, "Chat", [_uname("chat_handle")], broadcast=False)
+    parent = _MultiUsernameChannel(100, "Channel", [], username="parent")
+
+    class FakeClient:
+        async def iter_dialogs(self, *, limit=None):  # noqa: ARG002
+            yield types.SimpleNamespace(entity=linked)
+            yield types.SimpleNamespace(entity=parent)
+
+        async def __call__(self, request):  # noqa: ARG002
+            return types.SimpleNamespace(full_chat=types.SimpleNamespace(linked_chat_id=200))
+
+    proxy = TelegramProxy()
+    proxy._client = FakeClient()
+    proxy._channel_cls = _MultiUsernameChannel
+    proxy._get_full_channel_request = lambda entity: entity
+
+    records = await proxy.list_channels(limit=10)
+    assert records[0].linked_chat_username == "chat_handle"
+
+
+@pytest.mark.asyncio
+async def test_list_channels_ignores_inactive_only_usernames() -> None:
+    entity = _MultiUsernameChannel(12, "Retired", [_uname("gone", active=False)])
+
+    class FakeClient:
+        async def iter_dialogs(self, *, limit=None):  # noqa: ARG002
+            yield types.SimpleNamespace(entity=entity)
+
+        async def __call__(self, request):  # noqa: ARG002
+            return types.SimpleNamespace(full_chat=types.SimpleNamespace(linked_chat_id=None))
+
+    proxy = TelegramProxy()
+    proxy._client = FakeClient()
+    proxy._channel_cls = _MultiUsernameChannel
+    proxy._get_full_channel_request = lambda entity: entity
+
+    records = await proxy.list_channels(limit=10)
+    assert records[0].username is None
+
+
+@pytest.mark.asyncio
+async def test_read_messages_links_via_a_multi_username(monkeypatch) -> None:
+    """The t.me link is built from the entity's handle; without the fallback every
+    @oestick message would carry link=None and build_draft_input drops link-less
+    rows, so the channel could never reach the digest even once resolved."""
+    entity = _MultiUsernameChannel(1741956568, "AI и грабли", [_uname("oestick")])
+
+    class FakeClient:
+        async def iter_messages(self, entity, **kwargs):  # noqa: ARG002
+            yield types.SimpleNamespace(
+                id=42,
+                date=datetime(2026, 7, 30, 6, 0, tzinfo=timezone.utc),
+                sender_id=None,
+                views=1000,
+                forwards=3,
+                replies=None,
+                message="Пост канала",
+                to_dict=lambda: {"id": 42},
+            )
+
+    proxy = TelegramProxy()
+    proxy._client = FakeClient()
+
+    async def fake_resolve_entity(**kwargs):  # noqa: ARG001
+        return entity
+
+    monkeypatch.setattr(proxy, "_resolve_entity", fake_resolve_entity)
+
+    messages = await proxy.read_messages(
+        kind="channel", entity_id=1741956568, min_id=0, limit=5, recent_first=True
+    )
+    assert messages[0]["link"] == "https://t.me/oestick/42"

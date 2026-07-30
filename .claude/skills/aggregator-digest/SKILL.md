@@ -9,9 +9,12 @@ about AI/tech.
 Arguments (whitespace-separated, in this order, inside $ARGUMENTS):
 `<input-json-path> <output-json-path> [optional feedback-json-path]`.
 
-- The input file: JSON `{date, window_hours, posts:[{channel, username, link,
-  text, views, forwards, posted_at}], recent_headlines:[{date, headline}]}`.
+- The input file: JSON `{date, window_hours, posts:[{channel, username, origin,
+  link, text, views, forwards, posted_at}], recent_headlines:[{date, headline}]}`.
   `recent_headlines` = stories already SHIPPED in the last few days' digests.
+  `origin` is `"channel"` (a broadcast post) or `"chat"` (a message from an
+  allowlisted discussion chat — no view count, and it is one person talking, so
+  weigh it as a single voice, not as a channel's editorial signal).
 - The output file: where you write your STRICT JSON draft.
 - The feedback file (if a third path is present): lists gate errors from your
   previous attempt.

@@ -400,7 +400,6 @@ def test_chats_dry_run_reports_without_writing(state, chat_client, capsys):
     assert report["seen"] == 2 and report["admitted"] == 1
     assert report["rejected"] == {"too-short": 1}
     assert report["texts"][0]["message_id"] == 1
-    assert not (state / "aggregator.db").exists() or True  # db file may exist; rows must not
     from src.telegram_aggregator import AGG_ROLE
     from src.telegram_digest import TelegramDigestStore
     assert TelegramDigestStore(state / "aggregator.db").list_sources(roles=(AGG_ROLE,)) == []

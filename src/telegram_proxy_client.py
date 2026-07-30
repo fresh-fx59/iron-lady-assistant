@@ -43,6 +43,31 @@ class TelegramProxyClient:
         limit: int,
         recent_first: bool = False,
     ) -> list[dict[str, Any]]:
+        page = await self.read_messages_page(
+            kind=kind,
+            entity_id=entity_id,
+            min_id=min_id,
+            limit=limit,
+            recent_first=recent_first,
+        )
+        return page["messages"]
+
+    async def read_messages_page(
+        self,
+        *,
+        kind: str,
+        entity_id: int,
+        min_id: int,
+        limit: int,
+        recent_first: bool = False,
+    ) -> dict[str, Any]:
+        """``{messages, seen, max_seen_id}`` — see ``TelegramProxy.read_messages_page``.
+
+        ``max_seen_id`` covers text-less messages the proxy filtered out, so a
+        watermark built from it never stalls on a sticker burst. A proxy that predates
+        the field omits it; the fallback then derives what it can from the items,
+        which is exactly the pre-fix behaviour and no worse.
+        """
         payload = await self._get(
             f"/v1/messages/{kind}/{entity_id}",
             params={
@@ -51,7 +76,15 @@ class TelegramProxyClient:
                 "recent_first": "1" if recent_first else "0",
             },
         )
-        return list(payload.get("messages", []))
+        messages = list(payload.get("messages", []))
+        max_seen_id = int(payload.get("max_seen_id") or 0)
+        for item in messages:
+            max_seen_id = max(max_seen_id, int(item["message_id"]))
+        return {
+            "messages": messages,
+            "seen": int(payload.get("seen") or len(messages)),
+            "max_seen_id": max_seen_id,
+        }
 
     async def _get(self, path: str, *, params: dict[str, str]) -> dict[str, Any]:
         if not self._base_url:

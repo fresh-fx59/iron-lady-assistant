@@ -130,15 +130,31 @@ Accepted line forms, and what each maps to:
 | `@hyper_llm`, `t.me/hyper_llm`, `hyper_llm` | a **public chat handle**, resolved against the `linked_chat_username` of a joined channel |
 | `-1001788662720` | the `-100`-marked id a Telegram client shows |
 | `1788662720`, `id:1788662720` | the bare internal (positive) entity id |
-| `t.me/c/1788662720/12` | the internal deep link of a handle-less chat |
+| `t.me/c/1788662720/12`, `t.me/c/1788662720/8/12` | the internal deep link of a handle-less chat (the 3-segment form is what a **forum** group copies) |
+
+Anything else on a line is **reported, never dropped**: this file is the ON switch
+for the whole lane, so a fat-fingered handle (`@hyper-llm`) or an invite link
+(`t.me/+hash`, not a resolvable identity) comes back in `unresolved` as
+`{"entry": …, "form": "invalid", "reason": "malformed-line"}`. Two more reasons live
+there: `no-linked-chat-with-this-handle` (no joined channel exposes it — the paced
+join loop may not have reached it) and `broadcast-channel-id` (the id names a
+broadcast channel we already track; reading it as a chat would double-ingest its
+posts under a second `peer_key` with `views = NULL`). **Every allowlist line ends up
+either in `chats[]` — tagged `resolved_via: username | id-linked | id-unlinked` — or
+in `unresolved[]` with a reason.**
 
 The id forms exist because a linked discussion group usually has **no public
-username** (33 of 55 linked chats in the live dialogs). Such a chat is
-**corpus-only**: the proxy cannot build a `t.me/<handle>/<id>` link for it, the
+username** (33 of 55 linked chats in the live dialogs). A genuinely handle-less chat
+is **corpus-only**: the proxy cannot build a `t.me/<handle>/<id>` link for it, the
 draft input drops link-less rows, and the draft gates only accept that link shape —
 so its messages are ingested and visible to later analysis but can never be cited
-in a published digest. The dry-run reports `citable: false` for those. **Prefer
-chats that have a handle.**
+in a published digest. `citable` in the report answers exactly that, and it is
+derived from **the link the proxy actually built from the chat entity** — `true` /
+`false` once messages were read, `null` when nothing was read this run. It is
+deliberately *not* derived from the parent channel's `linked_chat_username`: that is
+a second, disagreeing derivation which is `None` for every id-form entry, so it
+reported `citable: false` for public chats whose rows carried a publishable link.
+**Prefer chats that have a handle.**
 
 **What gets in — an input gate, in this order.** All of it is plain code; the
 ingest path never calls an LLM.
@@ -154,14 +170,22 @@ ingest path never calls an LLM.
    the no-verbatim gate to have real source text), `no-carrier` (news arrives in a
    chat as a **link** or as a **forward**; a long opinion with neither is the chatter
    this lane must not import).
-3. **Dedup against the corpus**, three ways, all reusing what already exists:
+3. **Dedup against the corpus — EXACT IDENTITY ONLY.** An ingest reject is
+   irreversible (the watermark has already moved past the message, so nothing ever
+   offers it again), which rules out any fuzzy key here. The three ways:
    `forward-of-tracked-channel` (the parent-post echo, and any forward from a
    channel already in the corpus — we hold the original, with its view count),
-   `duplicate-text` (the same `_dedup_key` normalisation `build_draft_input` uses:
-   NFKC + lower + collapsed whitespace), and `echo-of-corpus-post` (a manual repost
-   that *prepends* the source link shifts the first 120 chars, so the text key
-   misses; the quoted `t.me/<channel>/<id>` is exact identity). Admitted items feed
-   back into the index, so two chats echoing one story in the same run collapse.
+   `duplicate-text` (`_identity_key`: NFKC + lower + collapsed whitespace over the
+   **whole** text) and `echo-of-corpus-post` (the quoted `t.me/<channel>/<id>`, the
+   dominant echo shape in live data — a manual repost that wraps the source link).
+   *Not* `_dedup_key`'s 120-char prefix: any chat with a boilerplate header longer
+   than that (a promo line, an "источник:" preamble) collapses onto ONE key, so the
+   first message would be admitted and every genuinely new story after it rejected,
+   forever. Fuzzy similarity therefore stays in `build_draft_input`, where a
+   collision only costs a slot in today's draft and the row remains re-selectable.
+   Within a single run the same identity is applied *before* the cap, so two
+   messages of one story from one chat merge into their best-ranked member
+   (`duplicate-in-run`) instead of burning two cap slots and publishing twice.
 4. **A hard per-chat cap per collect run** (`CHAT_MAX_PER_RUN`, 2), applied *after*
    the gate, keeping the batch's best candidates (carries a link → longer → newer).
    This is the load-bearing bound. Measured: the news corpus takes ~70 messages/day
@@ -172,17 +196,35 @@ ingest path never calls an LLM.
    messages/day from any one chat**: ~14% of the channel baseline, ~7× a median
    channel, a 95% cut of the loudest chat's raw rate.
 
-Chat rows carry `views = NULL`, so `build_draft_input`'s views-DESC ordering puts
-them last: they can only ever fill slots the channels left empty under
-`--max-posts`. Each post in the draft input is labelled `origin: "channel" | "chat"`
-— derived from `digest_sources.kind`, so marking origin needed no new column and no
-migration.
+Chat rows carry `views = NULL`, so `build_draft_input`'s views-DESC ordering ranks
+them **last**. That is ordering, not a bound: `--max-posts` (150) is well above the
+~70 posts/day channel corpus, so there is no slot pressure and **every stored chat
+row does enter the draft input**, ranked after the channels. The bound is the one at
+ingest: `CHAT_MAX_PER_RUN` (2) × 5 collect runs/day ⇒ **≤10 rows/day per chat**. Each
+post in the draft input is labelled `origin: "channel" | "chat"` — derived from
+`digest_sources.kind`, so marking origin needed no new column and no migration.
 
 Reads are **recency-first** from a watermark that advances past every message
 *seen*, not just the ones admitted — a cap must never turn into a stalled cursor
 that re-reads the same window forever. A burst larger than `--chat-read-limit`
 (150) therefore skips its oldest excess on purpose: the digest only looks at the
-last 24h.
+last 24h. "Seen" means **every message the proxy iterated**, which is why the read
+goes through `read_messages_page` (`{messages, seen, max_seen_id}`) instead of the
+list form: the proxy drops text-less messages (stickers, uncaptioned media,
+join/pin service events), so a cursor built from what came *back* stalls forever the
+moment `--chat-read-limit` of them sit above the watermark — no error, no alert, just
+`seen: 0` on every run. `max_seen_id` is counted before that filter. The field is
+additive on the HTTP envelope, so existing callers (the lead pipeline) are unaffected.
+
+**The proxy has a SECOND allowlist.** `TELEGRAM_PROXY_ALLOWED_CHAT_IDS` (config) is
+enforced in `_authorize_entity`: when it is non-empty, reading any chat outside it
+answers **403**, no matter what `chat_sources.txt` says. Both lists must contain a
+chat for it to be ingested. A read failure — 403, FloodWait, not-in-dialogs — is
+isolated per chat and now always produces a **named report entry** with
+`error: "<Type>: <message>"` alongside `failed_sources`, instead of a bare count with
+an empty `chats[]`. The `digest_sources` row is written only *after* a successful
+read, so a permanently-403 chat no longer gets a row rewritten every run and the
+table keeps meaning "chats we actually read".
 
 **Preview before enabling** — the dry-run reads and gates exactly like a real run
 but writes nothing (no source row, no message, no watermark) and prints the admitted

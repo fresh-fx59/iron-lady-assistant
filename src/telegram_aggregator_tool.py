@@ -108,6 +108,10 @@ def _chat_allowlist(paths) -> list:
     Default OFF, and the *file* is the flag: no `chat_sources.txt`, or a file that
     parses to nothing, means the chat lane never runs. Merging this code therefore
     cannot change today's digest by itself.
+
+    A file whose lines ALL fail to parse is deliberately not "nothing": the entries
+    come back as `ChatSource("invalid", …)` so the run reports the typos in
+    `unresolved` instead of looking like a lane that was never switched on.
     """
     if not paths.chat_sources_path.exists():
         return []

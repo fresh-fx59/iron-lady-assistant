@@ -329,3 +329,68 @@ async def test_read_messages_links_via_a_multi_username(monkeypatch) -> None:
         kind="channel", entity_id=1741956568, min_id=0, limit=5, recent_first=True
     )
     assert messages[0]["link"] == "https://t.me/oestick/42"
+
+
+@pytest.mark.asyncio
+async def test_read_messages_page_cursor_covers_textless_messages(monkeypatch) -> None:
+    """`max_seen_id` must count the messages the text filter drops.
+
+    Text-less messages (stickers, uncaptioned photos, join/pin service events) are not
+    digest material, but a caller whose watermark means "everything seen" cannot
+    derive it from the filtered list: `limit` consecutive text-less messages above the
+    watermark make the list empty and pin the peer forever, silently.
+    """
+    entity = _MultiUsernameChannel(555, "Чат", [_uname("some_chat")])
+
+    def _msg(mid, text):
+        return types.SimpleNamespace(
+            id=mid,
+            date=datetime(2026, 7, 30, 6, 0, tzinfo=timezone.utc),
+            sender_id=7,
+            views=None,
+            forwards=None,
+            replies=None,
+            message=text,
+            to_dict=lambda: {"id": mid},
+        )
+
+    class FakeClient:
+        async def iter_messages(self, entity, **kwargs):  # noqa: ARG002
+            for mid in (10, 11, 12):  # a sticker burst: no text at all
+                yield _msg(mid, None)
+
+    proxy = TelegramProxy()
+    proxy._client = FakeClient()
+
+    async def fake_resolve_entity(**kwargs):  # noqa: ARG001
+        return entity
+
+    monkeypatch.setattr(proxy, "_resolve_entity", fake_resolve_entity)
+
+    page = await proxy.read_messages_page(
+        kind="linked_chat", entity_id=555, min_id=9, limit=3, recent_first=True
+    )
+    assert page["messages"] == []
+    assert page["seen"] == 3
+    assert page["max_seen_id"] == 12
+    # the legacy list view is unchanged for every existing caller
+    assert await proxy.read_messages(
+        kind="linked_chat", entity_id=555, min_id=9, limit=3, recent_first=True
+    ) == []
+
+
+def test_entity_identity_reads_a_multi_username_lead_sender() -> None:
+    """The lead-sender label (upsert_lead_sender) reads the same handle the digest
+    links do: a multi-username entity keeps the legacy scalar empty, so the blind
+    read labelled a sender that HAS a public handle as handle-less."""
+    entity = _MultiUsernameChannel(4242, "Чат про ИИ", [_uname("ai_chat_public")])
+    assert TelegramProxy._entity_identity(entity) == (
+        "channel",
+        "ai_chat_public",
+        "Чат про ИИ",
+        False,
+    )
+    user = types.SimpleNamespace(
+        first_name="Иван", last_name="Петров", username=None, usernames=[], bot=False
+    )
+    assert TelegramProxy._entity_identity(user) == ("user", None, "Иван Петров", False)

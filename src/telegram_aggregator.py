@@ -70,10 +70,18 @@ CHAT_READ_LIMIT = 150
 CHAT_DEDUP_WINDOW_HOURS = 72
 
 _URL_RE = re.compile(r"https?://\S", re.IGNORECASE)
-_TME_ID_RE = re.compile(r"^(?:https?://)?t\.me/c/(\d+)(?:/\d+)?$", re.IGNORECASE)
+# t.me/c/<id>, t.me/c/<id>/<msg> AND t.me/c/<id>/<topic>/<msg> — a client copying a
+# link out of a FORUM group emits the three-segment form, so anything but "accept
+# every trailing message/topic segment" silently drops a legitimate allowlist line.
+_TME_ID_RE = re.compile(r"^(?:https?://)?t\.me/c/(\d+)(?:/\d+)*/?$", re.IGNORECASE)
 # A public post link as it appears quoted inside a chat message.
 _TME_POST_RE = re.compile(
     r"(?:https?://)?t\.me/(?!c/|\+)[A-Za-z][A-Za-z0-9_]{3,31}/\d+", re.IGNORECASE
+)
+# The handle inside a post link the proxy built — the ONE authority on whether a
+# message from this peer can be cited (see collect_chats' ``citable``).
+_TME_HANDLE_RE = re.compile(
+    r"^(?:https?://)?t\.me/(?!c/|\+)([A-Za-z][A-Za-z0-9_]{3,31})/\d+", re.IGNORECASE
 )
 
 
@@ -82,8 +90,11 @@ class ChatSource:
     """One allowlist entry: either a public handle or a bare entity id.
 
     ``form`` is ``"username"`` (resolvable only through a channel's
-    ``linked_chat_username``) or ``"id"`` (an internal, positive Telethon entity
-    id — the only way to name a discussion group with no public handle).
+    ``linked_chat_username``), ``"id"`` (an internal, positive Telethon entity id —
+    the only way to name a discussion group with no public handle) or ``"invalid"``
+    (a line that parsed to nothing; ``value`` is the raw line). This file IS the
+    feature flag, so a typo in it is REPORTED, never swallowed — an invalid entry
+    travels to ``resolve_chat_sources`` and shows up in ``unresolved`` with a reason.
     """
 
     form: str
@@ -97,21 +108,17 @@ class ResolvedChat:
     username: str | None
     parent_channel_id: int | None
     parent_channel_key: str | None
+    # How the allowlist line was resolved: "username" (via a channel's
+    # linked_chat_username), "id-linked" (a channel record links to this id, so
+    # title/parent are known) or "id-unlinked" (read by id; NOTHING about the peer is
+    # known before the read — in particular no handle, which is why ``citable`` may
+    # NOT be derived from ``username`` here). Reported per chat so every allowlist
+    # line is accounted for in the output.
+    resolved_via: str = "username"
 
     @property
     def peer_key(self) -> str:
         return f"{CHAT_KIND}:{self.entity_id}"
-
-    @property
-    def citable(self) -> bool:
-        """Whether a message here can carry a public ``t.me/<handle>/<id>`` link.
-
-        A handle-less group yields ``link=None`` from the proxy; ``build_draft_input``
-        drops link-less rows and the draft gates only accept
-        ``https://t.me/<username>/<id>``, so such a chat is corpus-only today — it is
-        ingested and visible to later analysis, but it cannot be cited in the digest.
-        """
-        return bool(self.username)
 
 
 @dataclass(frozen=True)
@@ -207,13 +214,18 @@ def parse_chat_sources(text: str) -> list[ChatSource]:
     | ``-1001788662720``          | the ``-100``-marked id a Telegram client shows   |
     | ``id:1788662720``           | the same, written explicitly                     |
     | ``t.me/c/1788662720/12``    | the internal deep link of a handle-less chat     |
+    | ``t.me/c/1788662720/8/12``  | the same for a FORUM group (topic + message)     |
 
     The id forms exist because a linked discussion group usually has NO public
-    username — 33 of the 55 linked chats in the live dialogs (2026-07-30). An id-only
-    chat is ingested but is *not citable*; see ``ResolvedChat.citable``.
+    username — 33 of the 55 linked chats in the live dialogs (2026-07-30).
 
-    ``t.me/+invite`` links are skipped (not resolvable identities). Comments (#…)
-    and blanks are skipped; order-preserving dedup, case-insensitive per form.
+    Comments (#…) and blanks are skipped; order-preserving dedup, case-insensitive
+    per form. **Everything else that fails to parse becomes a
+    ``ChatSource("invalid", <raw line>)``** rather than vanishing: this file is the
+    ON switch for the whole lane, so a fat-fingered handle (``@hyper-llm``) or an
+    invite link (``t.me/+abc``, not a resolvable identity) must reach the operator's
+    report. ``resolve_chat_sources`` turns each into an ``unresolved`` entry with a
+    reason; nothing is read for it.
     """
     seen: set[tuple[str, str]] = set()
     out: list[ChatSource] = []
@@ -231,6 +243,8 @@ def parse_chat_sources(text: str) -> list[ChatSource]:
             if candidate.lower().startswith("id:"):
                 candidate = candidate[3:].strip()
             if candidate.startswith("+"):
+                entry = ChatSource("invalid", line)
+                out.append(entry)
                 continue
             digits = candidate.lstrip("-")
             if digits.isdigit():
@@ -245,7 +259,7 @@ def parse_chat_sources(text: str) -> list[ChatSource]:
             elif _USERNAME_RE.match(candidate):
                 entry = ChatSource("username", candidate)
             else:
-                continue
+                entry = ChatSource("invalid", line)
         key = (entry.form, entry.value.lower())
         if key in seen:
             continue
@@ -256,7 +270,7 @@ def parse_chat_sources(text: str) -> list[ChatSource]:
 
 def resolve_chat_sources(
     chat_sources: list[ChatSource], channels: list[Any]
-) -> tuple[list[ResolvedChat], list[str]]:
+) -> tuple[list[ResolvedChat], list[dict[str, str]]]:
     """Map allowlist entries onto joined discussion chats.
 
     A discussion group is ``broadcast=False``, so it never appears in
@@ -265,10 +279,28 @@ def resolve_chat_sources(
     parent channel record. That is exactly what a handle entry is resolved
     against; an id entry needs no lookup at all (the proxy reads a joined chat by
     id), and only borrows the title/parent from a channel record when one links to it.
+
+    **Every allowlist line is accounted for**: it lands either in ``resolved`` (and
+    then in the per-chat report, tagged with ``resolved_via``) or in ``unresolved``
+    as ``{"entry": <line>, "form": …, "reason": …}``. Reasons:
+
+    * ``malformed-line`` — did not parse (see ``parse_chat_sources``).
+    * ``no-linked-chat-with-this-handle`` — no joined channel exposes it as its
+      ``linked_chat_username``; the paced join loop may not have reached it yet.
+    * ``broadcast-channel-id`` — the id is a BROADCAST channel we already track, not
+      a discussion chat. Reading it as ``linked_chat`` would double-ingest that
+      channel's posts under a second peer_key with ``views=NULL``, so the id form
+      gets this kind check instead of trusting any integer.
     """
     by_username: dict[str, Any] = {}
     by_id: dict[int, Any] = {}
+    # list_channels only ever returns BROADCAST channels, so their own entity ids are
+    # exactly the set an id-form entry must not name.
+    broadcast_ids: set[int] = set()
     for channel in channels:
+        own_id = getattr(channel, "entity_id", None)
+        if own_id is not None:
+            broadcast_ids.add(int(own_id))
         linked_id = getattr(channel, "linked_chat_id", None)
         if not linked_id:
             continue
@@ -278,20 +310,42 @@ def resolve_chat_sources(
             by_username.setdefault(handle, channel)
 
     resolved: list[ResolvedChat] = []
-    unresolved: list[str] = []
+    unresolved: list[dict[str, str]] = []
     seen_ids: set[int] = set()
     for source in chat_sources:
+        if source.form == "invalid":
+            unresolved.append(
+                {"entry": source.value, "form": "invalid", "reason": "malformed-line"}
+            )
+            continue
         if source.form == "username":
             channel = by_username.get(source.value.lower())
             if channel is None:
-                unresolved.append(source.value)
+                unresolved.append(
+                    {
+                        "entry": source.value,
+                        "form": "username",
+                        "reason": "no-linked-chat-with-this-handle",
+                    }
+                )
                 continue
             entity_id = int(channel.linked_chat_id)
             username = getattr(channel, "linked_chat_username", None)
+            resolved_via = "username"
         else:
             entity_id = int(source.value)
+            if entity_id in broadcast_ids:
+                unresolved.append(
+                    {
+                        "entry": source.value,
+                        "form": "id",
+                        "reason": "broadcast-channel-id",
+                    }
+                )
+                continue
             channel = by_id.get(entity_id)
             username = getattr(channel, "linked_chat_username", None) if channel else None
+            resolved_via = "id-linked" if channel is not None else "id-unlinked"
         if entity_id in seen_ids:
             continue
         seen_ids.add(entity_id)
@@ -306,6 +360,7 @@ def resolve_chat_sources(
                 username=username,
                 parent_channel_id=parent_id,
                 parent_channel_key=f"channel:{parent_id}" if parent_id is not None else None,
+                resolved_via=resolved_via,
             )
         )
     return resolved, unresolved
@@ -375,18 +430,17 @@ def _agg_connect(store: TelegramDigestStore) -> sqlite3.Connection:
 def _recent_corpus_index(
     store: TelegramDigestStore, *, window_hours: int
 ) -> tuple[set[str], set[str]]:
-    """``(text keys, post links)`` of everything already in the corpus's window.
+    """``(identity keys, post links)`` of everything already in the corpus's window.
 
-    The text keys reuse ``_dedup_key`` (NFKC + lower + collapsed whitespace) — the
-    SAME normalisation ``build_draft_input`` dedups with, so a chat echo collapses
-    on exactly the key the drafter would have collapsed on. Prior chat rows are
-    included too, so yesterday's echo is not re-admitted today.
+    Both sets are EXACT identities, because they are used as an ingest blocker and an
+    ingest reject is irreversible (see ``_identity_key``): the full normalised text,
+    and the normalised ``t.me/<channel>/<id>`` of each row. Prior chat rows are
+    included too, so yesterday's byte-identical echo is not re-admitted today.
 
-    The link set exists because the text key alone misses the OTHER echo shape,
-    the dominant one in live data: a manual repost that PREPENDS the source link,
-    which shifts the first 120 chars so the key no longer matches. A quoted
-    ``t.me/<channel>/<id>`` is exact identity, not a heuristic — if we already hold
-    that post, the chat message is a duplicate of it.
+    The link set exists because the text identity misses the dominant echo shape in
+    live data: a manual repost that adds its own wrapper around the source link. A
+    quoted ``t.me/<channel>/<id>`` is identity, not similarity — if we already hold
+    that post, the chat message is pointing at a duplicate of it.
     """
     cutoff = (_utc_now() - timedelta(hours=window_hours)).isoformat()
     con = _agg_connect(store)
@@ -402,9 +456,9 @@ def _recent_corpus_index(
         ).fetchall()
     finally:
         con.close()
-    keys = {_dedup_key(str(row["text"] or "")) for row in rows if row["text"]}
+    keys = {_identity_key(str(row["text"] or "")) for row in rows if row["text"]}
     links = {_normalize_post_link(row["link"]) for row in rows if row["link"]}
-    return keys, links - {""}
+    return keys - {""}, links - {""}
 
 
 def _normalize_post_link(link: str | None) -> str:
@@ -420,6 +474,35 @@ def _quoted_post_links(text: str) -> set[str]:
     return {
         _normalize_post_link(match.group(0)) for match in _TME_POST_RE.finditer(text or "")
     }
+
+
+def _link_handle(link: str | None) -> str | None:
+    """The public handle inside a ``t.me/<handle>/<id>`` link, else ``None``."""
+    match = _TME_HANDLE_RE.match(str(link or "").strip())
+    return match.group(1) if match else None
+
+
+async def _read_page(client: Any, **kwargs: Any) -> dict[str, Any]:
+    """One read, plus a cursor over every message the proxy ITERATED.
+
+    ``read_messages`` returns only text-bearing messages, so a watermark derived from
+    it stalls on a burst of stickers / uncaptioned media / service events (finding 2:
+    ``read_limit`` such messages above the watermark ⇒ empty list ⇒ cursor pinned
+    forever, silently). ``read_messages_page`` carries ``max_seen_id`` for exactly
+    this. A client that predates it (or a lightweight test fake) falls back to the
+    list form, where the cursor can only be what came back.
+    """
+    page_call = getattr(client, "read_messages_page", None)
+    if page_call is not None:
+        page = await page_call(**kwargs)
+        messages = list(page.get("messages", []))
+        max_seen_id = int(page.get("max_seen_id") or 0)
+    else:
+        messages = list(await client.read_messages(**kwargs))
+        max_seen_id = 0
+    for message in messages:
+        max_seen_id = max(max_seen_id, int(message["message_id"]))
+    return {"messages": messages, "max_seen_id": max_seen_id}
 
 
 def _utc_now() -> datetime:
@@ -473,20 +556,26 @@ async def collect(
             linked_channel_key=None,
             role=AGG_ROLE,
         )
-        last_id = store.last_message_id(peer_key)
+        # Same stall class as the chat lane (finding 2): a channel post with no text
+        # (an uncaptioned photo) is dropped by the proxy and therefore never stored,
+        # so a cursor derived only from stored rows can be overtaken by such posts.
+        # max() keeps this monotonic — the cursor never rewinds for existing sources.
+        last_id = max(store.last_message_id(peer_key), store.last_seen_message_id(peer_key))
         try:
-            messages = await client.read_messages(
+            page = await _read_page(
+                client,
                 kind="channel",
                 entity_id=entity_id,
                 min_id=last_id,
                 limit=collect_limit,
                 recent_first=last_id == 0,
             )
+            messages = page["messages"]
         except Exception as exc:  # noqa: BLE001 — per-source isolation
             failed += 1
             logger.warning("aggregator collect: skipping %s this pass: %s", name, exc)
             continue
-        latest = last_id
+        latest = max(last_id, page["max_seen_id"])
         for message in messages:
             posted_raw = message.get("posted_at")
             posted_at = (
@@ -548,7 +637,10 @@ async def collect_chats(
     turn into a stalled cursor that re-reads the same window forever. A burst larger
     than ``read_limit`` therefore skips its oldest excess on purpose — the digest
     only ever looks at the last 24h (this is also the 2026-07-24 lead-feed lesson:
-    never crawl a busy chat oldest-first).
+    never crawl a busy chat oldest-first). "Seen" means every message the PROXY
+    iterated, which is why the read goes through ``_read_page``: the proxy filters
+    text-less messages out of its result, and a cursor built from what came back is
+    pinned forever by ``read_limit`` stickers above the watermark.
 
     ``dry_run=True`` performs the reads and the full gate but writes NOTHING (no
     source row, no message, no watermark) and reports the admitted text, so the
@@ -573,31 +665,70 @@ async def collect_chats(
 
     for chat in resolved:
         peer_key = chat.peer_key
-        if not dry_run:
-            store.upsert_source(
-                peer_key=peer_key,
-                entity_id=chat.entity_id,
-                title=chat.title,
-                username=chat.username,
-                kind=CHAT_KIND,
-                linked_channel_key=chat.parent_channel_key,
-                role=AGG_ROLE,
-            )
         last_id = store.last_seen_message_id(peer_key)
         try:
-            messages = await client.read_messages(
+            # Read FIRST, write the source row only once the read succeeded. The
+            # proxy has its own, separate chat allowlist
+            # (TELEGRAM_PROXY_ALLOWED_CHAT_IDS) and answers 403 for anything outside
+            # it, so upserting before the read wrote a digest_sources row every run
+            # for a chat we can never read. digest_sources now means "chats we
+            # actually read", and a permanently-403 entry leaves no trace but the
+            # report entry below.
+            page = await _read_page(
+                client,
                 kind=CHAT_KIND,
                 entity_id=chat.entity_id,
                 min_id=last_id,
                 limit=read_limit,
                 recent_first=True,
             )
+            messages = page["messages"]
         except Exception as exc:  # noqa: BLE001 — per-source isolation
             failed += 1
             logger.warning(
                 "aggregator chat collect: skipping %s this pass: %s", peer_key, exc
             )
+            # A failure MUST be named. Counting it in failed_sources only produced
+            # `{"resolved": 3, "failed_sources": 3, "chats": []}` — no chat, no
+            # reason — which is unusable for the operator deciding whether a chat is
+            # safe to enable. The 403 above is the common case.
+            reports.append(
+                {
+                    "peer_key": peer_key,
+                    "title": chat.title,
+                    "username": chat.username,
+                    "resolved_via": chat.resolved_via,
+                    "citable": None,
+                    "seen": 0,
+                    "admitted": 0,
+                    "rejected": {},
+                    "error": f"{type(exc).__name__}: {exc}".strip(),
+                }
+            )
             continue
+
+        # The link the proxy built from the CHAT entity itself is the only authority
+        # on the handle; ResolvedChat.username is a second derivation (the parent
+        # channel's linked_chat_username, None for every id-unlinked entry) and the
+        # two disagree exactly when the operator is deciding whether to enable a chat.
+        observed_handles = sorted(
+            {
+                handle
+                for handle in (_link_handle(m.get("link")) for m in messages)
+                if handle
+            }
+        )
+        observed_handle = observed_handles[0] if observed_handles else None
+        if not dry_run:
+            store.upsert_source(
+                peer_key=peer_key,
+                entity_id=chat.entity_id,
+                title=chat.title,
+                username=observed_handle or chat.username,
+                kind=CHAT_KIND,
+                linked_channel_key=chat.parent_channel_key,
+                role=AGG_ROLE,
+            )
 
         dup_channel_ids = set(tracked_channel_ids)
         if chat.parent_channel_id is not None:
@@ -605,7 +736,16 @@ async def collect_chats(
 
         rejected: dict[str, int] = {}
         candidates: list[tuple[tuple[int, int, int], dict[str, Any], str, set[str]]] = []
-        latest_seen = last_id
+        # Intra-RUN identity index: group key -> index in ``candidates``. The
+        # cross-chat index (dedup_keys / corpus_links) can only be fed by the ADMITTED
+        # subset, which is known after the cap — so without this, two messages from
+        # the same chat in the same run were never compared to each other (finding 3):
+        # identical texts both stored and both burning a cap slot, and two differently
+        # worded messages quoting the same untracked post publishing one story twice.
+        # Duplicates MERGE into the best-ranked member of their group rather than
+        # rejecting the later one, so the cap still sees each group's best candidate.
+        run_groups: dict[str, int] = {}
+        latest_seen = max(last_id, page["max_seen_id"])
         for message in messages:
             message_id = int(message["message_id"])
             latest_seen = max(latest_seen, message_id)
@@ -616,7 +756,7 @@ async def collect_chats(
                 rejected[verdict] = rejected.get(verdict, 0) + 1
                 continue
             text = str(message.get("text") or "").strip()
-            key = _dedup_key(text)
+            key = _identity_key(text)
             if key in dedup_keys:
                 rejected["duplicate-text"] = rejected.get("duplicate-text", 0) + 1
                 continue
@@ -625,7 +765,21 @@ async def collect_chats(
                 rejected["echo-of-corpus-post"] = rejected.get("echo-of-corpus-post", 0) + 1
                 continue
             rank = (1 if _URL_RE.search(text) else 0, len(text), message_id)
+            # Own link is NOT a group key: it is unique per message by construction.
+            group_keys = {key} | quoted
+            hit = next((run_groups[k] for k in group_keys if k in run_groups), None)
+            if hit is not None:
+                rejected["duplicate-in-run"] = rejected.get("duplicate-in-run", 0) + 1
+                incumbent = candidates[hit]
+                group_keys |= {incumbent[2]} | incumbent[3]
+                if rank > incumbent[0]:
+                    candidates[hit] = (rank, message, key, quoted | incumbent[3])
+                for group_key in group_keys:
+                    run_groups[group_key] = hit
+                continue
             candidates.append((rank, message, key, quoted))
+            for group_key in group_keys:
+                run_groups[group_key] = len(candidates) - 1
 
         candidates.sort(key=lambda item: item[0], reverse=True)
         admitted = candidates[:max_per_run]
@@ -682,10 +836,15 @@ async def collect_chats(
         report = {
             "peer_key": peer_key,
             "title": chat.title,
-            "username": chat.username,
-            # False ⇒ the proxy cannot build a t.me link here, so build_draft_input
-            # drops these rows: the chat is corpus-only, never cited in a digest.
-            "citable": chat.citable,
+            "username": observed_handle or chat.username,
+            "resolved_via": chat.resolved_via,
+            # True/False ⇒ the messages the proxy returned DO / do NOT carry a public
+            # t.me/<handle>/<id> link (build_draft_input drops link-less rows and the
+            # draft gates only accept that form, so a False chat is corpus-only).
+            # None ⇒ unknown, nothing was read this run — never guessed from
+            # ResolvedChat.username, which reported False for public id-form chats
+            # whose rows in fact carried a publishable link.
+            "citable": bool(observed_handle) if messages else None,
             "seen": len(messages),
             "admitted": len(admitted),
             "rejected": rejected,
@@ -704,10 +863,31 @@ async def collect_chats(
     }
 
 
-def _dedup_key(text: str) -> str:
+def _identity_key(text: str) -> str:
+    """INGEST identity: NFKC + lower + collapsed whitespace over the WHOLE text.
+
+    The only kind of key an ingest blocker may use. Rejecting a message at ingest is
+    IRREVERSIBLE — ``mark_collected`` has already advanced the watermark past it, so
+    nothing ever offers it again. ``_dedup_key``'s 120-char prefix cannot carry that
+    weight: any chat whose messages share a boilerplate header longer than the prefix
+    (a promo line, an "источник:" preamble, a channel signature) collapses onto ONE
+    key, so the first message is admitted and every genuinely new story after it is
+    dropped as a duplicate, forever. Fuzzy similarity belongs in
+    ``build_draft_input``, where a collision only costs a slot in today's draft.
+    """
     norm = unicodedata.normalize("NFKC", text).lower()
-    norm = " ".join(norm.split())
-    return norm[:120]
+    return " ".join(norm.split())
+
+
+def _dedup_key(text: str) -> str:
+    """SELECTION key: the first 120 normalised chars. DRAFT-TIME ONLY.
+
+    Lossy on purpose — it merges near-identical rewrites of one story when picking
+    what goes into a draft. Non-destructive by construction: every row stays in the
+    corpus and is re-selectable tomorrow. Never use it as an ingest blocker
+    (see ``_identity_key``).
+    """
+    return _identity_key(text)[:120]
 
 
 def build_draft_input(
@@ -748,9 +928,12 @@ def build_draft_input(
             "username": r["username"],
             # Origin comes straight from digest_sources.kind — the corpus already
             # distinguishes a broadcast source from a discussion chat, so marking
-            # origin needs NO new column and NO migration. Chat rows also carry
-            # views=NULL, so the views-DESC ordering above puts them last: they can
-            # only ever fill slots the channels left empty under max_posts.
+            # origin needs NO new column and NO migration. Chat rows carry views=NULL,
+            # so the views-DESC ordering above ranks them LAST — but that is ordering,
+            # not a bound: max_posts (150) is well above the ~70 posts/day channel
+            # corpus, so there is no slot pressure and every stored chat row does
+            # enter the draft input. The real bound is at ingest:
+            # CHAT_MAX_PER_RUN (2) x 5 collect runs/day = <=10 rows/day per chat.
             "origin": "chat" if r["kind"] == CHAT_KIND else "channel",
             "link": r["link"],
             "text": (r["text"] or "").strip(),

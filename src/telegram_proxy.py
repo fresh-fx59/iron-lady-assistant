@@ -490,17 +490,34 @@ class ProxyChannelRecord:
     linked_chat_username: str | None
 
 
-@dataclass(frozen=True)
+# `user`/`bot` dialogs are never returned by /v1/dialogs: see list_dialogs.
+_PRIVATE_DIALOG_KINDS = frozenset({"user", "bot"})
+# GetFullChannel sweep budget for ONE list_dialogs call. The account holds ~60
+# broadcast channels today; the bound exists so growth cannot silently turn a
+# daily job into a ban-sensitive 200-request burst.
+_LINKED_LOOKUP_MAX = 80
+_LINKED_LOOKUP_PACING_SECONDS = 0.4
+
+
+@dataclass
 class ProxyDialogRecord:
+    """Mutable: the linked-chat sweep is a SECOND phase that fills two fields in."""
+
     entity_id: int
     title: str
-    kind: str  # channel | megagroup | group | user | bot
+    kind: str  # channel | megagroup | group  (never user / bot — see list_dialogs)
     username: str | None
     usernames: list[str]
     is_broadcast: bool
     is_megagroup: bool
     participants_count: int | None
     linked_chat_id: int | None
+    # ok | pending | skipped … | failed (…) | floodwait …s — a caller must be able
+    # to tell "no discussion chat" from "we could not find out".
+    linked_chat_lookup: str = "ok"
+    # Internal only: the Telethon entity, so phase 2 needs no re-resolve. Never
+    # serialised (the route strips underscore fields; it is None by then anyway).
+    _entity: Any = None
 
 
 def _dialog_usernames(entity: Any) -> list[str]:
@@ -804,32 +821,37 @@ class TelegramProxy:
             return records
 
     async def list_dialogs(self, *, limit: int, with_linked: bool = False) -> list[ProxyDialogRecord]:
-        """READ-ONLY enumeration of EVERY dialog the account is in.
+        """READ-ONLY enumeration of every GROUP/CHANNEL dialog the account is in.
 
         `list_channels` filters to broadcast=True, so a hand-joined group is
-        invisible to every audit that goes through it. This is the unfiltered
-        view. It never joins, leaves, sends, or mutates anything; the only
-        optional round trip is GetFullChannel for `linked_chat_id`, and only for
-        broadcast channels (nothing else can have a discussion group).
+        invisible to every audit that goes through it. This is the view that also
+        shows groups. It never joins, leaves, sends, or mutates anything.
+
+        `user`/`bot` dialogs are dropped HERE, server-side: returning the title,
+        handle and participant count of every DM — the account's entire contact
+        list — to any holder of the proxy token is a leak `list_channels` never
+        had, and no consumer has any use for them beyond refusing them.
+
+        The optional `with_linked` round trip (GetFullChannel per broadcast
+        channel) is a heavy, ban-sensitive sweep, so it runs in a SECOND phase:
+        outside the enumeration lock, one channel at a time, PACED and BOUNDED,
+        re-taking the lock per call so other proxy consumers can interleave. Each
+        record carries `linked_chat_lookup` (ok | skipped | failed | floodwait…)
+        so a caller can tell a real "no discussion chat" from a degraded answer.
         """
         client = self._require_client()
+        records: list[ProxyDialogRecord] = []
         async with self._lock:
-            records: list[ProxyDialogRecord] = []
             async for dialog in client.iter_dialogs(limit=limit):
                 entity = getattr(dialog, "entity", None)
                 if entity is None:
                     continue
-                entity_id = int(getattr(entity, "id", 0) or 0)
                 kind = _dialog_kind(entity)
+                if kind in _PRIVATE_DIALOG_KINDS:
+                    continue
+                entity_id = int(getattr(entity, "id", 0) or 0)
                 handles = _dialog_usernames(entity)
                 count = getattr(entity, "participants_count", None)
-                linked_chat_id: Any = None
-                if with_linked and kind == "channel":
-                    try:
-                        full = await client(self._get_full_channel_request(entity))
-                        linked_chat_id = getattr(full.full_chat, "linked_chat_id", None)
-                    except Exception:
-                        logger.debug("no linked chat for dialog=%s", entity_id, exc_info=True)
                 records.append(
                     ProxyDialogRecord(
                         entity_id=entity_id,
@@ -843,10 +865,56 @@ class TelegramProxy:
                         is_broadcast=bool(getattr(entity, "broadcast", False)),
                         is_megagroup=bool(getattr(entity, "megagroup", False)),
                         participants_count=int(count) if isinstance(count, int) else None,
-                        linked_chat_id=int(linked_chat_id) if linked_chat_id else None,
+                        linked_chat_id=None,
+                        linked_chat_lookup="ok" if not with_linked else "pending",
+                        _entity=entity,
                     )
                 )
-            return records
+        if with_linked:
+            await self._resolve_linked_chats(client, records)
+        for record in records:
+            record._entity = None  # never serialise the Telethon entity
+        return records
+
+    async def _resolve_linked_chats(self, client: Any, records: list[ProxyDialogRecord]) -> None:
+        """Phase 2 of list_dialogs: paced, bounded GetFullChannel sweep.
+
+        Unlike `list_channels` (bootstrap-only) this route now runs DAILY, and the
+        module's own comment calls a full sweep "heavy, ban-sensitive". So: at
+        most `_LINKED_LOOKUP_MAX` lookups per call, `_LINKED_LOOKUP_PACING_SECONDS`
+        apart, and the lock is released between them. A FloodWaitError stops the
+        sweep immediately (retrying inside one is how an account gets limited) and
+        every remaining record is marked degraded rather than silently reported as
+        "no linked chat" — that silent None made a discussion chat classify as
+        `enroll-leads`/`skip` instead of `enroll-both` with nothing recorded.
+        """
+        from telethon.errors import FloodWaitError
+
+        targets = [r for r in records if r.kind == "channel" and r._entity is not None]
+        stop_reason: str | None = None
+        for index, record in enumerate(targets):
+            if stop_reason is not None:
+                record.linked_chat_lookup = stop_reason
+                continue
+            if index >= _LINKED_LOOKUP_MAX:
+                record.linked_chat_lookup = f"skipped (bounded at {_LINKED_LOOKUP_MAX} lookups/call)"
+                continue
+            if index:
+                await asyncio.sleep(_LINKED_LOOKUP_PACING_SECONDS)
+            try:
+                async with self._lock:
+                    full = await client(self._get_full_channel_request(record._entity))
+                linked_chat_id = getattr(full.full_chat, "linked_chat_id", None)
+                record.linked_chat_id = int(linked_chat_id) if linked_chat_id else None
+                record.linked_chat_lookup = "ok"
+            except FloodWaitError as exc:
+                seconds = int(getattr(exc, "seconds", 0) or 0)
+                stop_reason = f"floodwait {seconds}s — sweep stopped"
+                record.linked_chat_lookup = stop_reason
+                logger.warning("list_dialogs linked-chat sweep hit FloodWait %ss; stopping", seconds)
+            except Exception as exc:  # noqa: BLE001 — per-channel isolation
+                record.linked_chat_lookup = f"failed ({type(exc).__name__})"
+                logger.debug("no linked chat for dialog=%s", record.entity_id, exc_info=True)
 
     async def read_messages(
         self,
@@ -1699,11 +1767,16 @@ async def _list_channels(request: web.Request) -> web.Response:
 
 
 async def _list_dialogs(request: web.Request) -> web.Response:
-    """Read-only: every dialog, including the groups /v1/channels filters out."""
+    """Read-only: group/channel dialogs, including the ones /v1/channels filters out.
+
+    DMs and bot chats are never included (see TelegramProxy.list_dialogs). The
+    clamp matches the /v1/channels neighbour — 500 max, 200 default — because the
+    same iter_dialogs sweep backs both and there is no consumer that needs more.
+    """
     _check_auth(request)
     proxy: TelegramProxy = request.app["proxy"]
     try:
-        limit = max(1, min(1000, int(request.query.get("limit", "500"))))
+        limit = max(1, min(500, int(request.query.get("limit", "200"))))
     except ValueError:
         raise web.HTTPBadRequest(text="limit must be an integer.") from None
     with_linked = request.query.get("with_linked", "0").strip().lower() in {"1", "true", "yes", "on"}
@@ -1713,7 +1786,14 @@ async def _list_dialogs(request: web.Request) -> web.Response:
         raise
     except Exception as exc:
         raise web.HTTPBadGateway(text=f"List dialogs failed: {exc}") from exc
-    return web.json_response({"dialogs": [asdict(record) for record in records]})
+    return web.json_response(
+        {
+            "dialogs": [
+                {key: value for key, value in asdict(record).items() if not key.startswith("_")}
+                for record in records
+            ]
+        }
+    )
 
 
 async def _read_messages(request: web.Request) -> web.Response:

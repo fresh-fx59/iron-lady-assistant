@@ -86,6 +86,9 @@ def test_parse_deny_rules_reads_every_form_and_skips_comments() -> None:
 
     assert [rule.kind for rule in rules] == ["user", "user", "id", "word", "re"]
     assert rules[0].value == "zhkparusa"
+    # The marked -100 form is normalised to the raw positive id the proxy emits;
+    # test_telegram_dialog_scan_defects.py pins that it actually MATCHES.
+    assert rules[2].value == "1234"
 
 
 def test_default_deny_rules_cover_the_operators_personal_channels(paths: ScanPaths) -> None:
@@ -301,7 +304,13 @@ def test_nothing_new_means_no_report_at_all(paths: ScanPaths) -> None:
 def test_a_new_enrolment_notifies_the_operator_once(paths: ScanPaths) -> None:
     sent: list[str] = []
 
-    report = run_scan(paths=paths, dialogs=[dialog(110, "channel", username="fresh_ai_news")], notifier=sent.append)
+    def notifier(text: str) -> bool:
+        # Mirrors notify_operator's contract: True = delivered. run_scan USES the
+        # return value, so a test double must be honest about delivery.
+        sent.append(text)
+        return True
+
+    report = run_scan(paths=paths, dialogs=[dialog(110, "channel", username="fresh_ai_news")], notifier=notifier)
 
     assert len(sent) == 1
     assert "fresh_ai_news" in sent[0]

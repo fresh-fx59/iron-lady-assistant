@@ -217,7 +217,7 @@ def build_draft_input(
                    m.link, m.text, m.views, m.forwards, m.posted_at
             FROM digest_messages m
             JOIN digest_sources s ON s.peer_key = m.peer_key
-            WHERE s.role = ? AND m.posted_at >= ?
+            WHERE (',' || s.role || ',') LIKE ('%,' || ? || ',%') AND m.posted_at >= ?
             ORDER BY COALESCE(m.views, 0) DESC
             """,
             (AGG_ROLE, cutoff),

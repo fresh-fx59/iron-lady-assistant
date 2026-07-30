@@ -4,6 +4,17 @@ Rendering, splitting, link emission, footer, and the actual send are ALL code �
 the model never touches the wire format (deliver-critical-values-by-code rule).
 Publisher design (injectable Transport, 2-phase ledger, dry-run) mirrors
 dzen-autopilot's post.py, adapted for multi-message digests.
+
+**ONE post = image + full text.** When the day has a hero image the digest ships
+as a SINGLE `sendRichMessage` post (Bot API **10.2**, 2026-07-14): the image is a
+media block inside a rich-HTML document that carries the whole digest, up to
+32768 chars. This replaced the old two-post shape (`sendPhoto` with a 1024-char
+caption, then the digest as separate `sendMessage`s) — the 1024 caption ceiling
+never fit a real digest (measured 1292-3097 chars), so *every* image day posted
+twice. **Requires Bot API >= 10.2** — if the method ever goes away the endpoint
+answers 404 (verified: a bogus method 404s while an empty rich body 400s), which
+PROVES nothing was posted and degrades to the old photo+text plan instead of
+freezing the channel. That plan stays reachable as the documented fallback.
 """
 from __future__ import annotations
 
@@ -28,17 +39,22 @@ from .telegram_aggregator_gates import Story
 logger = logging.getLogger(__name__)
 
 _MESSAGE_CAP = 4000  # under the 4096 Bot API ceiling; split at story boundaries
-_CAPTION_CAP = 1024  # Telegram sendPhoto caption ceiling
+_CAPTION_CAP = 1024  # Telegram sendPhoto caption ceiling (degrade path only)
+_RICH_CAP = 32768  # Bot API 10.2 rich-message text ceiling (chars)
+_RICH_MEDIA_ID = "hero"  # InputRichMessageMedia.id <-> tg://photo?id= <-> attach://
 
 
 class PhotoNotSent(Exception):
-    """A send_photo failure that PROVES the photo never reached Telegram.
+    """A media-send failure that PROVES nothing reached Telegram.
 
-    Raised only for file/DNS/connection errors — the request body demonstrably
-    never left the host (or was never built). Any other failure (HTTP error
-    after receipt, response-read timeout, JSON/KeyError parsing the OK response)
-    is *ambiguous*: Telegram may already hold the upload, so it must NOT be
-    treated as PhotoNotSent (degrading to a text re-post would double-post)."""
+    Raised only for file/DNS/connection errors (and, on the rich path, a 404 =
+    method does not exist) — the request body demonstrably never left the host,
+    was never built, or hit a method Telegram has no handler for. Any other
+    failure (HTTP error after receipt, response-read timeout, JSON/KeyError
+    parsing the OK response) is *ambiguous*: Telegram may already hold the post,
+    so it must NOT be treated as PhotoNotSent — falling back to another plan
+    would double-post. Name kept for compatibility; it covers send_photo and
+    send_rich_message alike."""
 
 
 # --- cross-day dedup (A1): structured-story (de)serialization + normalization ---
@@ -160,57 +176,142 @@ def render_messages(stories: list[Story], *, date_label: str, footer: str) -> li
     return messages
 
 
+def render_rich_html(messages: list[str], *, media_id: str = _RICH_MEDIA_ID) -> str:
+    """One rich-HTML document (Bot API 10.2) carrying image + the WHOLE digest.
+
+    Input is `render_messages`' output — the already-approved text, verbatim — so
+    the wording, the `Источники:` links and the escaping are exactly
+    `_render_story`'s and are never forked here. The messages are rejoined into
+    the single document they were split from (`render_messages` splits only at
+    the `\\n\\n` block boundaries it inserted), then each block becomes one rich
+    block: header/story blocks are `<p>`, the trailing block — the footer, by
+    construction always last — is `<footer>`. In-block newlines become `<br>`
+    because rich HTML collapses raw newlines.
+
+    Rich HTML accepts a NARROWER tag set than normal Bot API HTML; the tags used
+    here (`<p> <br> <b> <a href> <figure> <img> <footer>`) and the entities
+    `html.escape` emits (`&lt; &gt; &amp; &quot;`) are all in it.
+    """
+    document = "\n\n".join(messages)
+    blocks = [b for b in document.split("\n\n") if b.strip()]
+    # Media "can be specified only as a separate block": one leading <figure>
+    # referencing the uploaded photo by id (the id is bound to the multipart file
+    # part via attach:// in BotApiTransport.send_rich_message).
+    parts = [f'<figure><img src="tg://photo?id={media_id}"/></figure>']
+    last = len(blocks) - 1
+    for i, block in enumerate(blocks):
+        tag = "footer" if i == last and len(blocks) > 1 else "p"
+        parts.append(f"<{tag}>{block.replace(chr(10), '<br>')}</{tag}>")
+    return "".join(parts)
+
+
+def _build_photo_text_ops(
+    messages: list[str], image_path: str, short_caption: str
+) -> list[tuple]:
+    """The pre-10.2 photo plan — now the documented degrade path only.
+
+    - A SINGLE message that fits the caption cap -> the whole digest rides as the
+      photo's caption (one clean photo post, no trailing text).
+    - Otherwise -> a leading photo with a short caption, then the full digest
+      text as separate message(s), i.e. TWO+ posts.
+
+    NOTE (known, deliberately unchanged): the cap check compares `len()` of raw
+    HTML against a ceiling Telegram applies to *visible* text, so it under-counts
+    the budget. Harmless (conservative) and out of scope for the one-post work.
+    """
+    if len(messages) == 1 and len(messages[0]) <= _CAPTION_CAP:
+        return [("photo", image_path, messages[0])]
+    return [("photo", image_path, short_caption)] + [("text", m) for m in messages]
+
+
 def _build_send_ops(
     messages: list[str], image_path: str | None, short_caption: str
 ) -> list[tuple]:
     """Plan the ordered send operations for a digest.
 
     - No image -> one text op per message (the pre-A2 behavior).
-    - Image + a SINGLE message that fits the caption cap -> the whole digest
-      rides as the photo's caption (one clean photo post, no trailing text).
-    - Otherwise (image + long/multiple messages) -> a leading photo with a short
-      caption, then the full digest text as separate message(s).
+    - Image -> a SINGLE rich op: image + the whole digest in one post.
+    - Image whose rich HTML would blow the 32768 rich cap -> the legacy
+      photo+text plan (`_build_photo_text_ops`).
 
-    Photo ops are ``("photo", path, caption)``; text ops are ``("text", msg)``.
+    Rich ops are ``("rich", rich_html, path)``; photo ops are
+    ``("photo", path, caption)``; text ops are ``("text", msg)``.
     """
     if not image_path:
         return [("text", m) for m in messages]
-    if len(messages) == 1 and len(messages[0]) <= _CAPTION_CAP:
-        return [("photo", image_path, messages[0])]
-    return [("photo", image_path, short_caption)] + [("text", m) for m in messages]
+    rich_html = render_rich_html(messages)
+    if len(rich_html) <= _RICH_CAP:
+        return [("rich", rich_html, image_path)]
+    logger.warning(
+        "aggregator publish: rich html %d chars > %d cap — falling back to photo+text",
+        len(rich_html),
+        _RICH_CAP,
+    )
+    return _build_photo_text_ops(messages, image_path, short_caption)
+
+
+def _send_plans(
+    messages: list[str], image_path: str | None, short_caption: str
+) -> list[list[tuple]]:
+    """The primary plan plus its ordered degrade rungs.
+
+    A rung is tried ONLY when the previous one failed in a way that PROVES
+    nothing reached Telegram (`PhotoNotSent` before any op succeeded) — see
+    publish_next. Rungs: rich (one post) -> photo+text -> text-only.
+    """
+    plans = [_build_send_ops(messages, image_path, short_caption)]
+    if image_path:
+        photo_text = _build_photo_text_ops(messages, image_path, short_caption)
+        if photo_text != plans[0]:
+            plans.append(photo_text)
+        plans.append([("text", m) for m in messages])
+    return plans
 
 
 def _multipart(
     fields: dict[str, str],
     *,
-    file_field: str,
-    filename: str,
-    file_bytes: bytes,
-    content_type: str,
+    files: dict[str, tuple[str, str, bytes]],
     boundary: str,
 ) -> bytes:
-    """Encode a multipart/form-data body (stdlib only — no `requests`)."""
+    """Encode a multipart/form-data body (stdlib only — no `requests`).
+
+    `files` maps the form field name -> (filename, content_type, bytes). Field
+    names matter on the wire: sendPhoto wants `photo`, while sendRichMessage
+    references its upload by the name an `attach://<name>` points at.
+    """
     parts: list[bytes] = []
     for name, value in fields.items():
         parts.append(f"--{boundary}".encode())
         parts.append(f'Content-Disposition: form-data; name="{name}"'.encode())
         parts.append(b"")
         parts.append(str(value).encode("utf-8"))
-    parts.append(f"--{boundary}".encode())
-    parts.append(
-        f'Content-Disposition: form-data; name="{file_field}"; filename="{filename}"'.encode()
-    )
-    parts.append(f"Content-Type: {content_type}".encode())
-    parts.append(b"")
-    parts.append(file_bytes)
+    for name, (filename, content_type, file_bytes) in files.items():
+        parts.append(f"--{boundary}".encode())
+        parts.append(
+            f'Content-Disposition: form-data; name="{name}"; filename="{filename}"'.encode()
+        )
+        parts.append(f"Content-Type: {content_type}".encode())
+        parts.append(b"")
+        parts.append(file_bytes)
     parts.append(f"--{boundary}--".encode())
     parts.append(b"")
     return b"\r\n".join(parts)
 
 
+def _read_media(path: str) -> bytes:
+    """Read a media file for upload. Unreadable => PhotoNotSent: the request body
+    was never even built, so nothing can be live on the channel."""
+    try:
+        return Path(path).read_bytes()
+    except OSError as exc:
+        raise PhotoNotSent(f"cannot read media {path!r}: {exc}") from exc
+
+
 class Transport(Protocol):
     def send_message(self, chat: str, text: str) -> int: ...
     def send_photo(self, chat: str, photo_path: str, caption: str) -> int: ...
+    def send_rich_message(self, chat: str, rich_html: str, photo_path: str) -> int: ...
 
 
 class BotApiTransport:
@@ -244,29 +345,32 @@ class BotApiTransport:
                 raise
         raise RuntimeError("unreachable")
 
-    def send_photo(self, chat: str, photo_path: str, caption: str) -> int:
-        # Read the file once; caption is hard-capped at the Bot API ceiling.
-        # A file we can't read never left the host => PhotoNotSent (safe to
-        # degrade to text-only at the caller).
-        try:
-            file_bytes = Path(photo_path).read_bytes()
-        except OSError as exc:
-            raise PhotoNotSent(f"cannot read photo {photo_path!r}: {exc}") from exc
-        filename = Path(photo_path).name
-        caption = (caption or "")[:_CAPTION_CAP]
+    def _upload(
+        self,
+        method: str,
+        fields: dict[str, str],
+        files: dict[str, tuple[str, str, bytes]],
+        *,
+        not_sent_on_404: bool = False,
+    ) -> int:
+        """POST one multipart media send; honors a single 429 `retry_after`.
+
+        The failure CLASSIFICATION lives here, once, for every media method —
+        it decides whether the caller may safely re-send by another route, so a
+        wrong answer double-posts to the public channel:
+
+        - HTTP status  => Telegram ANSWERED, so it may already hold the post =>
+          ambiguous, re-raise. Exception: 404 with `not_sent_on_404` means the
+          method itself does not exist, which PROVES nothing was posted.
+        - DNS / connection error => the body never reached Telegram => PhotoNotSent.
+        - timeout (socket.timeout/TimeoutError) => ambiguous, re-raise.
+        """
         boundary = uuid.uuid4().hex
-        body = _multipart(
-            {"chat_id": chat, "caption": caption, "parse_mode": "HTML"},
-            file_field="photo",
-            filename=filename,
-            file_bytes=file_bytes,
-            content_type="image/png",
-            boundary=boundary,
-        )
+        body = _multipart(fields, files=files, boundary=boundary)
         headers = {"Content-Type": f"multipart/form-data; boundary={boundary}"}
         for attempt in (1, 2):
             request = urllib.request.Request(
-                f"https://api.telegram.org/bot{self._token}/sendPhoto",
+                f"https://api.telegram.org/bot{self._token}/{method}",
                 data=body,
                 headers=headers,
             )
@@ -275,27 +379,68 @@ class BotApiTransport:
                     parsed = json.loads(response.read().decode())
                 return int(parsed["result"]["message_id"])
             except urllib.error.HTTPError as exc:  # noqa: PERF203
-                # The request REACHED Telegram (it answered with an HTTP status)
-                # => the upload may already be live. Retry a 429 once, otherwise
-                # re-raise unchanged: this is ambiguous, never PhotoNotSent.
                 err = json.loads(exc.read().decode() or "{}")
                 retry_after = (err.get("parameters") or {}).get("retry_after")
                 if exc.code == 429 and retry_after and attempt == 1:
                     time.sleep(min(int(retry_after), 60))
                     continue
+                if exc.code == 404 and not_sent_on_404:
+                    raise PhotoNotSent(
+                        f"{method} unavailable on this Bot API endpoint (404)"
+                    ) from exc
                 raise
             except urllib.error.URLError as exc:
                 # URLError is HTTPError's parent, so this branch sees only the
-                # NON-HTTP transport failures. DNS-resolution / connection
-                # errors mean the request body never reached Telegram => safe to
-                # degrade (PhotoNotSent). A timeout (socket.timeout/TimeoutError)
-                # is ambiguous — the upload may have been received — so re-raise.
+                # NON-HTTP transport failures.
                 if isinstance(exc.reason, (socket.gaierror, ConnectionError)):
                     raise PhotoNotSent(
-                        f"photo send to {chat!r} never reached Telegram: {exc.reason}"
+                        f"{method} to {fields.get('chat_id')!r} never reached "
+                        f"Telegram: {exc.reason}"
                     ) from exc
                 raise
         raise RuntimeError("unreachable")
+
+    def send_photo(self, chat: str, photo_path: str, caption: str) -> int:
+        """Legacy photo send — the degrade path now that rich messages ship one post.
+
+        Read the file once; caption is hard-capped at the Bot API ceiling. A file
+        we can't read never left the host => PhotoNotSent (safe to degrade at the
+        caller).
+        """
+        file_bytes = _read_media(photo_path)
+        caption = (caption or "")[:_CAPTION_CAP]
+        return self._upload(
+            "sendPhoto",
+            {"chat_id": chat, "caption": caption, "parse_mode": "HTML"},
+            {"photo": (Path(photo_path).name, "image/png", file_bytes)},
+        )
+
+    def send_rich_message(self, chat: str, rich_html: str, photo_path: str) -> int:
+        """ONE post = image + full text, via Bot API 10.2 `sendRichMessage`.
+
+        The photo is uploaded in the same multipart body under the field name
+        `_RICH_MEDIA_ID`; `InputRichMessageMedia.media` points at it with
+        `attach://<name>`, and the rich HTML places it with
+        `<img src="tg://photo?id=<name>">`. Returns the single Message's id.
+        """
+        file_bytes = _read_media(photo_path)
+        rich_message = {
+            "html": rich_html,
+            "media": [
+                {
+                    "id": _RICH_MEDIA_ID,
+                    "media": {"type": "photo", "media": f"attach://{_RICH_MEDIA_ID}"},
+                }
+            ],
+        }
+        return self._upload(
+            "sendRichMessage",
+            {"chat_id": chat, "rich_message": json.dumps(rich_message, ensure_ascii=False)},
+            {_RICH_MEDIA_ID: (Path(photo_path).name, "image/png", file_bytes)},
+            # A 404 here means the endpoint has no sendRichMessage (pre-10.2) =>
+            # nothing was posted => degrade instead of freezing the pipeline.
+            not_sent_on_404=True,
+        )
 
 
 class DigestLedger:
@@ -575,10 +720,19 @@ def publish_next(
     if not ledger.begin_send(date_key):
         return {"status": "skipped"}
 
-    ops = _build_send_ops(messages, image_path, short_caption)
+    plans = _send_plans(messages, image_path, short_caption)
+    ops = plans[0]
     if effective_dry:
         for i, op in enumerate(ops, 1):
-            if op[0] == "photo":
+            if op[0] == "rich":
+                # ONE post: image + the whole digest. Describe the plan, then the
+                # rich HTML itself so a human can still review what will ship.
+                print(
+                    f"[dry-run] {date_key} op {i}/{len(ops)} RICH -> "
+                    f"{chat or '<unset>'}\nimage: {op[2]}\nchars: {len(op[1])}"
+                    f" (cap {_RICH_CAP})\n{op[1]}\n"
+                )
+            elif op[0] == "photo":
                 print(
                     f"[dry-run] {date_key} op {i}/{len(ops)} PHOTO {op[1]} -> "
                     f"{chat or '<unset>'}\ncaption: {op[2]}\n"
@@ -596,7 +750,9 @@ def publish_next(
     def _dispatch(plan: list[tuple]) -> None:
         nonlocal sent
         for op in plan:
-            if op[0] == "photo":
+            if op[0] == "rich":
+                transport.send_rich_message(chat, op[1], op[2])
+            elif op[0] == "photo":
                 transport.send_photo(chat, op[1], op[2])
             else:
                 transport.send_message(chat, op[1])
@@ -604,50 +760,49 @@ def publish_next(
             ledger.record_sent(date_key, sent)
             time.sleep(1.0)  # pace multi-op digests well under flood limits
 
-    try:
-        _dispatch(ops)
-    except Exception as exc:  # noqa: BLE001
-        leading_photo = bool(ops) and ops[0][0] == "photo"
-        if sent == 0 and leading_photo and isinstance(exc, PhotoNotSent):
-            # The LEADING photo PROVABLY never reached Telegram (file/DNS/
-            # connection error) — the digest text has NOT gone out yet either,
-            # so it is safe to degrade to a text-only post rather than lose the
-            # digest to an image glitch (fallback e). Any AMBIGUOUS leading-photo
-            # failure (HTTP-after-receipt, read timeout, parse error) falls
-            # through to the conservative else branch: the photo may already be
-            # live, so re-posting as text would double-post.
-            logger.warning(
-                "aggregator publish: leading photo failed for %s; degrading to text-only: %s",
-                date_key,
-                exc,
+    # Walk the degrade rungs (rich -> photo+text -> text-only). A rung is only
+    # abandoned for the next one when its LEADING media op PROVABLY never reached
+    # Telegram (PhotoNotSent while sent == 0): the digest has not gone out at all,
+    # so re-planning cannot duplicate anything, and an image glitch must not lose
+    # the digest. Every AMBIGUOUS failure (HTTP-after-receipt, read timeout, parse
+    # error) — and any failure after something already went out — stops the chain:
+    # Telegram may already hold that post, so another plan would double-post.
+    failure: Exception | None = None
+    for rung, plan in enumerate(plans):
+        try:
+            _dispatch(plan)
+            failure = None
+            break
+        except Exception as exc:  # noqa: BLE001, PERF203
+            failure = exc
+            provably_nothing_sent = (
+                sent == 0
+                and bool(plan)
+                and plan[0][0] in ("rich", "photo")
+                and isinstance(exc, PhotoNotSent)
             )
-            try:
-                _dispatch(_build_send_ops(messages, None, short_caption))
-            except Exception as exc2:  # noqa: BLE001
-                logger.error(
-                    "aggregator publish: text fallback also failed for %s: %s", date_key, exc2
+            if provably_nothing_sent and rung + 1 < len(plans):
+                logger.warning(
+                    "aggregator publish: %s plan failed for %s (nothing sent); "
+                    "degrading to the next plan: %s",
+                    plan[0][0],
+                    date_key,
+                    exc,
                 )
-                return {
-                    "status": "failed",
-                    "date_key": date_key,
-                    "error": str(exc2),
-                    "sent": sent,
-                    "total": len(messages),
-                }
-        else:
-            # Something may already be on the public channel — an earlier
-            # message, or a leading photo whose failure was AMBIGUOUS (Telegram
-            # possibly received it). Do NOT mark_failed / revert: the row stays
-            # 'sending', which blocks all future publishing until a human
-            # inspects sent_count — auto-retrying here would double-post.
+                continue
+            # Do NOT mark_failed / revert: the row stays 'sending', which blocks
+            # all future publishing until a human inspects sent_count —
+            # auto-retrying here would double-post.
             logger.error("aggregator publish: send failed for %s: %s", date_key, exc)
-            return {
-                "status": "failed",
-                "date_key": date_key,
-                "error": str(exc),
-                "sent": sent,
-                "total": len(messages),
-            }
+            break
+    if failure is not None:
+        return {
+            "status": "failed",
+            "date_key": date_key,
+            "error": str(failure),
+            "sent": sent,
+            "total": len(messages),
+        }
     ledger.mark_posted(date_key)
     # Promote what actually shipped into the rolling dedup window — only now,
     # after the post is confirmed out, so a gated-but-never-published draft never

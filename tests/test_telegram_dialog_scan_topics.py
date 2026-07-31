@@ -505,7 +505,7 @@ def test_a_failed_enrolment_call_blocks_the_sources_line_AND_the_seen_entry(tmp_
     )
     assert report.added_news == []
     assert "https://t.me/goodfeed" not in paths.sources.read_text(encoding="utf-8")
-    assert 42 not in json.loads(paths.state.read_text(encoding="utf-8"))["seen"]
+    assert 42 not in json.loads(paths.state.read_text(encoding="utf-8"))["decided"]["leads"]
     assert any("503" in e and "goodfeed" in e for e in report.errors)
 
 
@@ -524,7 +524,7 @@ def test_an_AMBIGUOUS_timeout_is_reported_and_never_retried_inside_the_run(tmp_p
         lead_enroller=enroller,
     )
     assert calls == [42]  # exactly once — no blind retry into a possible double-write
-    assert 42 not in json.loads(paths.state.read_text(encoding="utf-8"))["seen"]
+    assert 42 not in json.loads(paths.state.read_text(encoding="utf-8"))["decided"]["leads"]
     assert any("AMBIGUOUS" in e for e in report.errors)
     assert not paths.sources.exists() or "goodfeed" not in paths.sources.read_text(encoding="utf-8")
 
@@ -545,5 +545,5 @@ def test_a_successful_enrolment_writes_the_news_line_and_the_seen_entry(tmp_path
     )
     assert report.added_news == ["https://t.me/goodfeed"]
     assert report.added_leads == [42]
-    assert 42 in json.loads(paths.state.read_text(encoding="utf-8"))["seen"]
+    assert 42 in json.loads(paths.state.read_text(encoding="utf-8"))["decided"]["leads"]
     assert seen_calls[0]["kind"] == "channel" and seen_calls[0]["username"] == "goodfeed"

@@ -140,8 +140,9 @@ def _joins_rows(join_db: Path) -> list[tuple]:
         return con.execute("SELECT target, kind, status, entity_id FROM joins ORDER BY target").fetchall()
 
 
-def _seen(paths: ScanPaths) -> set[int]:
-    return {int(i) for i in json.loads(paths.state.read_text())["seen"]}
+def _seen(paths: ScanPaths, surface: str = "leads") -> set[int]:
+    """Per-surface since 2026-07-31: `seen` split into `decided.{leads,news}`."""
+    return {int(i) for i in json.loads(paths.state.read_text())["decided"][surface]}
 
 
 # ── 1. the scanner can authenticate, and any failure reaches the operator ──
@@ -245,7 +246,10 @@ def test_a_failing_durable_write_never_leaves_a_channel_live_in_the_public_diges
 
 
 def test_first_run_shaped_report_fits_the_4000_char_cap_with_the_actions_intact(paths: ScanPaths) -> None:
-    dialogs = [dialog(1000 + i, "user", title=f"Contact {i}") for i in range(150)]
+    # 150 unaddressable groups: enrollable nowhere, but each one is a candidate
+    # on its first run and therefore a table row. (DMs no longer qualify at all —
+    # `user`/`bot` dialogs are eligible for no surface, so they never classify.)
+    dialogs = [dialog(1000 + i, "megagroup", title=f"Private chat {i}") for i in range(150)]
     dialogs.append(dialog(2000, "channel", username="fresh_ai_news", title="Fresh AI"))
 
     report = run_scan(paths=paths, dialogs=dialogs)
@@ -258,7 +262,7 @@ def test_first_run_shaped_report_fits_the_4000_char_cap_with_the_actions_intact(
 def test_errors_survive_the_cap_even_with_a_huge_table(paths: ScanPaths) -> None:
     report = run_scan(
         paths=paths,
-        dialogs=[dialog(3000 + i, "user", title=f"Contact {i}") for i in range(200)],
+        dialogs=[dialog(3000 + i, "megagroup", title=f"Private chat {i}") for i in range(200)],
     )
     report.errors.append("SOMETHING BROKE: the operator must see this")
     text = render_report(report)
@@ -336,7 +340,11 @@ def test_a_channel_tracked_under_an_alias_is_not_added_again_under_its_primary_h
     report = run_scan(paths=paths, dialogs=[candidate])
 
     assert report.added_news == []
-    assert report.decisions == []
+    # Per-surface tracking makes this peer a live LEADS candidate, so it now
+    # reaches the sources.txt line builder for the first time — the alias dedup
+    # has to hold there, not only in the freshness filter.
+    assert report.added_leads == [500]
+    assert "https://t.me/primary_alias" not in paths.sources.read_text()
 
 
 # ── 7. every deny-rule form actually denies ───────────────────────
@@ -550,6 +558,10 @@ def test_a_degraded_linked_chat_lookup_is_recorded_as_an_error(paths: ScanPaths)
 
 def test_a_run_that_changed_nothing_notifies_nobody(paths: ScanPaths) -> None:
     dialogs = [dialog(1600, "channel", username="already_news"), dialog(1601, "user")]
+    # @already_news is in sources.txt, so the NEWS surface was always settled;
+    # per-surface tracking means the first run still has its LEADS half to do.
+    # "changed nothing" is the run after that one.
+    run_scan(paths=paths, dialogs=dialogs)
     sent: list[str] = []
 
     report = run_scan(paths=paths, dialogs=dialogs, notifier=_notifier(sent))
@@ -670,7 +682,7 @@ def test_handle_less_chat_of_a_news_parent_goes_to_leads_only(paths: ScanPaths) 
     assert d.decision == "enroll-leads"
     assert d.news_target is None
     assert d.citable is False
-    assert "no public handle" in d.reason
+    assert "no citable public handle" in d.reason
     assert d.citability_blocked is True
 
 
@@ -724,15 +736,16 @@ def test_a_non_citable_chat_is_re_examined_next_run_and_promoted_when_it_gains_a
     first = run_scan(paths=paths, dialogs=[parent, naked])
     assert 300 in first.added_leads
     state = json.loads(paths.state.read_text())
-    assert 300 in state["pending_citable"]
-    assert 300 not in state["seen"]
+    assert 300 in state["news_pending"]
+    assert 300 in state["decided"]["leads"], "the lead half IS done"
+    assert 300 not in state["decided"]["news"], "and the news half is not — that is the point"
 
     # it gains a public handle
     now_public = dialog(300, "megagroup", title="чат без хэндла", username="ai_news_chat")
     second = run_scan(paths=paths, dialogs=[parent, now_public])
     assert second.added_chat == ["https://t.me/ai_news_chat"]
-    assert 300 in json.loads(paths.state.read_text())["seen"]
-    assert 300 not in json.loads(paths.state.read_text())["pending_citable"]
+    assert 300 in json.loads(paths.state.read_text())["decided"]["news"]
+    assert 300 not in json.loads(paths.state.read_text())["news_pending"]
 
 
 def test_a_still_non_citable_chat_does_not_page_the_operator_every_night(paths: ScanPaths) -> None:

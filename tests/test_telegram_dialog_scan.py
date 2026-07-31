@@ -308,11 +308,13 @@ def test_run_scan_is_idempotent(paths: ScanPaths) -> None:
 
 
 def test_run_scan_does_not_repropose_what_a_pipeline_already_tracks(paths: ScanPaths) -> None:
-    # already_news is in sources.txt but was never seen by the scanner.
+    """PER-SURFACE (2026-07-31): sources.txt membership settles the NEWS surface
+    and nothing else. The channel is still a LEADS candidate — the mirror image
+    of the lead_entity_ids short-circuit that blocked chat_sources for 102 ids."""
     report = run_scan(paths=paths, dialogs=[dialog(70, "channel", username="already_news")])
 
-    assert report.added_news == []
-    assert [d.decision for d in report.decisions] == []
+    assert report.added_news == [], "never a second sources.txt line"
+    assert report.added_leads == [70], "but the lead pipeline had never seen it"
 
 
 def test_run_scan_reports_a_missing_vault_mirror_instead_of_silently_skipping_it(paths: ScanPaths) -> None:
@@ -379,8 +381,13 @@ def test_a_new_enrolment_notifies_the_operator_once(paths: ScanPaths) -> None:
     assert report.notified is True
 
 
-def test_state_file_records_every_dialog_id_seen_including_skips(paths: ScanPaths) -> None:
+def test_state_file_records_a_decision_per_surface_not_a_global_seen_flag(paths: ScanPaths) -> None:
+    """The old `seen` was written from EVERY dialog id — including ids the global
+    tracked-filter dropped before classification, which is what made "lead-tracked"
+    mean "done with, forever". Only surfaces this run actually settled are recorded."""
     run_scan(paths=paths, dialogs=[dialog(120, "channel", username="fresh_ai_news"), dialog(121, "user")])
 
-    seen = set(json.loads(paths.state.read_text())["seen"])
-    assert {120, 121} <= seen
+    decided = json.loads(paths.state.read_text())["decided"]
+    assert 120 in decided["news"] and 120 in decided["leads"]
+    # A DM is enrollable nowhere, so it is never a candidate and needs no record.
+    assert 121 not in decided["news"] and 121 not in decided["leads"]

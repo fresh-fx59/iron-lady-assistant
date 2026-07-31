@@ -54,6 +54,16 @@ def _cmd_scan(args: argparse.Namespace) -> int:
             )
             return [str(m.get("text") or "") for m in messages]
 
+        def tracked_reader() -> dict:
+            """What the two pipelines ALREADY track, over the proxy.
+
+            Read-only, and read on EVERY run including --dry-run: the dry run's
+            whole job is to show what would be enrolled, which is meaningless
+            without knowing what already is. A failure propagates on purpose —
+            run_scan then blocks all writes rather than re-enrolling the world.
+            """
+            return asyncio.run(client.tracked_sources())
+
         def lead_enroller(**kwargs: object) -> dict:
             """The durable half of an enrolment, over the proxy (see _register_leads).
 
@@ -70,6 +80,7 @@ def _cmd_scan(args: argparse.Namespace) -> int:
             notifier=notifier,
             post_reader=post_reader,
             lead_enroller=None if args.dry_run else lead_enroller,
+            tracked_reader=tracked_reader,
         )
     except Exception as exc:  # noqa: BLE001 — deliberately everything, see below
         # The three likeliest failures (a missing proxy key => RuntimeError, a

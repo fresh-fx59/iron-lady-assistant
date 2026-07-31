@@ -297,6 +297,25 @@ class TelegramDigestStore:
                 )
         return False
 
+    def source_roles(self) -> list[dict[str, Any]]:
+        """The enrolment-dedup VIEW of digest_sources: peer_key, entity_id, role.
+
+        Deliberately narrower than the table. It exists for the daily dialog
+        scanner, which cannot open this db at all (0700 iron-lady) and asks the
+        proxy instead — see GET /v1/sources/tracked. Titles, usernames and link
+        columns are none of that decision's business, so they are not returned.
+        """
+        with self._connect() as con:
+            rows = con.execute("SELECT peer_key, entity_id, role FROM digest_sources").fetchall()
+        return [
+            {
+                "peer_key": str(row["peer_key"]),
+                "entity_id": int(row["entity_id"]),
+                "role": str(row["role"] or ""),
+            }
+            for row in rows
+        ]
+
     def last_message_id(self, peer_key: str) -> int:
         with self._connect() as con:
             row = con.execute(

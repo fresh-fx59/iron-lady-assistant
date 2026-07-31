@@ -61,6 +61,17 @@ class TelegramProxyClient:
         )
         return list(payload.get("messages", []))
 
+    async def tracked_sources(self) -> dict[str, Any]:
+        """GET /v1/sources/tracked — what the two pipelines already track.
+
+        The read half of the enrolment move: the scanner cannot open
+        /var/lib/iron-lady, so "is this already enrolled?" is answered by the
+        process that owns those ledgers. Any failure PROPAGATES — the caller must
+        treat it as "I do not know what is tracked" and refuse to write, because
+        an empty tracked set re-proposes every source the pipelines already have.
+        """
+        return await self._get("/v1/sources/tracked", params={})
+
     async def enrol_lead_source(
         self, *, entity_id: int, kind: str, title: str, username: str | None
     ) -> dict[str, Any]:

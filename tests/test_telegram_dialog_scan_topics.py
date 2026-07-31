@@ -30,6 +30,7 @@ from src.telegram_dialog_scan import (
     TOPIC_SCORE_THRESHOLD,
     Decision,
     ScanPaths,
+    ScanReport,
     TopicScore,
     broadcast_channel_is_a_news_source,
     classify,
@@ -46,6 +47,19 @@ from src.telegram_proxy import TelegramProxy, _enrol_lead_source, normalize_targ
 
 AI = "Новая модель OpenAI ускоряет инференс агентов в проде на 40 процентов"
 OFF = "Ребята, кто идёт на концерт в субботу? Билеты ещё есть, встречаемся у входа"
+
+# ── shim: tracked state is now READ over the proxy too ────────────
+# These tests predate `GET /v1/sources/tracked`; an EMPTY but SUCCESSFUL read
+# keeps each of them testing what it was written to test, while the real
+# "no tracked-state source at all" failure is pinned in
+# tests/test_telegram_dialog_scan_tracked.py.
+_run_scan_impl = run_scan
+
+
+def run_scan(*, tracked_reader=None, **kwargs):  # noqa: F811 — deliberate shim
+    return _run_scan_impl(
+        tracked_reader=tracked_reader or (lambda: {"digest_sources": [], "joins": []}), **kwargs
+    )
 
 
 # ── vocabulary parsing ────────────────────────────────────────────
@@ -184,8 +198,7 @@ def test_discussion_chat_of_a_FAILING_parent_never_reaches_chat_sources():
 
 def test_chat_with_UNREADABLE_posts_never_reaches_chat_sources_on_parent_evidence_alone():
     """The parent is what the gate scores — but chat_sources is the same public
-    lane, so a chat we could not read at all is still a guess. No second
-    threshold is invented: the chat's score must EXIST, not pass."""
+    lane, so a chat we could not read at all is still a guess."""
     parent = _channel(entity_id=222, username="ainews", title="AI news")
     chat = {"kind": "megagroup", "entity_id": 333, "username": "ainews_chat", "title": "Чат"}
     scores = {
@@ -198,9 +211,76 @@ def test_chat_with_UNREADABLE_posts_never_reaches_chat_sources_on_parent_evidenc
     assert d.decision == "enroll-leads"
     assert d.news_target is None
     assert "bounded at 80" in d.reason
-    # …and with its own evidence present (even a LOW score) it does reach chat_sources.
-    scores[("linked_chat", 333)] = TopicScore(score=0.08, hits=2, scored=24, read=24, status="ok")
-    assert _classify(chat, scores, parents={333: parent}).news_target == "chat_sources"
+
+
+# ── Correction 2: chat_sources is a PUBLIC surface, gated on the chat's OWN score
+#
+# The chat lane merged to main (1db5342) and is DEPLOYED: chat_sources.txt is a
+# live digest input the moment the file exists, not a staging file. A passing
+# PARENT is therefore not enough — the live dry-run showed parent-gated chats
+# scoring as low as 0.08. The chat must pass on its own posts, on the SAME metric
+# and the SAME 0.35 line (no second, hand-tuned number), or it goes to leads only.
+
+
+def test_chat_below_the_threshold_on_its_OWN_posts_goes_to_leads_only():
+    parent = _channel(entity_id=222, username="ainews", title="AI news")
+    chat = {"kind": "megagroup", "entity_id": 333, "username": "ainews_chat", "title": "Чат"}
+    scores = {
+        ("channel", 222): TopicScore(score=0.9, hits=27, scored=30, read=30, status="ok"),
+        ("linked_chat", 333): TopicScore(score=0.08, hits=2, scored=24, read=24, status="ok"),
+    }
+    d = _classify(chat, scores, parents={333: parent})
+    assert d.decision == "enroll-leads"
+    assert d.news_target is None
+    assert "0.08" in d.reason and f"{TOPIC_SCORE_THRESHOLD:.2f}" in d.reason
+
+
+def test_chat_that_passes_on_its_own_posts_reaches_chat_sources():
+    parent = _channel(entity_id=222, username="ainews", title="AI news")
+    chat = {"kind": "megagroup", "entity_id": 333, "username": "ainews_chat", "title": "Чат"}
+    scores = {
+        ("channel", 222): TopicScore(score=0.9, hits=27, scored=30, read=30, status="ok"),
+        ("linked_chat", 333): TopicScore(score=0.62, hits=15, scored=24, read=24, status="ok"),
+    }
+    d = _classify(chat, scores, parents={333: parent})
+    assert d.decision == "enroll-both"
+    assert d.news_target == "chat_sources"
+
+
+def test_chat_with_THIN_own_evidence_goes_to_leads_only_like_an_unreadable_one():
+    parent = _channel(entity_id=222, username="ainews", title="AI news")
+    chat = {"kind": "megagroup", "entity_id": 333, "username": "ainews_chat", "title": "Чат"}
+    scores = {
+        ("channel", 222): TopicScore(score=0.9, hits=27, scored=30, read=30, status="ok"),
+        ("linked_chat", 333): TopicScore(score=1.0, hits=3, scored=3, read=17, status="thin"),
+    }
+    d = _classify(chat, scores, parents={333: parent})
+    assert d.decision == "enroll-leads"
+    assert d.news_target is None
+    assert str(MIN_SCOREABLE_POSTS) in d.reason
+
+
+def test_the_chat_lane_uses_the_SAME_line_as_the_news_gate():
+    """One calibrated threshold, not two: the boundary case proves it."""
+    parent = _channel(entity_id=222, username="ainews", title="AI news")
+    chat = {"kind": "megagroup", "entity_id": 333, "username": "ainews_chat", "title": "Чат"}
+    parent_score = TopicScore(score=0.9, hits=27, scored=30, read=30, status="ok")
+    at_line = TopicScore(score=TOPIC_SCORE_THRESHOLD, hits=9, scored=24, read=24, status="ok")
+    below = TopicScore(score=TOPIC_SCORE_THRESHOLD - 0.01, hits=8, scored=24, read=24, status="ok")
+    assert _classify(chat, {("channel", 222): parent_score, ("linked_chat", 333): at_line},
+                     parents={333: parent}).news_target == "chat_sources"
+    assert _classify(chat, {("channel", 222): parent_score, ("linked_chat", 333): below},
+                     parents={333: parent}).news_target is None
+
+
+def test_the_report_no_longer_calls_a_chat_sources_write_inert():
+    """That line said 'STAGED ONLY: nothing reads chat_sources.txt'. It is now
+    false — a live consumer would read it — and it would mislead the operator."""
+    report = ScanReport(added_chat=["https://t.me/ainews_chat"])
+    text = render_report(report)
+    assert "STAGED ONLY" not in text
+    assert "nothing" not in text.lower().split("chat_sources.txt +=")[1][:200]
+    assert "public" in text.lower()
 
 
 # ── reading posts: paced, bounded, cached ─────────────────────────

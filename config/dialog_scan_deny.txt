@@ -35,6 +35,11 @@
 # Built-in defaults (DEFAULT_DENY_RULES_TEXT in the module) always apply and are
 # the floor: the operator's personal channels @zhkparusa, @pifagortrade,
 # @slezisatoshisliv2, @travelbelka_cards, @startupoftheday plus their keywords.
+# NOT calibrated against live data: those five are NOT dialogs of this parser
+# account. They come from a dormant legacy source set belonging to the operator's
+# pre-2026-07-13 main account, so no live dry-run has ever exercised these rules
+# — they are a cheap floor against a re-add, not evidence of anything. Do not
+# read their presence as "the scanner saw these and denied them".
 # This file only ADDS. The operator's own publishing channels
 # (@ai_daily_summary, @ai_in_modern_world) are hard-coded never-enroll and do not
 # depend on this file at all.

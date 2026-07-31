@@ -10,9 +10,18 @@ NEWS enrolment is TOPICALLY GATED (2026-07-31): a candidate broadcast channel is
 scored deterministically against an operator-editable RU/EN vocabulary over its
 own recent posts, and only a passing score reaches the PUBLIC digest. Leads
 enrolment is unchanged — private, breadth is the point — but reports the score.
-The durable half of an enrolment goes over POST /v1/sources/lead-enrol on the
-proxy, not the filesystem: /var/lib/iron-lady is 0700 iron-lady and this runs as
-claude-developer (see _register_leads for the full rationale).
+CHAT enrolment is gated the SAME way (2026-07-31, second pass): `chat_sources.txt`
+is a PUBLIC-SURFACE write — the chat lane is live in prod (1db5342), so a chat in
+that file feeds the digest's draft input as soon as the file exists. A passing
+parent channel is therefore not enough; the discussion chat must clear the same
+0.35 line on its OWN posts, or it goes to the lead pipeline only.
+
+Both halves of an enrolment go over the proxy, not the filesystem:
+/var/lib/iron-lady is 0700 iron-lady and this runs as claude-developer. The WRITE
+is POST /v1/sources/lead-enrol (see _register_leads); the corresponding READ —
+what the pipelines already track — is GET /v1/sources/tracked (see load_tracked).
+Reading it over the filesystem is what silently returned an EMPTY tracked set in
+production and re-proposed ~47 already-enrolled entities in a single night.
 
 Three hard safety properties, because it writes live pipeline inputs:
 
@@ -777,10 +786,15 @@ def classify(
         if parent is not None:
             parent_score = scores.get(("channel", int(parent.get("entity_id") or 0)))
             if broadcast_channel_is_a_news_source(parent, deny_rules, topic_score=parent_score):
-                # The parent is the GATED entity, but a chat whose own posts we
-                # could not read at all is still a guess, and chat_sources is the
-                # same public digest lane. No new threshold is invented here —
-                # the chat's score does not have to PASS, it just has to EXIST.
+                # chat_sources.txt is a PUBLIC-SURFACE write (the chat lane merged
+                # as 1db5342 and is deployed: the digest reads that file the moment
+                # it exists), so a passing PARENT is not enough — the live dry-run
+                # found parent-gated chats scoring 0.08. The chat must pass on its
+                # OWN posts, on the SAME metric and the SAME calibrated 0.35 line;
+                # inventing a second, chat-specific number would be picking one by
+                # feel, and reusing the calibrated line needs no labelled chat set.
+                # Everything short of a pass — unreadable, thin, or simply
+                # off-topic — goes to leads only, with the reason reported.
                 if own_score is None or own_score.status == "unreadable":
                     detail = own_score.detail if own_score is not None else "not scored"
                     return out(
@@ -790,11 +804,29 @@ def classify(
                         "-> leads only; chat_sources needs evidence we could not get",
                         score=own_score,
                     )
+                if own_score.status == "thin":
+                    return out(
+                        "enroll-leads",
+                        f"discussion chat of news channel @{parent.get('username')} "
+                        f"(parent {parent_score.label()}), but its OWN evidence is thin "
+                        f"({own_score.scored} scoreable of {own_score.read} read, need "
+                        f"{MIN_SCOREABLE_POSTS}) -> leads only",
+                        score=own_score,
+                    )
+                if not own_score.passes():
+                    return out(
+                        "enroll-leads",
+                        f"discussion chat of news channel @{parent.get('username')} "
+                        f"(parent {parent_score.label()}), but the chat itself scores "
+                        f"{own_score.label()} < {TOPIC_SCORE_THRESHOLD:.2f} on its own posts "
+                        "-> leads only; chat_sources is a PUBLIC digest input",
+                        score=own_score,
+                    )
                 return out(
                     "enroll-both",
                     f"discussion chat of news channel @{parent.get('username')} "
-                    f"(parent scores {parent_score.label()}, chat itself {own_score.label()}) "
-                    "-> leads + chat_sources",
+                    f"(parent scores {parent_score.label()}, chat itself {own_score.label()} "
+                    f">= {TOPIC_SCORE_THRESHOLD:.2f}) -> leads + chat_sources",
                     "chat_sources",
                     own_score,
                 )
@@ -848,12 +880,68 @@ def chat_source_key(username: str | None, entity_id: int) -> str:
     return (username or "").lower() or str(entity_id)
 
 
-def load_tracked(paths: ScanPaths) -> Tracked:
+def _read_tracked_over_proxy(
+    tracked: Tracked, tracked_reader: Callable[[], dict[str, Any]] | None
+) -> None:
+    """Fill the two pipeline-ledger views from GET /v1/sources/tracked.
+
+    THREE outcomes, and the code must keep them apart:
+      * reader missing        -> "I have no way to know" == FAILURE. Not silence.
+      * reader raises / junk  -> FAILURE, named, with the exception text.
+      * reader returns []     -> a SUCCESSFUL read of an empty pipeline; writes
+                                 proceed. A pipeline with nothing enrolled yet
+                                 must still be able to enroll its first source.
+    """
+    if tracked_reader is None:
+        tracked.errors.append(
+            "tracked-state read UNAVAILABLE: no digest/join db path is configured and no proxy "
+            "reader was supplied, so 'is this already enrolled?' cannot be answered — refusing to "
+            "treat that as 'nothing is tracked' (that re-enrolls every existing source)"
+        )
+        return
+    try:
+        payload = tracked_reader()
+        if not isinstance(payload, dict):
+            raise TypeError(f"expected a JSON object, got {type(payload).__name__}")
+        sources = payload.get("digest_sources") or []
+        joins = payload.get("joins") or []
+        if not isinstance(sources, list) or not isinstance(joins, list):
+            raise TypeError("`digest_sources` and `joins` must both be lists")
+        peer_keys: set[str] = set()
+        lead_ids: set[int] = set()
+        for item in sources:
+            peer_key = str(item["peer_key"])
+            if peer_key:
+                peer_keys.add(peer_key)
+            if LEAD_SOURCE_ROLE in {r.strip() for r in str(item.get("role") or "").split(",")}:
+                lead_ids.add(int(item["entity_id"]))
+        targets = {str(t) for t in joins}
+    except Exception as exc:  # noqa: BLE001 — HTTP, JSON and shape failures alike
+        tracked.errors.append(
+            f"tracked-state read FAILED over the proxy (GET /v1/sources/tracked): "
+            f"{type(exc).__name__}: {exc}"
+        )
+        return
+    tracked.digest_peer_keys = peer_keys
+    tracked.lead_entity_ids = lead_ids
+    tracked.join_targets = targets
+
+
+def load_tracked(
+    paths: ScanPaths, tracked_reader: Callable[[], dict[str, Any]] | None = None
+) -> Tracked:
     """Every read guarded: a locked, corrupt, or wrong-type input is REPORTED.
 
     A read failure lands in `Tracked.errors`, and run_scan then refuses to write
     at all — an unknown ledger must never be mistaken for an empty one (that
     would re-enroll everything already tracked).
+
+    The two PIPELINE ledgers (digest_sources, joins) are read through
+    `tracked_reader` — in production `GET /v1/sources/tracked` on the proxy,
+    which owns 0700 /var/lib/iron-lady. Direct db paths stay as the test/override
+    path and WIN when configured. Having NEITHER is a failure, not an empty
+    ledger: that combination is exactly what shipped on 2026-07-31 and made the
+    scanner re-propose ~47 already-enrolled entities in one night.
     """
     tracked = Tracked()
     try:
@@ -875,6 +963,9 @@ def load_tracked(paths: ScanPaths) -> Tracked:
             # Deliberately NOT a blocking error: "treat every dialog as new" is
             # safe here because the pipeline ledgers are the real dedup authority.
             logger.warning("dialog-scan state unreadable (%s); treating every dialog as new", exc)
+    if paths.digest_db is None and paths.join_db is None:
+        _read_tracked_over_proxy(tracked, tracked_reader)
+        return tracked
     try:
         if paths.digest_db is not None and paths.digest_db.exists():
             with sqlite3.connect(paths.digest_db, timeout=10) as con:
@@ -1111,8 +1202,8 @@ def render_report(report: ScanReport, *, max_chars: int = MAX_REPORT_CHARS) -> s
         lines += ["", f"news sources.txt += {report.added_news}"]
     if report.added_chat:
         lines.append(
-            f"chat_sources.txt += {report.added_chat} — STAGED ONLY: nothing on this branch reads "
-            "chat_sources.txt, so these take effect once the chat-collector lane is live."
+            f"chat_sources.txt += {report.added_chat} — PUBLIC surface: the chat lane is LIVE in "
+            "prod (1db5342), so these chats feed the digest's draft input from the next collect on."
         )
     if report.added_leads:
         lines.append(f"lead sources += {report.added_leads}")
@@ -1181,6 +1272,7 @@ def run_scan(
     max_report_chars: int = MAX_REPORT_CHARS,
     post_reader: Callable[[str, int], Sequence[str]] | None = None,
     lead_enroller: Callable[..., Any] | None = None,
+    tracked_reader: Callable[[], dict[str, Any]] | None = None,
 ) -> ScanReport:
     report = ScanReport(dry_run=dry_run)
     dialogs = list(dialogs)
@@ -1212,6 +1304,7 @@ def run_scan(
             max_report_chars=max_report_chars,
             post_reader=post_reader,
             lead_enroller=lead_enroller,
+            tracked_reader=tracked_reader,
         )
     finally:
         _release_lock(lock_fd)
@@ -1247,8 +1340,9 @@ def _run_scan_locked(
     max_report_chars: int,
     post_reader: Callable[[str, int], Sequence[str]] | None = None,
     lead_enroller: Callable[..., Any] | None = None,
+    tracked_reader: Callable[[], dict[str, Any]] | None = None,
 ) -> ScanReport:
-    tracked = load_tracked(paths)
+    tracked = load_tracked(paths, tracked_reader)
     report.errors.extend(tracked.errors)
     deny_rules = load_deny_rules(paths.deny)
     report.errors.extend(deny_rule_errors(deny_rules))

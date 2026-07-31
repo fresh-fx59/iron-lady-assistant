@@ -31,6 +31,21 @@
 # ── calibration (2026-07-31, against the LIVE account) ──────────────────────
 # 59 readable broadcast channels the parser account is in:
 #   * the 52 handles in sources.txt (known-good) scored 0.36 … 1.00, median 0.89
+#     CORRECTION (same day, later): only 51 of the 52 were COUNTED in that
+#     bucket. @oestick "AI и грабли" (entity 1741956568) was read and scored like
+#     the rest — 22 posts, score 0.95 — but the calibration bucketed by the
+#     `username` field of the /v1/channels snapshot, and that snapshot was taken
+#     at 07:51, BEFORE the proxy was restarted onto 1db5342: it still carried
+#     "username": null (the multi-username bug that release fixed), so a
+#     sources.txt handle could not be matched to it and it fell into the "unknown"
+#     bucket. The same null is why the dry-run skipped it as "broadcast channel
+#     with no username (unaddressable)". Re-fetching the SAME endpoint at 08:30
+#     returns "username": "oestick".
+#     The earlier note that @oestick "is in sources.txt but is not a live
+#     broadcast dialog / no longer subscribed" is FALSE: it is subscribed, it
+#     resolves, and a collect run took it from 0 to 163 rows that morning.
+#     Counting it changes nothing here — 0.95 sits inside the known-good band,
+#     well above the empty (0.27, 0.36) gap the threshold was placed in.
 #   * @erdman_music (music-production; its linked chat is the one entry the deny
 #     list had to be patched with by hand) scored 0.27
 #   * @Music_Producers_Chat itself scored 0.00 over 17 posts

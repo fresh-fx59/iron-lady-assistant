@@ -410,14 +410,19 @@ def test_the_same_quarantine_does_not_page_the_operator_every_night(paths: ScanP
 # ── 9. chat_sources is described truthfully ───────────────────────
 
 
-def test_the_report_says_chat_sources_entries_are_staged_only(paths: ScanPaths) -> None:
+def test_the_report_calls_a_chat_sources_write_a_PUBLIC_surface(paths: ScanPaths) -> None:
+    """This used to say "STAGED ONLY: nothing reads chat_sources.txt". That
+    premise expired on 2026-07-31: the chat lane merged as 1db5342 and is
+    deployed, so the file is a live digest input the moment it exists. Telling
+    the operator a public write is inert is worse than saying nothing."""
     parent = dialog(900, "channel", username="already_news", linked_chat_id=901)
     child = dialog(901, "megagroup", username=None, title="Discussion")
 
     report = run_scan(paths=paths, dialogs=[parent, child])
 
     assert report.added_chat == ["901"]
-    assert "STAGED" in report.text
+    assert "STAGED" not in report.text
+    assert "PUBLIC" in report.text
     assert "chat_sources" in report.text
 
 

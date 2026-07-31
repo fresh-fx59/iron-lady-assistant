@@ -206,6 +206,16 @@ class JoinStore:
             )
 
     # ── queue mutations ───────────────────────────────────────────
+    def all_targets(self) -> list[str]:
+        """Every joins-table target key, whatever its status.
+
+        The dialog scanner treats ANY row as "this dialog is already accounted
+        for" — a pending `request_sent` included, because re-enqueueing it is
+        exactly the duplicate the joins PK exists to prevent.
+        """
+        with self._connect() as con:
+            return [str(row[0]) for row in con.execute("SELECT target FROM joins").fetchall()]
+
     def record_existing_membership(self, target: str, kind: str, entity_id: int | None) -> bool:
         """INSERT OR IGNORE a status='joined' row for a dialog we are ALREADY in.
 
@@ -1135,6 +1145,28 @@ class TelegramProxy:
             "join_note": join_note,
         }
 
+    def tracked_sources(self) -> dict[str, Any]:
+        """READ-ONLY twin of enrol_lead_source: what the pipelines ALREADY track.
+
+        The scanner used to open the two ledgers itself. It cannot — /var/lib/
+        iron-lady is 0700 iron-lady — so once the WRITE moved here the READ had to
+        follow, or the scanner decides "is this already enrolled?" against an
+        empty set and re-proposes everything (2026-07-31: 65 "new" of 116 where
+        18 were genuinely new).
+
+        Returns exactly the two ledger projections that decision needs — the
+        digest_sources (peer_key, entity_id, role) rows and the joins targets —
+        and nothing else: no titles, no message text, no join status. Writes
+        nothing, and can start no Telegram work.
+        """
+        sources = self._get_digest_store().source_roles()
+        joins = self._get_join_store().all_targets()
+        return {
+            "digest_sources": sources,
+            "joins": joins,
+            "counts": {"digest_sources": len(sources), "joins": len(joins)},
+        }
+
     def lead_candidates(
         self, *, since_id: int, limit: int, since_ts: str | None = None
     ) -> dict[str, Any]:
@@ -2014,6 +2046,25 @@ async def _enrol_lead_source(request: web.Request) -> web.Response:
     return web.json_response({"ok": True, **result})
 
 
+async def _tracked_sources(request: web.Request) -> web.Response:
+    """GET /v1/sources/tracked — read-only twin of POST /v1/sources/lead-enrol.
+
+    Same auth, same error convention (an unexpected store failure is a 502, never
+    a 200 with an empty list — downstream an empty answer means "nothing is
+    tracked", which is precisely the mistake this route exists to stop). Takes no
+    parameters, so there is nothing to validate and nothing to widen: the caller
+    cannot ask for anything but the whole enrolment-dedup view.
+    """
+    _check_auth(request)
+    proxy: TelegramProxy = request.app["proxy"]
+    try:
+        return web.json_response(proxy.tracked_sources())
+    except web.HTTPException:
+        raise
+    except Exception as exc:
+        raise web.HTTPBadGateway(text=f"Tracked-source read failed: {exc}") from exc
+
+
 async def _join_enqueue(request: web.Request) -> web.Response:
     _check_auth(request)
     proxy: TelegramProxy = request.app["proxy"]
@@ -2092,6 +2143,7 @@ def create_app() -> web.Application:
     app.router.add_get("/v1/users/{sender_id}", _lead_user)
     app.router.add_post("/v1/telegram/createGroup", _create_group)
     app.router.add_post("/v1/sources/lead-enrol", _enrol_lead_source)
+    app.router.add_get("/v1/sources/tracked", _tracked_sources)
     app.router.add_post("/v1/join/enqueue", _join_enqueue)
     app.router.add_post("/v1/join/sync-linked", _join_sync_linked)
     app.router.add_get("/v1/join/status", _join_status)

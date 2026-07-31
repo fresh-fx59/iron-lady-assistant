@@ -40,6 +40,21 @@ that file feeds the digest's draft input as soon as the file exists. A passing
 parent channel is therefore not enough; the discussion chat must clear the same
 0.35 line on its OWN posts, or it goes to the lead pipeline only.
 
+THE REPORT ANSWERS ONE QUESTION: "do I need to do anything?" (2026-07-31, after
+the operator read a correct 4000-char nightly report and said *"I do not
+understand what me expected to do"*). Line one is a verdict, the things that need
+a human come next with a paste-able command each, and the routine majority
+collapses to counts with a journal pointer. And a message is sent ONLY when that
+list is non-empty — a night where nothing needs the operator sends NOTHING, even
+if it enrolled eight chats into a public digest input. See `operator_actions` for
+the boundary and why it is drawn exactly there, and `_notify` for the send gate.
+
+SILENCE IS NOT A REMOVAL REASON. `sources.txt` is self-healing: nothing here ever
+removes a source, and a channel missing from the file is re-added automatically
+the next run it passes the topical gate. A dormant channel contributes nothing
+and costs nothing, so it is kept — the only thing that keeps a channel out is a
+deny rule (a human's explicit "no") or a failed topical gate.
+
 Both halves of an enrolment go over the proxy, not the filesystem:
 /var/lib/iron-lady is 0700 iron-lady and this runs as claude-developer. The WRITE
 is POST /v1/sources/lead-enrol (see _register_leads); the corresponding READ —
@@ -309,6 +324,19 @@ SURFACE_LEADS = "leads"
 SURFACE_NEWS = "news"
 SURFACES = (SURFACE_LEADS, SURFACE_NEWS)
 
+# WHY the public surface stayed closed for a candidate, named by the CLASSIFIER
+# and never re-derived from its prose. The report counts these; the operator
+# reads counts, not 57 rows. Input-gate principle: the one place that knows the
+# reason states it, so the renderer needs no logic to guess it back.
+HOLD_NONE = ""                                              # enrolled — nothing held
+HOLD_NOT_ENROLLABLE = "not enrollable (DM / bot / own channel)"
+HOLD_DENY_RULE = "quarantined by a deny rule"
+HOLD_THIN_EVIDENCE = "quarantined: evidence too thin to judge"
+HOLD_BELOW_THRESHOLD = "below the topical threshold"
+HOLD_NOT_CITABLE = "no citable public handle"
+HOLD_PARENT_NOT_NEWS = "parent is not a news source"
+HOLD_EVIDENCE_RETRY = "evidence unavailable — retried next run"
+
 
 @dataclass(frozen=True)
 class DenyRule:
@@ -370,6 +398,9 @@ class Decision:
     # as a COUNT, never as a repeated row. Only a settled surface enters
     # `decided`, which is what makes a steady state possible at all.
     news_settled: bool = False
+    # WHY the public surface stayed closed, from the HOLD_* vocabulary above.
+    # Empty means "nothing was held" — the enrolment happened.
+    hold: str = HOLD_NONE
 
 
 @dataclass
@@ -417,6 +448,17 @@ class ScanReport:
     text: str = ""
     notified: bool = False
     notify_failed: bool = False
+    # THREE distinct outcomes, never two: sent / tried-and-failed / DELIBERATELY
+    # NOT SENT. The operator asked (2026-07-31) not to be messaged when nothing
+    # needs them, so "no message" is now the healthy night — and it must stay
+    # distinguishable from a send that broke, which is the exact defect that once
+    # let `notified: true` be a lie.
+    notify_skipped: bool = False
+    # Paths quoted VERBATIM in the action commands. A command the operator has to
+    # translate into their own filesystem is not a command, it is homework.
+    sources_path: str = ""
+    deny_path: str = ""
+    mirror_path: str = ""
 
     @property
     def wrote_nothing(self) -> bool:
@@ -886,25 +928,33 @@ def classify(
         score: TopicScore | None = None,
         citability_blocked: bool = False,
         news_settled: bool = False,
+        hold: str = HOLD_NONE,
     ) -> Decision:
         return Decision(
             entity_id, str(candidate.get("title") or ""), kind, handle, decision, reason, news_target, score,
-            citable, citability_blocked, news_settled,
+            citable, citability_blocked, news_settled, hold,
         )
 
     # A `skip` is structural and permanent — it settles every surface at once.
     if kind in {"user", "bot"}:
-        return out("skip", f"never-enroll: {kind} dialog (DM / bot / Saved Messages)", news_settled=True)
+        return out(
+            "skip", f"never-enroll: {kind} dialog (DM / bot / Saved Messages)",
+            news_settled=True, hold=HOLD_NOT_ENROLLABLE,
+        )
     if _all_handles(candidate) & OWN_PUBLISHING_CHANNELS:
-        return out("skip", f"never-enroll: operator's own publishing channel @{handle}", news_settled=True)
+        return out(
+            "skip", f"never-enroll: operator's own publishing channel @{handle}",
+            news_settled=True, hold=HOLD_NOT_ENROLLABLE,
+        )
     rule = deny_match(deny_rules, candidate)
     if rule is not None:
-        return out("quarantine", f"deny rule fired: {rule.label()}")
+        return out("quarantine", f"deny rule fired: {rule.label()}", hold=HOLD_DENY_RULE)
 
     if kind == "channel":
         if not handle:
             return out(
-                "skip", "never-enroll: broadcast channel with no username (unaddressable)", news_settled=True
+                "skip", "never-enroll: broadcast channel with no username (unaddressable)",
+                news_settled=True, hold=HOLD_NOT_ENROLLABLE,
             )
         if citable is False:
             # Same class as the chat case below: sources.txt is a PUBLIC-surface
@@ -919,19 +969,24 @@ def classify(
                 "-> leads only; re-checked every run, promoted if it gains one",
                 score=scores.get(("channel", entity_id)),
                 citability_blocked=True,
+                hold=HOLD_NOT_CITABLE,
             )
         score = scores.get(("channel", entity_id))
         # NEVER GUESS: no evidence is not "probably fine", and it is not "probably
         # bad" either — it is a quarantine the operator sees, with the reason.
         if score is None or score.status == "unreadable":
             detail = score.detail if score is not None else "not scored"
-            return out("quarantine", f"topical gate: posts unreadable ({detail}) — refusing to guess", score=score)
+            return out(
+                "quarantine", f"topical gate: posts unreadable ({detail}) — refusing to guess",
+                score=score, hold=HOLD_THIN_EVIDENCE,
+            )
         if score.status == "thin":
             return out(
                 "quarantine",
                 f"topical gate: too few readable posts ({score.scored} scoreable of {score.read} read, "
                 f"need {MIN_SCOREABLE_POSTS}) — refusing to guess",
                 score=score,
+                hold=HOLD_THIN_EVIDENCE,
             )
         if broadcast_channel_is_a_news_source(candidate, deny_rules, topic_score=score):
             return out(
@@ -948,6 +1003,7 @@ def classify(
             "-> NOT a news source; leads only (private pipeline, breadth is the point)",
             score=score,
             news_settled=True,
+            hold=HOLD_BELOW_THRESHOLD,
         )
 
     if kind in {"megagroup", "group"}:
@@ -976,6 +1032,7 @@ def classify(
                     "skip",
                     "never-enroll: no username AND no linked parent (unaddressable, unverifiable)",
                     news_settled=True,
+                    hold=HOLD_NOT_ENROLLABLE,
                 )
             who = f"@{parent.get('username')}" if parent is not None else "no linked channel"
             return out(
@@ -985,6 +1042,7 @@ def classify(
                 "re-checked every run at no read cost, promoted if it ever gains one",
                 score=own_score,
                 citability_blocked=True,
+                hold=HOLD_NOT_CITABLE,
             )
         if status == "yes":
             shown = _parent_evidence(parent, tracked, parent_score) if parent is not None else "n/a"
@@ -1003,6 +1061,7 @@ def classify(
                     f"OWN posts are unreadable ({detail}) -> leads only; chat_sources needs evidence we "
                     "could not get, so it is retried next run",
                     score=own_score,
+                    hold=HOLD_EVIDENCE_RETRY,
                 )
             if own_score.status == "thin":
                 return out(
@@ -1011,6 +1070,7 @@ def classify(
                     f"OWN evidence is thin ({own_score.scored} scoreable of {own_score.read} read, need "
                     f"{MIN_SCOREABLE_POSTS}) -> leads only; retried next run",
                     score=own_score,
+                    hold=HOLD_EVIDENCE_RETRY,
                 )
             if not own_score.passes():
                 return out(
@@ -1020,6 +1080,7 @@ def classify(
                     "-> leads only; chat_sources is a PUBLIC digest input",
                     score=own_score,
                     news_settled=True,
+                    hold=HOLD_BELOW_THRESHOLD,
                 )
             return out(
                 "enroll-both",
@@ -1036,6 +1097,7 @@ def classify(
                 f"group @{handle} -> leads; chat_sources undecided because its parent "
                 f"@{parent.get('username')} could not be scored ({detail}) — retried next run",
                 score=own_score,
+                hold=HOLD_EVIDENCE_RETRY,
             )
         # status == "no". NOT settled: the parent may be added to sources.txt
         # tomorrow, and re-asking costs nothing (the answer comes from the ledger
@@ -1048,14 +1110,16 @@ def classify(
                 f"group @{handle} -> leads (parent @{parent.get('username')} scores {shown} — not a news "
                 "source, so chat_sources stays closed; re-checked free every run)",
                 score=own_score,
+                hold=HOLD_PARENT_NOT_NEWS,
             )
         return out(
             "enroll-leads",
             f"group @{handle} -> leads (no linked news channel; chat_sources needs an operator add)",
             score=own_score,
+            hold=HOLD_PARENT_NOT_NEWS,
         )
 
-    return out("quarantine", f"unknown peer kind {kind!r} — refusing to guess")
+    return out("quarantine", f"unknown peer kind {kind!r} — refusing to guess", hold=HOLD_THIN_EVIDENCE)
 
 
 # ── ledger reads (every one guarded) ──────────────────────────────
@@ -1454,51 +1518,226 @@ def _clamp(text: str, max_chars: int) -> str:
     return text[: max_chars - len(TRUNCATION_MARKER)].rstrip() + TRUNCATION_MARKER
 
 
-def render_report(report: ScanReport, *, max_chars: int = MAX_REPORT_CHARS) -> str:
-    """ACTIONS and ERRORS first, the table last and BOUNDED.
+@dataclass(frozen=True)
+class Action:
+    """ONE thing the operator has to do, with the command that does it."""
 
-    The per-dialog table used to come first, so on the first run (150 DMs + one
-    new channel) the 18 625-char report was cut at 4000 by notify_operator and
-    the operator never saw the `sources.txt +=` line or the ERRORS block — the
-    only two things they had to act on. Truncation is now explicit, and it can
-    only ever eat table rows.
+    what: str
+    how: tuple[str, ...] = ()
+
+    def render(self, index: int, total: int) -> str:
+        return "\n".join([f"ACTION {index}/{total} — {self.what}", *(f"    {h}" for h in self.how)])
+
+
+_JOURNAL = "journalctl -u telegram-dialog-scan --since today --no-pager"
+
+
+def operator_actions(report: ScanReport) -> list[Action]:
+    """The ONLY question this report exists to answer: does a human have to act?
+
+    THE BOUNDARY, and why it is drawn exactly here. "Needs you" is:
+
+      * an ERROR — anything the run could not do;
+      * a FAILED OR PARTIAL WRITE — a ledger, sources.txt, chat_sources.txt, the
+        state file, or the vault mirror that did not get what it was owed. These
+        are the cases where the pipelines and the vault silently disagree, and
+        only a human can reconcile them;
+      * a NOTIFICATION FAILURE — the job's only output reached nobody;
+      * a QUARANTINE THE SCANNER CHOSE BECAUSE IT REFUSED TO GUESS (unreadable or
+        too-thin evidence, an unknown peer kind). Here the scanner is *explicitly
+        asking a human* — it has no evidence and will not invent any. That is a
+        question addressed to the operator, so it pages.
+
+    It is NOT: a routine enrolment, a routine below-threshold rejection, a
+    non-citable hold, a deny rule the operator wrote firing exactly as written,
+    or a repeat of any outcome already reported. Those are the system working as
+    designed; they are counts, and they live in the journal.
+
+    Two failure modes are being traded off, and only one of them is recoverable.
+    Under-reporting loses a night — the next run re-proposes everything, because
+    nothing that matters is settled without evidence. Over-reporting costs the
+    ALARM ITSELF: a nightly message that never once required action trains the
+    operator to stop reading it, and then the one night it matters is the night
+    it is ignored. So when in doubt, do not page. A report that cries wolf
+    nightly is the same defect as a report with no verdict, in a better costume.
+
+    Consequence, by operator instruction (2026-07-31): an empty list means NO
+    MESSAGE IS SENT AT ALL — not a quiet one. Even a run that enrolls 8 chats
+    into a public digest input stays silent; the journal and the state file are
+    the audit trail. See `_notify`.
     """
-    kinds = ", ".join(f"{k}={v}" for k, v in sorted(report.by_kind.items()))
-    head = "dialog-scan" + (" (DRY RUN — nothing was written)" if report.dry_run else "")
-    if report.skipped_locked:
-        return _clamp(f"{head}: another dialog-scan run holds the lock — this pass did nothing.", max_chars)
-    lines = [f"{head}: {report.total_dialogs} dialogs ({kinds}); {len(report.new_dialogs)} new"]
+    actions: list[Action] = []
 
+    if report.mirror_pending:
+        lines = " ".join(f"'{u}'" for u in report.mirror_pending)
+        mirror = report.mirror_path or "the vault mirror"
+        actions.append(
+            Action(
+                f"the vault mirror did NOT get {len(report.mirror_pending)} line(s) that sources.txt did "
+                "(missing or unwritable) — add them by hand so the pair stops drifting:",
+                (f"printf '%s\\n' {lines} >> {mirror}",),
+            )
+        )
+
+    for d in report.decisions:
+        if not needs_operator(d):
+            continue
+        who = f"@{d.username}" if d.username else (d.title or f"dialog:{d.entity_id}")
+        why = d.reason.replace(" — refusing to guess", "")  # said once, in the action's own words
+        deny = report.deny_path or "the deny file"
+        sources = report.sources_path or "sources.txt"
+        rule = f"user:{d.username}" if d.username else f"id:{d.entity_id}"
+        actions.append(
+            Action(
+                f"{who} — the scanner REFUSED TO GUESS ({d.reason}). It stays quarantined until you "
+                "decide; pick one:",
+                (
+                    f"keep it out:  echo '{rule}' >> {deny}",
+                    (
+                        f"let it in:    echo 'https://t.me/{d.username}' >> {sources}"
+                        if d.username
+                        else f"let it in:    it has no handle — nothing to add to {sources}; leave it out"
+                    ),
+                ),
+            )
+        )
+
+    for error in report.errors:
+        actions.append(Action(error, (_JOURNAL,)))
+
+    return actions
+
+
+def needs_operator(decision: Decision) -> bool:
+    """A quarantine the scanner chose because it had NO evidence, not because a
+    rule fired. The first is a question for a human; the second is the human's
+    own rule doing its job."""
+    return decision.decision == "quarantine" and decision.hold == HOLD_THIN_EVIDENCE
+
+
+def _action_block(actions: Sequence[Action], budget: int) -> tuple[str, int]:
+    """Whole items only. A half-rendered command is worse than a missing one."""
+    shown: list[str] = []
+    used = 0
+    for i, action in enumerate(actions, 1):
+        text = action.render(i, len(actions))
+        if used + len(text) + 1 > budget:
+            break
+        shown.append(text)
+        used += len(text) + 1
+    return "\n".join(shown), len(actions) - len(shown)
+
+
+def _held_counts(report: ScanReport) -> list[tuple[str, int]]:
+    """Every candidate the public surface stayed closed for, by REASON.
+
+    `not enrollable` (a DM, a bot, the operator's own channel) is deliberately
+    absent: those were never candidates for anything, so counting them as "held"
+    inflates the one number that is supposed to mean "considered and refused".
+    """
+    buckets: dict[str, int] = {}
+    for d in report.decisions:
+        if d.hold and d.hold != HOLD_NOT_ENROLLABLE:
+            buckets[d.hold] = buckets.get(d.hold, 0) + 1
+    if report.still_pending:
+        buckets["unchanged since last run"] = len(report.still_pending)
+    if report.requarantined:
+        buckets["quarantined, unchanged since last run"] = len(report.requarantined)
+    return sorted(buckets.items(), key=lambda kv: (-kv[1], kv[0]))
+
+
+def _changed_lines(report: ScanReport) -> list[str]:
+    """What actually landed — at most one line per target, never one per peer."""
+
+    def few(urls: Sequence[str], limit: int = 3) -> str:
+        head = ", ".join(urls[:limit])
+        return head if len(urls) <= limit else f"{head} (+{len(urls) - limit} more)"
+
+    lines: list[str] = []
     if report.added_news:
-        lines += ["", f"news sources.txt += {report.added_news}"]
+        lines.append(f"- news sources.txt += {len(report.added_news)}: {few(report.added_news)}")
     if report.added_chat:
         lines.append(
-            f"chat_sources.txt += {report.added_chat} — PUBLIC surface: the chat lane is LIVE in "
-            "prod (1db5342), so these chats feed the digest's draft input from the next collect on."
+            f"- chat_sources.txt += {len(report.added_chat)}: {few(report.added_chat)} — PUBLIC surface: "
+            "the chat lane is LIVE in prod (1db5342), so these feed the digest's draft input from the "
+            "next collect on."
         )
     if report.added_leads:
-        lines.append(f"lead sources += {report.added_leads}")
-    if report.mirror_pending:
-        lines += ["", f"ACTION: vault mirror needs a HUMAN edit (missing/unwritable): {report.mirror_pending}"]
-    if report.ledger_notes:
-        lines += ["", "NOTES:", *[f"- {n}" for n in report.ledger_notes]]
-    if report.requarantined:
-        lines.append(
-            f"({len(report.requarantined)} dialog(s) still quarantined by the deny list — unchanged; "
-            "delete the rule to re-open them.)"
-        )
-    if report.still_pending:
-        lines.append(
-            f"({len(report.still_pending)} peer(s) still lead-only for the same reason as last run — no "
-            "citable handle, or no parent that is a news source. Re-checked every run at no read cost, "
-            "promoted automatically the moment that changes.)"
-        )
-    if report.refused_to_write and not report.dry_run:
-        lines += ["", "NOTHING WAS WRITTEN THIS RUN (see ERRORS)."]
-    if report.errors:
-        lines += ["", "ERRORS:", *[f"- {e}" for e in report.errors]]
+        lines.append(f"- leads += {len(report.added_leads)} peer(s) (private pipeline, never published)")
+    return lines
 
-    fixed = "\n".join(lines)
+
+# Said ONCE, because the operator should never wonder whether a missing handle
+# in sources.txt is a chore waiting for them. It is not.
+_SELF_HEALING = (
+    "sources.txt is SELF-HEALING and needs no curation from you: a channel missing from it is re-added "
+    "automatically the next run it passes the topical gate. Silence is NOT a removal reason — a channel "
+    "that goes quiet costs us no reads and keeps its place."
+)
+
+
+def _routine_lines(report: ScanReport) -> list[str]:
+    """Enrolled, then held-and-why, then merely-evaluated. That order is the point:
+    the old header led with `57 new`, i.e. the number that mattered least."""
+    kinds = ", ".join(f"{k}={v}" for k, v in sorted(report.by_kind.items()))
+    public = len(report.added_news) + len(report.added_chat)
+    label = "enrolled"
+    if report.dry_run:
+        public = len([d for d in report.decisions if d.news_target])
+        label = "would enrol"
+    lines = [
+        f"{label}: {public} into the PUBLIC digest inputs "
+        f"(news sources.txt {len(report.added_news)}, chat_sources.txt {len(report.added_chat)})"
+        + (f" · leads +{len(report.added_leads)} (private)" if report.added_leads else "")
+    ]
+    held = _held_counts(report)
+    if held:
+        detail = ", ".join(f"{n} {reason}" for reason, n in held)
+        lines.append(f"held: {sum(n for _, n in held)} — {detail}")
+    else:
+        lines.append("held: 0")
+    not_enrollable = len([d for d in report.decisions if d.hold == HOLD_NOT_ENROLLABLE])
+    lines.append(
+        f"evaluated: {len(report.decisions)} candidate(s) of {report.total_dialogs} dialogs ({kinds})"
+        + (f"; {not_enrollable} not enrollable (DM / bot / own channel)" if not_enrollable else "")
+    )
+    changed = _changed_lines(report)
+    if changed:
+        lines += ["", "changed:", *changed]
+    if report.ledger_notes:
+        lines += ["", "notes:", *[f"- {n}" for n in report.ledger_notes]]
+    lines += ["", _SELF_HEALING, "", f"full table: {_JOURNAL}"]
+    return lines
+
+
+def render_report(report: ScanReport, *, max_chars: int = MAX_REPORT_CHARS) -> str:
+    """Line one answers "do I need to do anything?" — then the actions, then counts.
+
+    Everything below the action block is context, and the budget is spent in that
+    order: actions can never be crowded out by the table (the 2026-07-30 shape,
+    where 18 625 chars of rows pushed the only actionable lines past the 4000-char
+    cap), and the table can never be crowded out silently (truncation is stated).
+    """
+    actions = operator_actions(report)
+    verdict = f"NEEDS YOU: {len(actions)}" if actions else "NOTHING TO DO"
+    head = f"dialog-scan: {verdict}" + (" (DRY RUN — nothing was written)" if report.dry_run else "")
+    if report.skipped_locked:
+        return _clamp(f"{head} — another dialog-scan run holds the lock; this pass did nothing.", max_chars)
+
+    top = [head]
+    if actions:
+        if report.refused_to_write and not report.dry_run:
+            top.append("NOTHING WAS WRITTEN THIS RUN — the next run retries; see below.")
+        block, dropped = _action_block(actions, max_chars - len(head) - 400)
+        top += ["", block]
+        if dropped:
+            return _clamp(
+                "\n".join(top) + f"\n… {dropped} more item(s) need you — full list in the journal."
+                + TRUNCATION_MARKER,
+                max_chars,
+            )
+
+    fixed = "\n".join([*top, "", *_routine_lines(report)])
     if not report.decisions:
         return _clamp(fixed, max_chars)
 
@@ -1556,7 +1795,12 @@ def run_scan(
     lead_enroller: Callable[..., Any] | None = None,
     tracked_reader: Callable[[], dict[str, Any]] | None = None,
 ) -> ScanReport:
-    report = ScanReport(dry_run=dry_run)
+    report = ScanReport(
+        dry_run=dry_run,
+        sources_path=str(paths.sources),
+        deny_path=str(paths.deny),
+        mirror_path=str(paths.mirror),
+    )
     dialogs = list(dialogs)
     report.total_dialogs = len(dialogs)
     for candidate in dialogs:
@@ -1571,6 +1815,7 @@ def run_scan(
             if lock_error is None:
                 report.skipped_locked = True
                 report.text = render_report(report, max_chars=max_report_chars)
+                report.notify_skipped = True  # a concurrent run is not an operator problem
                 return report
             report.errors.append(lock_error)
             report.text = render_report(report, max_chars=max_report_chars)
@@ -1593,12 +1838,22 @@ def run_scan(
 
 
 def _notify(report: ScanReport, notifier: Callable[[str], Any] | None, max_report_chars: int) -> None:
-    """Use the notifier's RETURN VALUE: `notified: true` must never be a lie.
+    """THE send gate, and the only one: a message goes out if — and only if — the
+    report contains something the operator must DO.
 
-    notify_operator() returns False when the token or the chat id is missing,
-    which the caller used to ignore — a job whose ONLY output is a Telegram
-    message then reported success while reaching nobody.
+    Operator, 2026-07-31: *"I do not need to be alerted if nothing to do from my
+    side."* The previous gate was `bool(errors) or anything-not-a-skip`, i.e. it
+    treated *something happened* as *tell the human*, which is precisely the
+    nightly wall of correct-and-useless facts they objected to. Enrolments,
+    holds, promotions and the decision table are journal material now, even when
+    the run put eight chats into a public digest input.
+
+    `notify_skipped` records that choice, so "sent nothing on purpose" can never
+    be read as "the send failed" — and `notified: true` still never a lie.
     """
+    if not operator_actions(report):
+        report.notify_skipped = True
+        return
     if notifier is None:
         return
     if bool(notifier(report.text)):
@@ -1855,10 +2110,9 @@ def _run_scan_locked(
             report.state_written = True
 
     report.text = render_report(report, max_chars=max_report_chars)
-    # Problems-and-changes only: a run whose new dialogs are all skips (a DM, a
-    # bot) stays silent. Quarantines DO report — the operator decides — but only
-    # the first time each one fires.
-    worth_saying = bool(report.errors) or any(d.decision != "skip" for d in report.decisions)
-    if worth_saying:
-        _notify(report, notifier, max_report_chars)
+    # ONE gate, inside _notify: a message goes out only when something needs the
+    # operator. The old "worth_saying" test lived here and asked a different
+    # question — *did anything happen* — which is why a night that needed nothing
+    # still messaged them.
+    _notify(report, notifier, max_report_chars)
     return report

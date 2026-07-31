@@ -318,14 +318,21 @@ def test_a_handle_less_chat_uses_the_proxys_own_id_target_convention(paths: Scan
 def test_a_failed_notification_is_reported_not_claimed_as_delivered(paths: ScanPaths) -> None:
     sent: list[str] = []
 
+    def unreadable(kind, entity_id):
+        raise RuntimeError("403 CHANNEL_PRIVATE")
+
     report = run_scan(
         paths=paths,
+        # Something that NEEDS the operator (the scanner refused to guess), because
+        # a run with nothing to act on now deliberately sends nothing at all.
         dialogs=[dialog(400, "channel", username="fresh_ai_news")],
+        post_reader=unreadable,
         notifier=_notifier(sent, result=False),  # notify_operator's unconfigured-token path
     )
 
     assert sent  # it tried
     assert report.notified is False
+    assert report.notify_skipped is False, "a FAILED send must never look like a skipped one"
     assert any("notification" in e.lower() for e in report.errors)
 
 
@@ -402,18 +409,38 @@ def test_deleting_a_deny_line_reopens_the_dialog_as_the_file_documents(paths: Sc
 
 
 def test_the_same_quarantine_does_not_page_the_operator_every_night(paths: ScanPaths) -> None:
-    paths.deny.write_text("@borderline_chan\n")
+    """Only the quarantine the scanner REFUSED TO GUESS on is a question for a
+    human, and only the first time it is asked."""
     dialogs = [dialog(801, "channel", username="borderline_chan", title="Borderline")]
     sent: list[str] = []
 
-    run_scan(paths=paths, dialogs=dialogs, notifier=_notifier(sent))
-    assert len(sent) == 1  # first sighting reports
+    def thin(kind, entity_id):
+        return [_TOPICAL_POST, _TOPICAL_POST]  # 2 scoreable posts, need 8
 
-    second = run_scan(paths=paths, dialogs=dialogs, notifier=_notifier(sent))
+    run_scan(paths=paths, dialogs=dialogs, post_reader=thin, notifier=_notifier(sent))
+    assert len(sent) == 1, "the scanner is asking a human: that pages, once"
+    assert "NEEDS YOU: 1" in sent[0]
+
+    second = run_scan(paths=paths, dialogs=dialogs, post_reader=thin, notifier=_notifier(sent))
 
     assert len(sent) == 1, "a known quarantine must not re-report"
     assert second.notified is False
+    assert second.notify_skipped is True
     assert second.requarantined == [801]
+
+
+def test_a_deny_rule_firing_never_pages_the_operator_at_all(paths: ScanPaths) -> None:
+    """The operator's OWN rule doing exactly what they wrote it to do is not news
+    — not even once. (It used to page on first sighting.)"""
+    paths.deny.write_text("@borderline_chan\n")
+    dialogs = [dialog(802, "channel", username="borderline_chan", title="Borderline")]
+    sent: list[str] = []
+
+    report = run_scan(paths=paths, dialogs=dialogs, notifier=_notifier(sent))
+
+    assert [d.decision for d in report.decisions] == ["quarantine"]
+    assert sent == []
+    assert report.notify_skipped is True
 
 
 # ── 9. chat_sources is described truthfully ───────────────────────
@@ -626,13 +653,18 @@ def test_operator_report_with_angle_brackets_is_actually_delivered(paths: ScanPa
     chat = dialog(200, "megagroup", username="ai_news_chat")  # off-topic => "... < 0.35 ..."
     other = dialog(101, "channel", username="ai_news_two", linked_chat_id=300)
     naked = dialog(300, "megagroup", title="R&D <lab> chat")  # title reaches the table verbatim
+    # A run only sends when something needs the operator (2026-07-31), so this
+    # regression needs one: a channel whose posts cannot be read at all.
+    mystery = dialog(102, "channel", username="mystery_chan")
 
     def reader(kind, entity_id):
+        if entity_id == 102:
+            raise RuntimeError("403 CHANNEL_PRIVATE")
         return ["просто болтовня о погоде и котиках"] * 20 if kind == "linked_chat" else [_TOPICAL_POST] * 20
 
     report = run_scan(
         paths=paths,
-        dialogs=[parent, chat, other, naked],
+        dialogs=[parent, chat, other, naked, mystery],
         post_reader=reader,
         notifier=pub.notify_operator,
     )

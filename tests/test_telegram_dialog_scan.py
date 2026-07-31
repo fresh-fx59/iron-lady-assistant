@@ -365,7 +365,12 @@ def test_nothing_new_means_no_report_at_all(paths: ScanPaths) -> None:
     assert report.notified is False
 
 
-def test_a_new_enrolment_notifies_the_operator_once(paths: ScanPaths) -> None:
+def test_a_new_enrolment_does_NOT_page_the_operator(paths: ScanPaths) -> None:
+    """REVERSED by the operator on 2026-07-31: *"I do not need to be alerted if
+    nothing to do from my side."* A routine enrolment — even into the PUBLIC
+    digest input — is the system working as designed, so it goes to the journal
+    and nowhere else. This test used to assert the opposite; the message it
+    asserted is exactly the one they said they could not act on."""
     sent: list[str] = []
 
     def notifier(text: str) -> bool:
@@ -376,9 +381,12 @@ def test_a_new_enrolment_notifies_the_operator_once(paths: ScanPaths) -> None:
 
     report = run_scan(paths=paths, dialogs=[dialog(110, "channel", username="fresh_ai_news")], notifier=notifier)
 
-    assert len(sent) == 1
-    assert "fresh_ai_news" in sent[0]
-    assert report.notified is True
+    assert report.added_news == ["https://t.me/fresh_ai_news"]  # it DID the work…
+    assert sent == []                                           # …and said nothing
+    assert report.notified is False
+    assert report.notify_failed is False, "not sending on purpose is not a send failure"
+    assert report.notify_skipped is True
+    assert "fresh_ai_news" in report.text, "the journal still gets the whole story"
 
 
 def test_state_file_records_a_decision_per_surface_not_a_global_seen_flag(paths: ScanPaths) -> None:

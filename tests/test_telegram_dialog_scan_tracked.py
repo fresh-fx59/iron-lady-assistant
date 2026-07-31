@@ -157,14 +157,24 @@ def test_load_tracked_reads_the_pipeline_state_over_the_reader(tmp_path, proxy):
 
 
 def test_an_already_enrolled_entity_is_no_longer_reproposed(tmp_path, proxy):
-    """The 47 re-proposals: entity 8 is lead-enrolled, so it is not 'new'."""
+    """The 47 re-proposals were a LEADS re-proposal, and they stay fixed.
+
+    PER-SURFACE (2026-07-31): entity 8 is settled for leads and STILL a news
+    candidate — it had never been scored for the public digest, and the global
+    short-circuit that hid it there is exactly the defect this repair removes."""
+    from src.telegram_dialog_scan import outstanding_surfaces
+
     payload = _get(proxy)
     dialogs = [_dialog(8, "feedchat"), _dialog(9, "brandnew")]
+    paths = _paths(tmp_path)
     report = run_scan(
-        paths=_paths(tmp_path), dialogs=dialogs, dry_run=True,
+        paths=paths, dialogs=dialogs, dry_run=True,
         post_reader=_reader, tracked_reader=lambda: payload,
     )
-    assert report.new_dialogs == [9]
+    tracked = load_tracked(paths, tracked_reader=lambda: payload)
+    assert outstanding_surfaces(dialogs[0], tracked) == {"news"}, "leads already has it"
+    assert outstanding_surfaces(dialogs[1], tracked) == {"leads", "news"}
+    assert report.new_dialogs == [8, 9]
 
     blind = run_scan(paths=_paths(tmp_path), dialogs=dialogs, dry_run=True, post_reader=_reader,
                      tracked_reader=lambda: {"digest_sources": [], "joins": []})

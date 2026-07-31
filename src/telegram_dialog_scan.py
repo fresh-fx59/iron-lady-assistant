@@ -3,8 +3,32 @@
 `/v1/channels` only ever returned broadcast peers, so a hand-joined group (or a
 pending join request an admin finally approved) was invisible to both pipelines.
 This walks the new `GET /v1/dialogs`, diffs against what the scanner has already
-seen AND what each pipeline tracks, classifies the rest by EXPLICIT RULES (no
+decided AND what each pipeline tracks, classifies the rest by EXPLICIT RULES (no
 LLM), and enrolls the survivors.
+
+TRACKING IS PER PIPELINE (2026-07-31, third pass — see `outstanding_surfaces`).
+It used to be one global "already tracked?" flag that short-circuited on
+`entity_id in tracked.lead_entity_ids`, so the moment a peer became a LEAD source
+the scanner stopped considering it for anything — including the NEWS surface it
+had never once been evaluated for. In production that left 102 lead-tracked
+entities permanently unable to reach `sources.txt` / `chat_sources.txt`, among
+them @moneyforstartup_chat (citable, own score 0.48 behind a 1.00 parent, i.e.
+exactly the chat that should have been staged). The same flag ran the other way
+too: a channel in `sources.txt` was "tracked", so it could never be lead-enrolled.
+A candidate is now evaluated for EVERY surface it is eligible for and is not
+already on, and the state file records a decision PER SURFACE.
+
+Two disciplines keep that from turning into nightly noise, because ~100 entities
+suddenly become news candidates against an 80-read budget:
+
+  * ONLY READS THAT CAN CHANGE AN OUTCOME. A chat with no citable handle can
+    never be staged, and a chat whose parent is in `sources.txt` (or already
+    news-decided against) needs no parent read — both answers come from ledgers
+    we already hold. After one pass the steady state costs ZERO post reads.
+  * A REPEAT OUTCOME IS A COUNT, NOT A ROW — the discipline `requarantined`
+    already used, now covering every peer whose news surface stays open for a
+    reason the operator has already been told (`news_pending`). Nothing new ⇒ an
+    empty, silent, free run.
 
 NEWS enrolment is TOPICALLY GATED (2026-07-31): a candidate broadcast channel is
 scored deterministically against an operator-editable RU/EN vocabulary over its
@@ -269,9 +293,21 @@ def citable_handle(candidate: dict[str, Any]) -> str | None:
 # A username Telegram would actually accept (used to reject a malformed deny rule).
 _HANDLE_RE = re.compile(r"^[a-z0-9_]{3,32}$")
 
-# 3 adds `pending_citable`. No migration needed: every key is read with .get(),
-# so a v2 file simply starts with an empty bucket.
-_STATE_VERSION = 3
+# 4 makes the "done with it" memory PER-SURFACE (`decided.leads` / `decided.news`)
+# and generalises `pending_citable` into `news_pending`. A v3 file migrates on
+# read: its `seen` list becomes `decided.leads` and `decided.news` starts EMPTY —
+# v3 `seen` was written from every dialog id, including the ones the old global
+# `_already_tracked` filtered out before they were ever classified, so it cannot
+# be trusted to mean "the news surface was evaluated". That costs exactly one
+# re-evaluation pass (see the module docstring).
+_STATE_VERSION = 4
+
+# The two pipelines this scanner feeds. A candidate is evaluated for EVERY
+# surface it is eligible for and is not already on; being tracked on one says
+# nothing about the other.
+SURFACE_LEADS = "leads"
+SURFACE_NEWS = "news"
+SURFACES = (SURFACE_LEADS, SURFACE_NEWS)
 
 
 @dataclass(frozen=True)
@@ -323,10 +359,17 @@ class Decision:
     # enrollable peer (channel / group / megagroup), None for the kinds no
     # publication path exists for at all (a DM, a bot).
     citable: bool | None = None
-    # True only when citability is the ONE thing standing between this peer and
-    # chat_sources: parent is a news source, but the chat has no usable handle.
-    # Those ids go to the re-evaluated bucket, not to permanent `seen`.
+    # True when citability is the ONE thing standing between this peer and the
+    # public surface. A handle is a thing a peer GAINS, so these are re-checked
+    # every run — for FREE, no post read: citability is read off the dialog row.
     citability_blocked: bool = False
+    # Did this run actually SETTLE the news surface for this peer — i.e. decide
+    # it on evidence we hold, so there is nothing left to reconsider? False for
+    # every "we could not get the evidence" and every "the blocker is a thing
+    # that can change for free" outcome; those stay outstanding and are reported
+    # as a COUNT, never as a repeated row. Only a settled surface enters
+    # `decided`, which is what makes a steady state possible at all.
+    news_settled: bool = False
 
 
 @dataclass
@@ -336,11 +379,14 @@ class Tracked:
     digest_peer_keys: set[str] = field(default_factory=set)
     lead_entity_ids: set[int] = field(default_factory=set)
     join_targets: set[str] = field(default_factory=set)
-    seen_ids: set[int] = field(default_factory=set)
+    # PER-SURFACE "we are done with this id here". Never global: an id decided
+    # for leads is still a news candidate, and vice versa.
+    decided: dict[str, set[int]] = field(default_factory=lambda: {s: set() for s in SURFACES})
     quarantined_ids: set[int] = field(default_factory=set)
-    # Lead-enrolled, but held back from chat_sources ONLY because they had no
-    # public handle. Re-examined every run (see _already_tracked).
-    pending_citable_ids: set[int] = field(default_factory=set)
+    # News is still OUTSTANDING for a reason we have already told the operator
+    # about (no citable handle yet, parent is not a news source yet, evidence we
+    # could not get). Re-evaluated every run; reported as a COUNT after the first.
+    news_pending_ids: set[int] = field(default_factory=set)
     # DISQUALIFYING read failures: an unreadable ledger means "I don't know what
     # is already tracked", which must never be treated as "nothing is tracked".
     errors: list[str] = field(default_factory=list)
@@ -767,6 +813,53 @@ def _parent_tracked(parent: dict[str, Any], tracked: Tracked | None) -> bool:
     )
 
 
+def parent_news_status(
+    parent: dict[str, Any] | None,
+    tracked: Tracked | None,
+    deny_rules: Sequence[DenyRule],
+    *,
+    topic_score: TopicScore | None,
+) -> str:
+    """`yes` | `no` | `unknown` — and it answers FREE whenever it can.
+
+    A discussion chat can only reach `chat_sources.txt` behind a parent that is a
+    news source, so this is the gate that decides whether reading the chat (or
+    the parent) can change anything at all. Two of the three answers cost no read:
+
+      * the parent's handle is IN sources.txt  -> `yes`, by the ledger;
+      * the parent is already `decided` for news and is NOT in sources.txt
+        -> `no`, because that decision was only ever recorded on real evidence.
+
+    Only a parent we have never scored is `unknown`, and only `unknown` buys a
+    read. This is what keeps the steady state at zero reads: after one pass every
+    parent channel is either in sources.txt or news-decided.
+
+    `no` is deliberately NOT recorded as a settled news verdict for the CHILD (see
+    classify): the parent may be added to sources.txt tomorrow, and re-asking is
+    free, so the chat stays outstanding and simply reports as a count.
+    """
+    if parent is None:
+        return "no"
+    if tracked is not None and (_all_handles(parent) & tracked.news_handles):
+        return "yes"
+    if broadcast_channel_is_a_news_source(parent, deny_rules, topic_score=topic_score):
+        return "yes"
+    if topic_score is not None and topic_score.status == "ok":
+        return "no"  # real evidence, and it failed the line
+    if tracked is not None and int(parent.get("entity_id") or 0) in tracked.decided.get(SURFACE_NEWS, set()):
+        return "no"  # scored and rejected on an earlier run; nothing to re-read
+    return "unknown"
+
+
+def _parent_evidence(parent: dict[str, Any], tracked: Tracked | None, score: TopicScore | None) -> str:
+    """What we can honestly say about the parent WITHOUT having read it."""
+    if score is not None:
+        return score.label()
+    if tracked is not None and (_all_handles(parent) & tracked.news_handles):
+        return "already in sources.txt"
+    return "not scored"
+
+
 def classify(
     candidate: dict[str, Any],
     *,
@@ -792,33 +885,40 @@ def classify(
         news_target: str | None = None,
         score: TopicScore | None = None,
         citability_blocked: bool = False,
+        news_settled: bool = False,
     ) -> Decision:
         return Decision(
             entity_id, str(candidate.get("title") or ""), kind, handle, decision, reason, news_target, score,
-            citable, citability_blocked,
+            citable, citability_blocked, news_settled,
         )
 
+    # A `skip` is structural and permanent — it settles every surface at once.
     if kind in {"user", "bot"}:
-        return out("skip", f"never-enroll: {kind} dialog (DM / bot / Saved Messages)")
+        return out("skip", f"never-enroll: {kind} dialog (DM / bot / Saved Messages)", news_settled=True)
     if _all_handles(candidate) & OWN_PUBLISHING_CHANNELS:
-        return out("skip", f"never-enroll: operator's own publishing channel @{handle}")
+        return out("skip", f"never-enroll: operator's own publishing channel @{handle}", news_settled=True)
     rule = deny_match(deny_rules, candidate)
     if rule is not None:
         return out("quarantine", f"deny rule fired: {rule.label()}")
 
     if kind == "channel":
         if not handle:
-            return out("skip", "never-enroll: broadcast channel with no username (unaddressable)")
+            return out(
+                "skip", "never-enroll: broadcast channel with no username (unaddressable)", news_settled=True
+            )
         if citable is False:
             # Same class as the chat case below: sources.txt is a PUBLIC-surface
             # write and the digest cites t.me/<handle>/<id>. A handle that cannot
-            # form a link the publish gate accepts can never be cited.
+            # form a link the publish gate accepts can never be cited — but a
+            # handle is a thing a peer GAINS, so this is re-checked (for free,
+            # no post read) rather than settled.
             return out(
                 "enroll-leads",
                 f"broadcast channel @{handle} has no citable public handle "
                 "(cannot form a t.me/<handle>/<id> link the digest gate accepts) "
-                "-> leads only, never a news source",
+                "-> leads only; re-checked every run, promoted if it gains one",
                 score=scores.get(("channel", entity_id)),
+                citability_blocked=True,
             )
         score = scores.get(("channel", entity_id))
         # NEVER GUESS: no evidence is not "probably fine", and it is not "probably
@@ -840,105 +940,120 @@ def classify(
                 f"[{', '.join(score.terms)}] -> news + leads",
                 "sources",
                 score,
+                news_settled=True,
             )
         return out(
             "enroll-leads",
             f"broadcast channel @{handle} scores {score.label()} < {TOPIC_SCORE_THRESHOLD:.2f} "
             "-> NOT a news source; leads only (private pipeline, breadth is the point)",
             score=score,
+            news_settled=True,
         )
 
     if kind in {"megagroup", "group"}:
         parent = linked_parents.get(entity_id)
-        # A discussion chat reaches the PUBLIC digest only behind a parent that
-        # passed the gate. The chat's own score is reported as evidence but does
-        # not gate: there is no labelled set of discussion chats to calibrate a
+        # The chat's own score is reported as evidence but only gates the PUBLIC
+        # surface: there is no labelled set of discussion chats to calibrate a
         # chat threshold against, and inventing one would be picking a number by
         # feel. This is what makes the @Music_Producers_Chat case (parent
         # @erdman_music scores 0.27) a RULE rather than a hand-added deny line.
         own_score = scores.get(("linked_chat", entity_id))
-        if parent is not None:
-            parent_score = scores.get(("channel", int(parent.get("entity_id") or 0)))
-            if broadcast_channel_is_a_news_source(parent, deny_rules, topic_score=parent_score):
-                # CITABILITY FIRST — it needs no evidence and no read, and it is
-                # decisive: all five chats the live 2026-07-31 run staged were
-                # handle-less, so every one of them was inert in the digest while
-                # still costing a read per collect run. Leads still take it: that
-                # pipeline keys on entity_id and never publishes a link.
-                if citable_handle(candidate) is None:
-                    return out(
-                        "enroll-leads",
-                        f"discussion chat of news channel @{parent.get('username')} "
-                        f"(parent {parent_score.label()}), but it has no public handle "
-                        "⇒ cannot be cited in a published digest (its messages carry link=None and are "
-                        "dropped before the draft) -> leads only; re-checked every run, promoted if it "
-                        "ever gains one",
-                        score=own_score,
-                        citability_blocked=True,
-                    )
-                # chat_sources.txt is a PUBLIC-SURFACE write (the chat lane merged
-                # as 1db5342 and is deployed: the digest reads that file the moment
-                # it exists), so a passing PARENT is not enough — the live dry-run
-                # found parent-gated chats scoring 0.08. The chat must pass on its
-                # OWN posts, on the SAME metric and the SAME calibrated 0.35 line;
-                # inventing a second, chat-specific number would be picking one by
-                # feel, and reusing the calibrated line needs no labelled chat set.
-                # Everything short of a pass — unreadable, thin, or simply
-                # off-topic — goes to leads only, with the reason reported.
-                if own_score is None or own_score.status == "unreadable":
-                    detail = own_score.detail if own_score is not None else "not scored"
-                    return out(
-                        "enroll-leads",
-                        f"discussion chat of news channel @{parent.get('username')} "
-                        f"(parent {parent_score.label()}), but its OWN posts are unreadable ({detail}) "
-                        "-> leads only; chat_sources needs evidence we could not get",
-                        score=own_score,
-                    )
-                if own_score.status == "thin":
-                    return out(
-                        "enroll-leads",
-                        f"discussion chat of news channel @{parent.get('username')} "
-                        f"(parent {parent_score.label()}), but its OWN evidence is thin "
-                        f"({own_score.scored} scoreable of {own_score.read} read, need "
-                        f"{MIN_SCOREABLE_POSTS}) -> leads only",
-                        score=own_score,
-                    )
-                if not own_score.passes():
-                    return out(
-                        "enroll-leads",
-                        f"discussion chat of news channel @{parent.get('username')} "
-                        f"(parent {parent_score.label()}), but the chat itself scores "
-                        f"{own_score.label()} < {TOPIC_SCORE_THRESHOLD:.2f} on its own posts "
-                        "-> leads only; chat_sources is a PUBLIC digest input",
-                        score=own_score,
-                    )
+        parent_score = (
+            scores.get(("channel", int(parent.get("entity_id") or 0))) if parent is not None else None
+        )
+        status = parent_news_status(parent, tracked, deny_rules, topic_score=parent_score)
+        # CITABILITY FIRST — it is read off the dialog row, needs no post read at
+        # all, and it is decisive: all five chats the live 2026-07-31 run staged
+        # were handle-less, so every one of them was inert in the digest while
+        # still costing a read per collect run. Leads still take it: that pipeline
+        # keys on entity_id and never publishes a link. Checking it before the
+        # own-post score is what makes a non-citable chat cost nothing, nightly.
+        if citable_handle(candidate) is None:
+            verifiable = parent is not None and (status == "yes" or _parent_tracked(parent, tracked))
+            if not handle and not verifiable:
+                # Unaddressable AND unverifiable: enrollable into nothing, ever.
                 return out(
-                    "enroll-both",
-                    f"discussion chat of news channel @{parent.get('username')} "
-                    f"(parent scores {parent_score.label()}, chat itself {own_score.label()} "
-                    f">= {TOPIC_SCORE_THRESHOLD:.2f}) -> leads + chat_sources",
-                    "chat_sources",
-                    own_score,
+                    "skip",
+                    "never-enroll: no username AND no linked parent (unaddressable, unverifiable)",
+                    news_settled=True,
                 )
-        if handle:
-            reason = f"group @{handle} -> leads"
-            if parent is not None:
-                parent_score = scores.get(("channel", int(parent.get("entity_id") or 0)))
-                shown = parent_score.label() if parent_score is not None else "not scored"
-                reason += f" (parent @{parent.get('username')} scores {shown} — not a news source)"
-            else:
-                reason += " (news needs an operator chat_sources add)"
-            return out("enroll-leads", reason, score=own_score)
-        # No handle of its own, but a tracked parent makes it verifiable and the
-        # joins door keys on entity_id, so leads still works. News does not: the
-        # parent is not a news source, so its chat has no business in the digest.
-        if parent is not None and _parent_tracked(parent, tracked):
+            who = f"@{parent.get('username')}" if parent is not None else "no linked channel"
             return out(
                 "enroll-leads",
-                f"discussion chat of tracked non-news channel {parent.get('title')!r} -> leads",
+                f"discussion chat ({who}) has no citable public handle ⇒ cannot be cited in a published "
+                "digest (its messages carry link=None and are dropped before the draft) -> leads only; "
+                "re-checked every run at no read cost, promoted if it ever gains one",
+                score=own_score,
+                citability_blocked=True,
+            )
+        if status == "yes":
+            shown = _parent_evidence(parent, tracked, parent_score) if parent is not None else "n/a"
+            # chat_sources.txt is a PUBLIC-SURFACE write (the chat lane merged as
+            # 1db5342 and is deployed: the digest reads that file the moment it
+            # exists), so a passing PARENT is not enough — the live dry-run found
+            # parent-gated chats scoring 0.08. The chat must clear the SAME
+            # calibrated 0.35 line on its OWN posts. Everything short of a pass
+            # goes to leads only, with the reason reported; but only a REAL score
+            # settles the news surface — unreadable or thin evidence is retried.
+            if own_score is None or own_score.status == "unreadable":
+                detail = own_score.detail if own_score is not None else "not scored"
+                return out(
+                    "enroll-leads",
+                    f"discussion chat of news channel @{parent.get('username')} (parent {shown}), but its "
+                    f"OWN posts are unreadable ({detail}) -> leads only; chat_sources needs evidence we "
+                    "could not get, so it is retried next run",
+                    score=own_score,
+                )
+            if own_score.status == "thin":
+                return out(
+                    "enroll-leads",
+                    f"discussion chat of news channel @{parent.get('username')} (parent {shown}), but its "
+                    f"OWN evidence is thin ({own_score.scored} scoreable of {own_score.read} read, need "
+                    f"{MIN_SCOREABLE_POSTS}) -> leads only; retried next run",
+                    score=own_score,
+                )
+            if not own_score.passes():
+                return out(
+                    "enroll-leads",
+                    f"discussion chat of news channel @{parent.get('username')} (parent {shown}), but the "
+                    f"chat itself scores {own_score.label()} < {TOPIC_SCORE_THRESHOLD:.2f} on its own posts "
+                    "-> leads only; chat_sources is a PUBLIC digest input",
+                    score=own_score,
+                    news_settled=True,
+                )
+            return out(
+                "enroll-both",
+                f"discussion chat of news channel @{parent.get('username')} (parent {shown}, chat itself "
+                f"{own_score.label()} >= {TOPIC_SCORE_THRESHOLD:.2f}) -> leads + chat_sources",
+                "chat_sources",
+                own_score,
+                news_settled=True,
+            )
+        if status == "unknown":
+            detail = parent_score.detail if parent_score is not None else "not scored"
+            return out(
+                "enroll-leads",
+                f"group @{handle} -> leads; chat_sources undecided because its parent "
+                f"@{parent.get('username')} could not be scored ({detail}) — retried next run",
                 score=own_score,
             )
-        return out("skip", "never-enroll: no username AND no linked parent (unaddressable, unverifiable)")
+        # status == "no". NOT settled: the parent may be added to sources.txt
+        # tomorrow, and re-asking costs nothing (the answer comes from the ledger
+        # and the state file, never from a read), so this chat stays a candidate
+        # and simply reports as a count instead of a nightly row.
+        if parent is not None:
+            shown = _parent_evidence(parent, tracked, parent_score)
+            return out(
+                "enroll-leads",
+                f"group @{handle} -> leads (parent @{parent.get('username')} scores {shown} — not a news "
+                "source, so chat_sources stays closed; re-checked free every run)",
+                score=own_score,
+            )
+        return out(
+            "enroll-leads",
+            f"group @{handle} -> leads (no linked news channel; chat_sources needs an operator add)",
+            score=own_score,
+        )
 
     return out("quarantine", f"unknown peer kind {kind!r} — refusing to guess")
 
@@ -1047,9 +1162,23 @@ def load_tracked(
     if paths.state.exists():
         try:
             state = json.loads(paths.state.read_text(encoding="utf-8"))
-            tracked.seen_ids = {int(i) for i in state.get("seen") or []}
+            decided = state.get("decided")
+            if isinstance(decided, dict):
+                tracked.decided = {s: {int(i) for i in decided.get(s) or []} for s in SURFACES}
+            else:
+                # v<=3 MIGRATION. `seen` meant "handled", but it was written from
+                # EVERY dialog id — including the ones the old global filter threw
+                # away before classification — so it is only trustworthy as "the
+                # lead half is done". The news half starts empty on purpose: one
+                # re-evaluation pass is the price of the repair, and it converges.
+                tracked.decided = {
+                    SURFACE_LEADS: {int(i) for i in state.get("seen") or []},
+                    SURFACE_NEWS: set(),
+                }
             tracked.quarantined_ids = {int(i) for i in state.get("quarantined") or []}
-            tracked.pending_citable_ids = {int(i) for i in state.get("pending_citable") or []}
+            tracked.news_pending_ids = {
+                int(i) for i in (state.get("news_pending") or state.get("pending_citable") or [])
+            }
         except Exception as exc:  # noqa: BLE001 — a corrupt state file must not stop the scan
             # Deliberately NOT a blocking error: "treat every dialog as new" is
             # safe here because the pipeline ledgers are the real dedup authority.
@@ -1082,34 +1211,65 @@ def load_tracked(
     return tracked
 
 
-def _already_tracked(candidate: dict[str, Any], tracked: Tracked) -> bool:
-    """Note what is NOT in here: quarantined ids.
+def eligible_surfaces(candidate: dict[str, Any]) -> set[str]:
+    """Which pipelines could this peer EVER belong to? Kind alone answers it."""
+    if str(candidate.get("kind") or "user") in {"user", "bot"}:
+        return set()  # a DM / bot dialog is enrollable nowhere, so never a candidate
+    return set(SURFACES)
 
-    A quarantined dialog is re-classified against the CURRENT deny rules on every
-    run, which is what makes the deny file's documented behaviour ("delete a line
-    to re-open that dialog") actually true.
+
+def on_surface(candidate: dict[str, Any], tracked: Tracked, surface: str) -> bool:
+    """Is this peer ALREADY on that surface, per the surface's own ledger?
+
+    The ledgers — not the state file — are the authority on membership, so an
+    operator's hand-added line counts exactly like one of ours.
     """
     entity_id = int(candidate.get("entity_id") or 0)
+    if surface == SURFACE_LEADS:
+        kind = "channel" if str(candidate.get("kind")) == "channel" else "linked_chat"
+        # A digest_sources row of ANY role counts: _register_leads deliberately
+        # never rewrites an existing row (that upsert once demoted a news source
+        # to a lead source), so there is nothing left for us to do about it.
+        return entity_id in tracked.lead_entity_ids or _peer_key(kind, entity_id) in tracked.digest_peer_keys
     handles = _all_handles(candidate)
-    if entity_id in tracked.pending_citable_ids:
-        # DELIBERATELY re-examined: it is lead-enrolled but was refused the public
-        # surface only because it had no handle, and a handle is a thing a chat
-        # GAINS. `seen` is permanent, so parking it there would mean "never
-        # reconsidered"; the quarantine bucket is the wrong home (that set means
-        # "enrolled nowhere"), so this is its own re-evaluated bucket. Re-running
-        # it is cheap and idempotent: _register_leads short-circuits on the
-        # digest peer_key it already holds, so the re-check costs one topical
-        # read and no write.
-        return False
+    # ALL handles, not just the primary: a channel already in sources.txt under
+    # an alias would otherwise be added again under its main handle.
     return bool(
-        entity_id in tracked.seen_ids
-        or entity_id in tracked.lead_entity_ids
-        # ALL handles, not just the primary: a channel already in sources.txt
-        # under an alias would otherwise be added again under its main handle.
-        or (handles & tracked.news_handles)
+        (handles & tracked.news_handles)
         or (handles & tracked.chat_entries)
         or str(entity_id) in tracked.chat_entries
     )
+
+
+def outstanding_surfaces(candidate: dict[str, Any], tracked: Tracked) -> set[str]:
+    """THE freshness rule, and the whole point of the 2026-07-31 repair.
+
+    This used to be one global `_already_tracked()` that short-circuited on
+    `entity_id in tracked.lead_entity_ids`. So the instant a peer became a LEAD
+    source it stopped being considered for anything — including the NEWS surface
+    it had never been evaluated for. Live, that left 102 lead-tracked entities
+    permanently unable to reach `sources.txt` / `chat_sources.txt`, including
+    @moneyforstartup_chat (citable, own score 0.48 behind a 1.00 parent). The
+    same bug ran the other way too: a channel in sources.txt was "tracked", so it
+    could never be lead-enrolled.
+
+    Tracking is now PER PIPELINE. A surface is outstanding when the peer is
+    eligible for it, is not on it, and we have not already decided it there.
+
+    Note what is NOT consulted here: the quarantine bucket. A quarantined dialog
+    settles no surface, so it comes back every run and is re-classified against
+    the CURRENT deny rules — which is what makes the deny file's documented
+    behaviour ("delete a line to re-open that dialog") actually true. The
+    citability bucket needs no special case any more either: a peer blocked only
+    on citability simply never settles its news surface.
+    """
+    entity_id = int(candidate.get("entity_id") or 0)
+    return {
+        surface
+        for surface in eligible_surfaces(candidate)
+        if entity_id not in tracked.decided.get(surface, set())
+        and not on_surface(candidate, tracked, surface)
+    }
 
 
 # ── writes ────────────────────────────────────────────────────────
@@ -1329,8 +1489,9 @@ def render_report(report: ScanReport, *, max_chars: int = MAX_REPORT_CHARS) -> s
         )
     if report.still_pending:
         lines.append(
-            f"({len(report.still_pending)} chat(s) still lead-only: no public handle, so they cannot be "
-            "cited in the digest — re-checked every run, promoted automatically if one appears.)"
+            f"({len(report.still_pending)} peer(s) still lead-only for the same reason as last run — no "
+            "citable handle, or no parent that is a news source. Re-checked every run at no read cost, "
+            "promoted automatically the moment that changes.)"
         )
     if report.refused_to_write and not report.dry_run:
         lines += ["", "NOTHING WAS WRITTEN THIS RUN (see ERRORS)."]
@@ -1485,7 +1646,8 @@ def _run_scan_locked(
         int(d["linked_chat_id"]): d for d in dialogs if d.get("linked_chat_id") and d.get("kind") == "channel"
     }
 
-    fresh = [d for d in dialogs if not _already_tracked(d, tracked)]
+    outstanding = {int(d.get("entity_id") or 0): outstanding_surfaces(d, tracked) for d in dialogs}
+    fresh = [d for d in dialogs if outstanding[int(d.get("entity_id") or 0)]]
     report.new_dialogs = [int(d.get("entity_id") or 0) for d in fresh]
 
     # Score ONLY what the gate actually needs, in the order the report shows it:
@@ -1499,16 +1661,34 @@ def _run_scan_locked(
     for candidate in fresh:
         entity_id = int(candidate.get("entity_id") or 0)
         kind = str(candidate.get("kind") or "")
+        if deny_match(deny_rules, candidate) is not None:
+            continue
         if kind == "channel" and (candidate.get("username") or ""):
-            if not (_all_handles(candidate) & OWN_PUBLISHING_CHANNELS) and deny_match(deny_rules, candidate) is None:
+            if not (_all_handles(candidate) & OWN_PUBLISHING_CHANNELS):
                 wanted.append(("channel", entity_id))
         elif kind in {"megagroup", "group"}:
-            if deny_match(deny_rules, candidate) is not None:
-                continue
-            wanted.append(("linked_chat", entity_id))
+            # ONLY reads that can change an outcome. This is the whole answer to
+            # "97 lead-tracked entities against an 80-read budget": most of them
+            # are decided by facts we already hold.
             parent = linked_parents.get(entity_id)
-            if parent is not None and deny_match(deny_rules, parent) is None:
+            if parent is None or deny_match(deny_rules, parent) is not None:
+                continue
+            status = parent_news_status(parent, tracked, deny_rules, topic_score=None)
+            if citable_handle(candidate) is None:
+                # Never a chat_sources candidate, so its own posts decide nothing.
+                # The parent is still worth one read in exactly one case: a
+                # handle-less chat is only enrollable at all if its parent is
+                # verifiable, and an unscored, untracked parent is the one thing
+                # we cannot answer for free.
+                if candidate.get("username") or _parent_tracked(parent, tracked) or status != "unknown":
+                    continue
                 wanted.append(("channel", int(parent.get("entity_id") or 0)))
+                continue
+            if status == "no":
+                continue  # parent is not a news source and we know it for free
+            if status == "unknown":
+                wanted.append(("channel", int(parent.get("entity_id") or 0)))
+            wanted.append(("linked_chat", entity_id))
     topic_scores, topic_errors = collect_topic_scores(wanted, reader=post_reader, rules=topic_rules)
     report.errors.extend(topic_errors)
 
@@ -1527,14 +1707,21 @@ def _run_scan_locked(
     report.requarantined = [
         d.entity_id for d in decisions if d.decision == "quarantine" and d.entity_id in tracked.quarantined_ids
     ]
-    # Same discipline for a chat we already reported as "lead-enrolled, not
-    # citable": say it once, then only as a count, or the nightly scan pages the
-    # operator about the same handle-less chat forever.
+    # Same discipline, now for EVERY peer whose news surface is still open for a
+    # reason we already told the operator about — no citable handle, a parent
+    # that is not a news source, evidence we could not get. Say it once, then
+    # only as a count, or 30+ lead-tracked chats page the operator every night.
+    news_unsettled = {d.entity_id for d in decisions if d.decision != "quarantine" and not d.news_settled}
     report.still_pending = [
-        d.entity_id for d in decisions if d.citability_blocked and d.entity_id in tracked.pending_citable_ids
+        d.entity_id for d in decisions if d.entity_id in news_unsettled and d.entity_id in tracked.news_pending_ids
     ]
     known = set(report.requarantined) | set(report.still_pending)
     report.decisions = [d for d in decisions if d.entity_id not in known]
+    # "new" must mean NEW. A peer whose surface stays open for a reason already
+    # reported (no citable handle, no news-source parent) is a candidate every
+    # run by design — counting it as new would put a permanent non-zero "N new"
+    # in the header of a run that found nothing.
+    report.new_dialogs = [i for i in report.new_dialogs if i not in known]
 
     stamp = datetime.now(timezone.utc).date().isoformat()
     lead_items = [d for d in decisions if d.decision in {"enroll-leads", "enroll-both"}]
@@ -1555,12 +1742,17 @@ def _run_scan_locked(
         report.ledger_notes.extend(enrolment.notes)
 
         # 2. VISIBLE half — only for items whose durable half completed.
+        # The dedup is over ALL of the peer's handles, not just the primary one:
+        # a channel listed in sources.txt under an alias is now a legitimate
+        # LEADS candidate (per-surface tracking), so it reaches this list, and
+        # matching on the primary handle alone would append it a second time.
+        handles_of = {int(d.get("entity_id") or 0): _all_handles(d) for d in dialogs}
         news_lines = [
             f"https://t.me/{d.username}"
             for d in decisions
             if d.news_target == "sources"
             and d.username
-            and d.username.lower() not in tracked.news_handles
+            and not (handles_of.get(d.entity_id, set()) & tracked.news_handles)
             and d.entity_id in enrolment.ok_ids
         ]
         # No bare-id branch any more: `news_target == "chat_sources"` now IMPLIES a
@@ -1572,6 +1764,7 @@ def _run_scan_locked(
             if d.news_target == "chat_sources"
             and d.entity_id in enrolment.ok_ids
             and chat_source_key(d.username, d.entity_id) not in tracked.chat_entries
+            and not (handles_of.get(d.entity_id, set()) & tracked.chat_entries)
         ]
         news_written = False
         if news_lines:
@@ -1605,24 +1798,40 @@ def _run_scan_locked(
             else:
                 report.added_chat = chat_lines
 
-        # 3. STATE last, and only for ids whose whole handling completed. An id
-        #    that failed anywhere stays OUT of `seen`, so the next run retries it
-        #    instead of hiding it forever.
-        incomplete = {d.entity_id for d in lead_items if d.entity_id not in enrolment.ok_ids}
-        if news_lines and not news_written:
-            incomplete |= {d.entity_id for d in decisions if d.news_target == "sources"}
+        # 3. STATE last, PER SURFACE, and only for the surfaces whose handling
+        #    actually completed. This is the half that used to be global: `seen`
+        #    was filled from EVERY dialog id, so an entity the old filter dropped
+        #    before classification was marked done for a pipeline that had never
+        #    looked at it. Now a surface is recorded only when this run settled
+        #    it; anything else comes back tomorrow.
         quarantined = {d.entity_id for d in decisions if d.decision == "quarantine"}
-        # Blocked ONLY on citability => its own re-evaluated bucket, never `seen`.
-        pending = {d.entity_id for d in decisions if d.citability_blocked}
         all_ids = {int(d.get("entity_id") or 0) for d in dialogs}
-        seen = (tracked.seen_ids | all_ids) - incomplete - quarantined - pending
-        # Quarantined ids live in their OWN set, never in `seen`: that is what
-        # lets a removed deny rule genuinely re-open a dialog. Ids missing from
-        # today's dialog list keep their remembered quarantine.
+        # LEADS settles when the durable half landed (or there was nothing to do).
+        leads_settled = {d.entity_id for d in decisions if d.decision == "skip"} | enrolment.ok_ids
+        # NEWS settles only on evidence — and only if the visible write that the
+        # verdict implied actually happened.
+        news_settled = {d.entity_id for d in decisions if d.news_settled}
+        if news_lines and not news_written:
+            news_settled -= {d.entity_id for d in decisions if d.news_target == "sources"}
+        if chat_lines and not report.added_chat:
+            news_settled -= {d.entity_id for d in decisions if d.news_target == "chat_sources"}
+        # A durable-half failure must not settle the news line we never wrote.
+        news_settled -= {d.entity_id for d in lead_items if d.entity_id not in enrolment.ok_ids and d.news_target}
+        # Quarantined ids settle NOTHING: that is what lets a removed deny rule
+        # genuinely re-open a dialog. Ids missing from today's dialog list keep
+        # their remembered quarantine.
+        decided = {
+            SURFACE_LEADS: (tracked.decided[SURFACE_LEADS] | leads_settled) - quarantined,
+            SURFACE_NEWS: (tracked.decided[SURFACE_NEWS] | news_settled) - quarantined,
+        }
         state_quarantined = quarantined | (tracked.quarantined_ids - all_ids)
-        # A pending chat that GAINED a handle is in all_ids and no longer
-        # citability-blocked, so it drops out of the bucket and lands in `seen`.
-        state_pending = pending | (tracked.pending_citable_ids - all_ids)
+        # Everything classified whose news surface is STILL open: reported once,
+        # then as a count. A chat that gained a handle settles and drops out.
+        state_pending = {
+            d.entity_id
+            for d in decisions
+            if d.decision != "quarantine" and d.entity_id not in decided[SURFACE_NEWS]
+        } | (tracked.news_pending_ids - all_ids)
         try:
             paths.state.parent.mkdir(parents=True, exist_ok=True)
             paths.state.write_text(
@@ -1630,9 +1839,9 @@ def _run_scan_locked(
                     {
                         "version": _STATE_VERSION,
                         "updated": stamp,
-                        "seen": sorted(seen),
+                        "decided": {s: sorted(decided[s]) for s in SURFACES},
                         "quarantined": sorted(state_quarantined),
-                        "pending_citable": sorted(state_pending),
+                        "news_pending": sorted(state_pending),
                     },
                     ensure_ascii=False,
                 )

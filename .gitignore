@@ -23,3 +23,4 @@ whisper.cpp/
 .omx/
 third_party/
 cli-proxy-api.service
+venv

@@ -113,7 +113,12 @@ def _cmd_scan(args: argparse.Namespace) -> int:
                 "added_leads": report.added_leads,
                 "mirror_pending": report.mirror_pending,
                 "requarantined": len(report.requarantined),
+                "still_pending": len(report.still_pending),
+                # Two DIFFERENT facts, and the old single field reported the
+                # second one under the first one's name: a --dry-run that wrote
+                # nothing said `wrote_nothing: false` because it had not refused.
                 "wrote_nothing": report.wrote_nothing,
+                "refused_to_write": report.refused_to_write,
                 "skipped_locked": report.skipped_locked,
                 "errors": report.errors,
                 "notified": report.notified,

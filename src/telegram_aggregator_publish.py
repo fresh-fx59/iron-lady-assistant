@@ -39,6 +39,12 @@ from .telegram_aggregator_gates import Story
 logger = logging.getLogger(__name__)
 
 _MESSAGE_CAP = 4000  # under the 4096 Bot API ceiling; split at story boundaries
+
+# The operator-alert ceiling, exported so a caller that RENDERS to a budget and
+# this module that SLICES to one can never drift apart (2026-07-31: the scanner
+# budgeted to its own 4000 and this sliced at a literal 4000 — the same number by
+# luck, which is exactly how a truncation marker ends up cut in half).
+OPERATOR_ALERT_CAP = 4000
 _CAPTION_CAP = 1024  # Telegram sendPhoto caption ceiling (degrade path only)
 _RICH_CAP = 32768  # Bot API 10.2 rich-message text ceiling (chars)
 _RICH_MEDIA_ID = "hero"  # InputRichMessageMedia.id <-> tg://photo?id= <-> attach://
@@ -309,7 +315,7 @@ def _read_media(path: str) -> bytes:
 
 
 class Transport(Protocol):
-    def send_message(self, chat: str, text: str) -> int: ...
+    def send_message(self, chat: str, text: str, *, parse_mode: str | None = "HTML") -> int: ...
     def send_photo(self, chat: str, photo_path: str, caption: str) -> int: ...
     def send_rich_message(self, chat: str, rich_html: str, photo_path: str) -> int: ...
 
@@ -320,13 +326,21 @@ class BotApiTransport:
     def __init__(self, token: str) -> None:
         self._token = token.strip()
 
-    def send_message(self, chat: str, text: str) -> int:
+    def send_message(self, chat: str, text: str, *, parse_mode: str | None = "HTML") -> int:
+        """`parse_mode=None` omits the field entirely => Telegram sends the body
+        VERBATIM. The digest's own posts are HTML and keep the default; anything
+        that is plain text must say so, because HTML mode rejects the WHOLE
+        message on the first bare `<` (prod 2026-07-31: a dialog-scan report
+        containing "scores 0.19 < 0.35" 400'd and reached nobody). Escaping the
+        report instead would mangle the operator's numbers and only move the
+        cliff to the next unescaped character."""
         payload = {
             "chat_id": chat,
             "text": text,
-            "parse_mode": "HTML",
             "disable_web_page_preview": True,
         }
+        if parse_mode:
+            payload["parse_mode"] = parse_mode
         for attempt in (1, 2):
             data = urllib.parse.urlencode(payload).encode()
             request = urllib.request.Request(
@@ -827,7 +841,12 @@ def notify_operator(text: str) -> bool:
     if not token or not chat_id:
         return False
     try:
-        BotApiTransport(token).send_message(chat_id, text[:4000])
+        # PLAIN TEXT, always: every caller of this function builds its message in
+        # plain code (Russian sentences, scanner reports, exception strings) and
+        # none of them emits HTML. Sending them as HTML is a latent 400 on the
+        # first `<`, `&` or stray tag-like token — i.e. exactly on the alerts that
+        # carry the most detail.
+        BotApiTransport(token).send_message(chat_id, text[:OPERATOR_ALERT_CAP], parse_mode=None)
         return True
     except Exception as exc:  # noqa: BLE001 — notification must never kill the pipeline
         logger.warning("aggregator notify failed: %s", exc)

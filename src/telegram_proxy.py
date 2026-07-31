@@ -6,6 +6,7 @@ import json
 import logging
 import os
 import random
+import re
 import sqlite3
 import time
 from dataclasses import asdict, dataclass
@@ -16,7 +17,7 @@ from typing import Any
 from aiohttp import web
 
 from . import config
-from .telegram_digest import TelegramDigestStore
+from .telegram_digest import LEAD_SOURCE_ROLE, TelegramDigestStore, _peer_key
 from .telegram_proxy_crypto import (
     TelegramProxyCredentials,
     decrypt_credentials,
@@ -205,6 +206,41 @@ class JoinStore:
             )
 
     # ── queue mutations ───────────────────────────────────────────
+    def all_targets(self) -> list[str]:
+        """Every joins-table target key, whatever its status.
+
+        The dialog scanner treats ANY row as "this dialog is already accounted
+        for" — a pending `request_sent` included, because re-enqueueing it is
+        exactly the duplicate the joins PK exists to prevent.
+        """
+        with self._connect() as con:
+            return [str(row[0]) for row in con.execute("SELECT target FROM joins").fetchall()]
+
+    def record_existing_membership(self, target: str, kind: str, entity_id: int | None) -> bool:
+        """INSERT OR IGNORE a status='joined' row for a dialog we are ALREADY in.
+
+        Two properties this method exists to guarantee, both load-bearing for the
+        dialog scanner (see src/telegram_dialog_scan.py):
+          * INSERT OR IGNORE — an EXISTING row is never touched. A genuine
+            outstanding `request_sent` must not be duplicated (the joins PK is
+            `target`, so a second row under a different spelling dangles the real
+            one) nor overwritten into `joined`.
+          * status='joined' is both TRUE and INERT: the paced join loop only ever
+            selects pending/floodwait rows, so this can never cause a network
+            join. Returns True only when a new row was actually created.
+        """
+        now = _isoformat(_utc_now())
+        with self._connect() as con:
+            cur = con.execute(
+                """
+                INSERT OR IGNORE INTO joins(target, kind, status, entity_id,
+                                            created_at, updated_at, joined_at)
+                VALUES (?, ?, 'joined', ?, ?, ?, ?)
+                """,
+                (target, kind, entity_id, now, now, now),
+            )
+            return cur.rowcount == 1
+
     def upsert_pending(self, target: str, kind: str) -> bool:
         """Insert a pending row; leave an existing row untouched. Idempotent.
 
@@ -488,6 +524,75 @@ class ProxyChannelRecord:
     linked_chat_id: int | None
     linked_chat_title: str | None
     linked_chat_username: str | None
+
+
+# `user`/`bot` dialogs are never returned by /v1/dialogs: see list_dialogs.
+_PRIVATE_DIALOG_KINDS = frozenset({"user", "bot"})
+# GetFullChannel sweep budget for ONE list_dialogs call. The account holds ~60
+# broadcast channels today; the bound exists so growth cannot silently turn a
+# daily job into a ban-sensitive 200-request burst.
+_LINKED_LOOKUP_MAX = 80
+_LINKED_LOOKUP_PACING_SECONDS = 0.4
+
+
+@dataclass
+class ProxyDialogRecord:
+    """Mutable: the linked-chat sweep is a SECOND phase that fills two fields in."""
+
+    entity_id: int
+    title: str
+    kind: str  # channel | megagroup | group  (never user / bot — see list_dialogs)
+    username: str | None
+    usernames: list[str]
+    is_broadcast: bool
+    is_megagroup: bool
+    participants_count: int | None
+    linked_chat_id: int | None
+    # ok | pending | skipped … | failed (…) | floodwait …s — a caller must be able
+    # to tell "no discussion chat" from "we could not find out".
+    linked_chat_lookup: str = "ok"
+    # Internal only: the Telethon entity, so phase 2 needs no re-resolve. Never
+    # serialised (the route strips underscore fields; it is None by then anyway).
+    _entity: Any = None
+
+
+def _dialog_usernames(entity: Any) -> list[str]:
+    """Every ACTIVE public handle on an entity, primary first.
+
+    Telegram now allows several handles per peer: the extras live in
+    `entity.usernames` (Username objects with .username/.active) while the
+    legacy `entity.username` can be EMPTY even though the peer is public
+    (@oestick, 12 925 subs, resolves to nothing if you only read the legacy
+    field). Read both, defensively — items may be plain strings.
+    """
+    out: list[str] = []
+    seen: set[str] = set()
+
+    def _add(name: str) -> None:
+        cleaned = name.strip().lstrip("@")
+        if cleaned and cleaned.lower() not in seen:
+            seen.add(cleaned.lower())
+            out.append(cleaned)
+
+    _add(str(getattr(entity, "username", None) or ""))
+    for item in getattr(entity, "usernames", None) or []:
+        if getattr(item, "active", True) is False:
+            continue
+        _add(str(item if isinstance(item, str) else (getattr(item, "username", None) or "")))
+    return out
+
+
+def _dialog_kind(entity: Any) -> str:
+    """Peer shape, duck-typed so a forbidden/partial entity still classifies."""
+    if getattr(entity, "broadcast", False):
+        return "channel"
+    if getattr(entity, "megagroup", False):
+        return "megagroup"
+    if getattr(entity, "title", None) is not None:
+        return "group"  # legacy Chat, gigagroup, or a Channel with neither flag
+    if getattr(entity, "bot", False):
+        return "bot"
+    return "user"  # includes self / Saved Messages
 
 
 def _json_safe(value: Any) -> Any:
@@ -794,6 +899,102 @@ class TelegramProxy:
                 )
             return records
 
+    async def list_dialogs(self, *, limit: int, with_linked: bool = False) -> list[ProxyDialogRecord]:
+        """READ-ONLY enumeration of every GROUP/CHANNEL dialog the account is in.
+
+        `list_channels` filters to broadcast=True, so a hand-joined group is
+        invisible to every audit that goes through it. This is the view that also
+        shows groups. It never joins, leaves, sends, or mutates anything.
+
+        `user`/`bot` dialogs are dropped HERE, server-side: returning the title,
+        handle and participant count of every DM — the account's entire contact
+        list — to any holder of the proxy token is a leak `list_channels` never
+        had, and no consumer has any use for them beyond refusing them.
+
+        The optional `with_linked` round trip (GetFullChannel per broadcast
+        channel) is a heavy, ban-sensitive sweep, so it runs in a SECOND phase:
+        outside the enumeration lock, one channel at a time, PACED and BOUNDED,
+        re-taking the lock per call so other proxy consumers can interleave. Each
+        record carries `linked_chat_lookup` (ok | skipped | failed | floodwait…)
+        so a caller can tell a real "no discussion chat" from a degraded answer.
+        """
+        client = self._require_client()
+        records: list[ProxyDialogRecord] = []
+        async with self._lock:
+            async for dialog in client.iter_dialogs(limit=limit):
+                entity = getattr(dialog, "entity", None)
+                if entity is None:
+                    continue
+                kind = _dialog_kind(entity)
+                if kind in _PRIVATE_DIALOG_KINDS:
+                    continue
+                entity_id = int(getattr(entity, "id", 0) or 0)
+                handles = _dialog_usernames(entity)
+                count = getattr(entity, "participants_count", None)
+                records.append(
+                    ProxyDialogRecord(
+                        entity_id=entity_id,
+                        title=(
+                            str(getattr(entity, "title", None) or getattr(dialog, "name", None) or "").strip()
+                            or f"dialog:{entity_id}"
+                        ),
+                        kind=kind,
+                        username=handles[0] if handles else None,
+                        usernames=handles,
+                        is_broadcast=bool(getattr(entity, "broadcast", False)),
+                        is_megagroup=bool(getattr(entity, "megagroup", False)),
+                        participants_count=int(count) if isinstance(count, int) else None,
+                        linked_chat_id=None,
+                        linked_chat_lookup="ok" if not with_linked else "pending",
+                        _entity=entity,
+                    )
+                )
+        if with_linked:
+            await self._resolve_linked_chats(client, records)
+        for record in records:
+            record._entity = None  # never serialise the Telethon entity
+        return records
+
+    async def _resolve_linked_chats(self, client: Any, records: list[ProxyDialogRecord]) -> None:
+        """Phase 2 of list_dialogs: paced, bounded GetFullChannel sweep.
+
+        Unlike `list_channels` (bootstrap-only) this route now runs DAILY, and the
+        module's own comment calls a full sweep "heavy, ban-sensitive". So: at
+        most `_LINKED_LOOKUP_MAX` lookups per call, `_LINKED_LOOKUP_PACING_SECONDS`
+        apart, and the lock is released between them. A FloodWaitError stops the
+        sweep immediately (retrying inside one is how an account gets limited) and
+        every remaining record is marked degraded rather than silently reported as
+        "no linked chat" — that silent None made a discussion chat classify as
+        `enroll-leads`/`skip` instead of `enroll-both` with nothing recorded.
+        """
+        from telethon.errors import FloodWaitError
+
+        targets = [r for r in records if r.kind == "channel" and r._entity is not None]
+        stop_reason: str | None = None
+        for index, record in enumerate(targets):
+            if stop_reason is not None:
+                record.linked_chat_lookup = stop_reason
+                continue
+            if index >= _LINKED_LOOKUP_MAX:
+                record.linked_chat_lookup = f"skipped (bounded at {_LINKED_LOOKUP_MAX} lookups/call)"
+                continue
+            if index:
+                await asyncio.sleep(_LINKED_LOOKUP_PACING_SECONDS)
+            try:
+                async with self._lock:
+                    full = await client(self._get_full_channel_request(record._entity))
+                linked_chat_id = getattr(full.full_chat, "linked_chat_id", None)
+                record.linked_chat_id = int(linked_chat_id) if linked_chat_id else None
+                record.linked_chat_lookup = "ok"
+            except FloodWaitError as exc:
+                seconds = int(getattr(exc, "seconds", 0) or 0)
+                stop_reason = f"floodwait {seconds}s — sweep stopped"
+                record.linked_chat_lookup = stop_reason
+                logger.warning("list_dialogs linked-chat sweep hit FloodWait %ss; stopping", seconds)
+            except Exception as exc:  # noqa: BLE001 — per-channel isolation
+                record.linked_chat_lookup = f"failed ({type(exc).__name__})"
+                logger.debug("no linked chat for dialog=%s", record.entity_id, exc_info=True)
+
     async def read_messages(
         self,
         *,
@@ -967,6 +1168,90 @@ class TelegramProxy:
         if self._digest_store is None:
             self._digest_store = TelegramDigestStore()
         return self._digest_store
+
+    # Everything this route may write, in one place. `role` is NOT a parameter:
+    # a lead enrolment can only ever ADD the lead role.
+    ENROLLABLE_KINDS = ("channel", "linked_chat")
+
+    def enrol_lead_source(
+        self, *, entity_id: int, kind: str, title: str, username: str | None
+    ) -> dict[str, Any]:
+        """Add ONE dialog to the lead-source set. The narrowest write we can offer.
+
+        Exists because the daily dialog scanner runs as `claude-developer` while
+        /var/lib/iron-lady is `drwx------ iron-lady:iron-lady` — it cannot open
+        the join/digest dbs at all. This proxy already runs as the owning user and
+        already authenticates, which is how every other claude-developer-side job
+        in this fleet reaches iron-lady state (telegram-lead-scorer reads
+        /v1/lead-candidates the same way).
+
+        What it CANNOT do, deliberately:
+          * it cannot join anything or change join state — the only joins write is
+            `record_existing_membership`, an INSERT OR IGNORE of an INERT
+            status='joined' row for a dialog the account is already in; an
+            outstanding `request_sent` is left exactly as it is;
+          * it cannot write an arbitrary source row — `role` is hard-coded to the
+            lead role and `linked_channel_key` to None, neither is read from the
+            request, and `add_source_role` never rewrites an existing row (so a
+            lead enrolment can never evict a chat from the digest: the role column
+            is a SET and only ever grows);
+          * it cannot address anything but a `channel` / `linked_chat` peer id.
+
+        Idempotent by construction, which is what lets a caller whose request
+        TIMED OUT re-attempt on its next run without risking a double write.
+        """
+        peer_key = _peer_key(kind, entity_id)
+        join_note: str | None = None
+        join_row_created = False
+        if kind == "linked_chat":
+            # normalize_target() is the joins-table key convention, not a display
+            # string: it lowercases, strips the @/t.me wrapper and returns the
+            # `public`/`private` kind the proxy itself emits. A handle-less chat
+            # reuses the proxy's own linked-chat convention: kind='linked',
+            # target='id:<n>'.
+            join_kind, target = normalize_target(username) if username else ("linked", f"id:{entity_id}")
+            join_row_created = self._get_join_store().record_existing_membership(
+                target, join_kind, entity_id
+            )
+            if not join_row_created:
+                join_note = f"joins ledger already owns target {target!r} — its row was left untouched"
+        created = self._get_digest_store().add_source_role(
+            peer_key=peer_key,
+            entity_id=entity_id,
+            title=title,
+            username=username,
+            kind=kind,
+            linked_channel_key=None,
+            role=LEAD_SOURCE_ROLE,
+        )
+        return {
+            "peer_key": peer_key,
+            "created": created,
+            "join_row_created": join_row_created,
+            "join_note": join_note,
+        }
+
+    def tracked_sources(self) -> dict[str, Any]:
+        """READ-ONLY twin of enrol_lead_source: what the pipelines ALREADY track.
+
+        The scanner used to open the two ledgers itself. It cannot — /var/lib/
+        iron-lady is 0700 iron-lady — so once the WRITE moved here the READ had to
+        follow, or the scanner decides "is this already enrolled?" against an
+        empty set and re-proposes everything (2026-07-31: 65 "new" of 116 where
+        18 were genuinely new).
+
+        Returns exactly the two ledger projections that decision needs — the
+        digest_sources (peer_key, entity_id, role) rows and the joins targets —
+        and nothing else: no titles, no message text, no join status. Writes
+        nothing, and can start no Telegram work.
+        """
+        sources = self._get_digest_store().source_roles()
+        joins = self._get_join_store().all_targets()
+        return {
+            "digest_sources": sources,
+            "joins": joins,
+            "counts": {"digest_sources": len(sources), "joins": len(joins)},
+        }
 
     def lead_candidates(
         self, *, since_id: int, limit: int, since_ts: str | None = None
@@ -1690,6 +1975,36 @@ async def _list_channels(request: web.Request) -> web.Response:
     return web.json_response({"channels": [asdict(record) for record in records]})
 
 
+async def _list_dialogs(request: web.Request) -> web.Response:
+    """Read-only: group/channel dialogs, including the ones /v1/channels filters out.
+
+    DMs and bot chats are never included (see TelegramProxy.list_dialogs). The
+    clamp matches the /v1/channels neighbour — 500 max, 200 default — because the
+    same iter_dialogs sweep backs both and there is no consumer that needs more.
+    """
+    _check_auth(request)
+    proxy: TelegramProxy = request.app["proxy"]
+    try:
+        limit = max(1, min(500, int(request.query.get("limit", "200"))))
+    except ValueError:
+        raise web.HTTPBadRequest(text="limit must be an integer.") from None
+    with_linked = request.query.get("with_linked", "0").strip().lower() in {"1", "true", "yes", "on"}
+    try:
+        records = await proxy.list_dialogs(limit=limit, with_linked=with_linked)
+    except web.HTTPException:
+        raise
+    except Exception as exc:
+        raise web.HTTPBadGateway(text=f"List dialogs failed: {exc}") from exc
+    return web.json_response(
+        {
+            "dialogs": [
+                {key: value for key, value in asdict(record).items() if not key.startswith("_")}
+                for record in records
+            ]
+        }
+    )
+
+
 async def _read_messages(request: web.Request) -> web.Response:
     _check_auth(request)
     proxy: TelegramProxy = request.app["proxy"]
@@ -1770,6 +2085,83 @@ async def _lead_user(request: web.Request) -> web.Response:
     return web.json_response(await proxy.resolve_sender(sender_id))
 
 
+_ENROL_USERNAME_RE = re.compile(r"^[A-Za-z0-9_]{3,32}$")
+_ENROL_MAX_TITLE_CHARS = 256
+
+
+async def _enrol_lead_source(request: web.Request) -> web.Response:
+    """POST /v1/sources/lead-enrol — add ONE dialog to the lead-source set.
+
+    Every field is validated here and NOTHING else is read from the body: a
+    `role`, a `status`, a `linked_channel_key` or a `target` in the payload is
+    ignored, so the route cannot be talked into writing an arbitrary source row,
+    triggering a join, or altering join-request state. See
+    TelegramProxy.enrol_lead_source for the full contract.
+    """
+    _check_auth(request)
+    proxy: TelegramProxy = request.app["proxy"]
+    try:
+        payload = await request.json()
+    except Exception:
+        raise web.HTTPBadRequest(text="Invalid JSON body.") from None
+    if not isinstance(payload, dict):
+        raise web.HTTPBadRequest(text="Body must be a JSON object.")
+
+    raw_id = payload.get("entity_id")
+    if isinstance(raw_id, bool) or not isinstance(raw_id, (int, str)):
+        raise web.HTTPBadRequest(text="`entity_id` must be a positive integer.")
+    try:
+        entity_id = int(raw_id)
+    except (TypeError, ValueError):
+        raise web.HTTPBadRequest(text="`entity_id` must be a positive integer.") from None
+    if entity_id <= 0:
+        raise web.HTTPBadRequest(text="`entity_id` must be a positive integer.")
+
+    kind = str(payload.get("kind") or "").strip()
+    if kind not in TelegramProxy.ENROLLABLE_KINDS:
+        raise web.HTTPBadRequest(
+            text=f"`kind` must be one of {list(TelegramProxy.ENROLLABLE_KINDS)}."
+        )
+
+    username = payload.get("username")
+    if username is not None:
+        username = parse_public_username(str(username))
+        if not _ENROL_USERNAME_RE.match(username):
+            raise web.HTTPBadRequest(text="`username` must be a Telegram handle (3-32 [A-Za-z0-9_]).")
+        username = username or None
+
+    title = str(payload.get("title") or "").strip()[:_ENROL_MAX_TITLE_CHARS] or f"{kind}:{entity_id}"
+
+    try:
+        result = proxy.enrol_lead_source(
+            entity_id=entity_id, kind=kind, title=title, username=username
+        )
+    except web.HTTPException:
+        raise
+    except Exception as exc:
+        raise web.HTTPBadGateway(text=f"Lead-source enrolment failed: {exc}") from exc
+    return web.json_response({"ok": True, **result})
+
+
+async def _tracked_sources(request: web.Request) -> web.Response:
+    """GET /v1/sources/tracked — read-only twin of POST /v1/sources/lead-enrol.
+
+    Same auth, same error convention (an unexpected store failure is a 502, never
+    a 200 with an empty list — downstream an empty answer means "nothing is
+    tracked", which is precisely the mistake this route exists to stop). Takes no
+    parameters, so there is nothing to validate and nothing to widen: the caller
+    cannot ask for anything but the whole enrolment-dedup view.
+    """
+    _check_auth(request)
+    proxy: TelegramProxy = request.app["proxy"]
+    try:
+        return web.json_response(proxy.tracked_sources())
+    except web.HTTPException:
+        raise
+    except Exception as exc:
+        raise web.HTTPBadGateway(text=f"Tracked-source read failed: {exc}") from exc
+
+
 async def _join_enqueue(request: web.Request) -> web.Response:
     _check_auth(request)
     proxy: TelegramProxy = request.app["proxy"]
@@ -1842,10 +2234,13 @@ def create_app() -> web.Application:
     app = web.Application()
     app.router.add_get("/health", _health)
     app.router.add_get("/v1/channels", _list_channels)
+    app.router.add_get("/v1/dialogs", _list_dialogs)
     app.router.add_get("/v1/messages/{kind}/{entity_id}", _read_messages)
     app.router.add_get("/v1/leads/candidates", _leads_candidates)
     app.router.add_get("/v1/users/{sender_id}", _lead_user)
     app.router.add_post("/v1/telegram/createGroup", _create_group)
+    app.router.add_post("/v1/sources/lead-enrol", _enrol_lead_source)
+    app.router.add_get("/v1/sources/tracked", _tracked_sources)
     app.router.add_post("/v1/join/enqueue", _join_enqueue)
     app.router.add_post("/v1/join/sync-linked", _join_sync_linked)
     app.router.add_get("/v1/join/status", _join_status)

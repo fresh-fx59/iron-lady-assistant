@@ -23,6 +23,37 @@ DEFAULT_SOURCE_ROLE = "digest"
 LEAD_SOURCE_ROLE = "lead"
 
 
+def parse_roles(raw: str | None) -> set[str]:
+    """``digest_sources.role`` is a SET, stored as a sorted comma-joined string.
+
+    One peer legitimately serves several pipelines at once: a news channel's
+    discussion chat is a digest source (context for the briefing) AND a lead
+    source (people asking for services), and a broadcast channel can be both an
+    ``aggregator`` source and a ``lead`` source under the very same
+    ``channel:<id>`` peer_key. A single-valued column made those mutually
+    exclusive, so whichever writer ran last silently EVICTED the other pipeline's
+    source (the 2026-07-30 role-flip: ``sync_joined_sources`` re-tagged every
+    joined row ``lead`` on each lead collect and dropped those chats out of the
+    digest). Legacy single-value rows (``'digest'``) parse as one-element sets, so
+    no migration is needed.
+    """
+    return {part.strip() for part in str(raw or "").split(",") if part.strip()}
+
+
+def format_roles(roles: Iterable[str]) -> str:
+    canonical = sorted({str(r).strip() for r in roles if str(r).strip()})
+    return ",".join(canonical) or DEFAULT_SOURCE_ROLE
+
+
+def _role_union(existing: str | None, incoming: str | None) -> str:
+    return format_roles(parse_roles(existing) | parse_roles(incoming))
+
+
+def _role_match_sql(column: str) -> str:
+    """SQL predicate: does the role SET in `column` contain the bound role?"""
+    return f"(',' || {column} || ',') LIKE ('%,' || ? || ',%')"
+
+
 @dataclass(frozen=True)
 class SourceRecord:
     peer_key: str
@@ -104,6 +135,9 @@ class TelegramDigestStore:
         # re-issuing it is a no-op).
         con.execute("PRAGMA busy_timeout=5000")
         con.execute("PRAGMA journal_mode=WAL")
+        # role is a SET (see parse_roles): the upsert UNIONS instead of replacing,
+        # so no writer can evict another pipeline's role for a shared peer.
+        con.create_function("role_union", 2, _role_union)
         return con
 
     def _init_db(self) -> None:
@@ -214,11 +248,73 @@ class TelegramDigestStore:
                     username = excluded.username,
                     kind = excluded.kind,
                     linked_channel_key = excluded.linked_channel_key,
-                    role = excluded.role,
+                    role = role_union(digest_sources.role, excluded.role),
                     updated_at = excluded.updated_at
                 """,
-                (peer_key, entity_id, title, username, kind, linked_channel_key, role, now, now),
+                (peer_key, entity_id, title, username, kind, linked_channel_key,
+                 format_roles(parse_roles(role)), now, now),
             )
+
+    def add_source_role(
+        self,
+        *,
+        peer_key: str,
+        entity_id: int,
+        title: str,
+        username: str | None,
+        kind: str,
+        linked_channel_key: str | None,
+        role: str,
+    ) -> bool:
+        """Ensure the row exists and CARRIES ``role``; never rewrite an existing row.
+
+        The descriptive fields (title/username/kind/linked_channel_key) belong to
+        whichever writer created the row — a periodic re-sync must not clobber a
+        real channel title with a join-queue target string, nor null out a
+        username. Only the role set grows. Returns True when a new row was created.
+        """
+        now = _isoformat(_utc_now())
+        wanted = format_roles(parse_roles(role))
+        with self._connect() as con:
+            existing = con.execute(
+                "SELECT role FROM digest_sources WHERE peer_key = ?", (peer_key,)
+            ).fetchone()
+            if existing is None:
+                con.execute(
+                    """
+                    INSERT INTO digest_sources(peer_key, entity_id, title, username, kind,
+                                               linked_channel_key, role, created_at, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (peer_key, entity_id, title, username, kind, linked_channel_key, wanted, now, now),
+                )
+                return True
+            merged = _role_union(existing["role"], wanted)
+            if merged != str(existing["role"] or ""):
+                con.execute(
+                    "UPDATE digest_sources SET role = ?, updated_at = ? WHERE peer_key = ?",
+                    (merged, now, peer_key),
+                )
+        return False
+
+    def source_roles(self) -> list[dict[str, Any]]:
+        """The enrolment-dedup VIEW of digest_sources: peer_key, entity_id, role.
+
+        Deliberately narrower than the table. It exists for the daily dialog
+        scanner, which cannot open this db at all (0700 iron-lady) and asks the
+        proxy instead — see GET /v1/sources/tracked. Titles, usernames and link
+        columns are none of that decision's business, so they are not returned.
+        """
+        with self._connect() as con:
+            rows = con.execute("SELECT peer_key, entity_id, role FROM digest_sources").fetchall()
+        return [
+            {
+                "peer_key": str(row["peer_key"]),
+                "entity_id": int(row["entity_id"]),
+                "role": str(row["role"] or ""),
+            }
+            for row in rows
+        ]
 
     def last_message_id(self, peer_key: str) -> int:
         with self._connect() as con:
@@ -327,7 +423,7 @@ class TelegramDigestStore:
         """
         since_id = max(0, int(since_id))
         limit = max(1, min(2000, int(limit)))
-        where = "s.role = ? AND m.sender_id IS NOT NULL AND m.rowid > ?"
+        where = f"{_role_match_sql('s.role')} AND m.sender_id IS NOT NULL AND m.rowid > ?"
         params: list[Any] = [LEAD_SOURCE_ROLE, since_id]
         if since_ts:
             where += " AND m.posted_at >= ?"
@@ -427,8 +523,8 @@ class TelegramDigestStore:
         )
         params: tuple[Any, ...] = ()
         if roles:
-            placeholders = ", ".join("?" for _ in roles)
-            query += f" WHERE role IN ({placeholders})"
+            predicate = " OR ".join(_role_match_sql("role") for _ in roles)
+            query += f" WHERE ({predicate})"
             params = tuple(roles)
         query += " ORDER BY kind, title"
         with self._connect() as con:
@@ -471,7 +567,7 @@ class TelegramDigestStore:
                        MAX(m.posted_at) AS latest_posted_at
                 FROM digest_sources s
                 JOIN digest_messages m ON m.peer_key = s.peer_key
-                WHERE m.posted_at >= ? AND s.role = ?
+                WHERE m.posted_at >= ? AND (',' || s.role || ',') LIKE ('%,' || ? || ',%')
                 GROUP BY s.peer_key, s.title, s.username, s.kind, s.linked_channel_key
                 ORDER BY latest_posted_at DESC
                 LIMIT ?
@@ -566,7 +662,11 @@ def sync_joined_sources(
     for row in rows:
         entity_id = int(row["entity_id"])
         title = str(row["target"] or f"lead:{entity_id}").strip() or f"lead:{entity_id}"
-        store.upsert_source(
+        # add_source_role, NOT upsert_source: this sweep runs on EVERY lead collect
+        # over every joined row. upsert_source would rewrite title/username/kind of
+        # a row another pipeline created (and, before the role set, evict its role) —
+        # the 2026-07-30 role-flip that dropped discussion chats out of the digest.
+        store.add_source_role(
             peer_key=_peer_key("linked_chat", entity_id),
             entity_id=entity_id,
             title=title,

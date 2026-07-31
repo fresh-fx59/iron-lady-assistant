@@ -1,0 +1,61 @@
+# dialog-scan deny list — ONE file, edit it to extend.
+#
+# THIS in-repo copy is only the SEED. The file the scanner actually reads is the
+# operator-editable copy in the aggregator state dir, beside sources.txt:
+#   /home/claude-developer/telegram-aggregator/dialog_scan_deny.txt
+# (env DIALOG_SCAN_DENY_PATH). Edit THAT one. This checkout is `git checkout
+# --force`-ed by the aggregator draft runner, so an edit made here is discarded.
+# The unit copies this file into place if the state-dir copy is missing, and
+# mirrors the live copy into the vault after every run.
+#
+# The daily scanner (src/telegram_dialog_scan.py) QUARANTINES any new dialog that
+# matches a rule here: it is reported to the operator but never enrolled into the
+# news digest or the lead pipeline. Deleting a line REALLY DOES re-open that
+# dialog: quarantined ids are tracked separately from enrolled ones and are
+# re-evaluated against the current rules on every run. (Before 2026-07-30 they
+# were written into the `seen` set and could never be re-evaluated — the file
+# documented a behaviour it did not have.) A quarantine is reported the first
+# time it fires and then only as a count, so it never pages nightly.
+#
+# Rule forms (one per line, `#` comments and blanks ignored):
+#   @handle             deny by username (with or without the @)
+#   handle              same thing
+#   https://t.me/handle same thing — the form sources.txt itself uses
+#   id:-1001609072825   deny by entity id; the marked (-100…) form your Telegram
+#   id:1609072825       client shows and the raw positive form the proxy emits
+#                       normalise to the SAME id, so either works
+#   word:крипто         case-insensitive substring of the title OR any username
+#   re:^travel          regular expression over "title + usernames"
+#
+# Handles match ANY of a peer's usernames (Telegram allows several), always
+# case-insensitively. A rule that cannot be parsed (a typo'd regex, a non-numeric
+# id, a line that is not a handle) is REPORTED in the run's ERRORS instead of
+# silently denying nothing.
+#
+# Built-in defaults (DEFAULT_DENY_RULES_TEXT in the module) always apply and are
+# the floor: the operator's personal channels @zhkparusa, @pifagortrade,
+# @slezisatoshisliv2, @travelbelka_cards, @startupoftheday plus their keywords.
+# NOT calibrated against live data: those five are NOT dialogs of this parser
+# account. They come from a dormant legacy source set belonging to the operator's
+# pre-2026-07-13 main account, so no live dry-run has ever exercised these rules
+# — they are a cheap floor against a re-add, not evidence of anything. Do not
+# read their presence as "the scanner saw these and denied them".
+# This file only ADDS. The operator's own publishing channels
+# (@ai_daily_summary, @ai_in_modern_world) are hard-coded never-enroll and do not
+# depend on this file at all.
+#
+# Operator additions below this line:
+
+# Music-producers chat: the linked chat of @erdman_music, which is still a news
+# source, so the classifier would auto-enroll this into the digest's chat
+# allowlist. A music-production chat carries no AI/dev signal. Found by the
+# 2026-07-30 live dry-run — the first concrete instance of the poisoning path the
+# deny list exists for. (Open question for the operator: @erdman_music itself is
+# arguably off-topic for an AI digest and has been silent since 2026-07-14.)
+#
+# 1609072825 is the CHAT's OWN entity id, re-confirmed against the 2026-07-30
+# dry-run table: every table row is one dialog, and that id sits on the
+# @Music_Producers_Chat row, not on the @erdman_music one. The handle rule
+# already covers it; the id rule is the belt-and-braces form for a handle change.
+@Music_Producers_Chat
+id:1609072825

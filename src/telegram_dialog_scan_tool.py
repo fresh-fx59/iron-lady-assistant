@@ -18,7 +18,7 @@ import traceback
 
 from .telegram_aggregator import load_file_env
 from .telegram_aggregator_publish import notify_operator
-from .telegram_dialog_scan import resolve_scan_paths, run_scan
+from .telegram_dialog_scan import TOPIC_READ_POSTS, resolve_scan_paths, run_scan
 from .telegram_proxy_client import TelegramProxyClient
 
 logger = logging.getLogger(__name__)
@@ -38,11 +38,38 @@ def _cmd_scan(args: argparse.Namespace) -> int:
             base_url=os.environ.get("TELEGRAM_PROXY_BASE_URL") or None,
         )
         dialogs = asyncio.run(client.list_dialogs(limit=args.limit, with_linked=True))
+
+        def post_reader(kind: str, entity_id: int) -> list[str]:
+            """The topical gate's evidence: the candidate's own recent posts.
+
+            READ-ONLY, and read through the proxy the account already uses — it
+            already follows these dialogs, so nothing is joined or subscribed to
+            here. Pacing/bounding lives in collect_topic_scores, next to the same
+            discipline the linked-chat sweep uses.
+            """
+            messages = asyncio.run(
+                client.read_messages(
+                    kind=kind, entity_id=entity_id, min_id=0, limit=TOPIC_READ_POSTS, recent_first=True
+                )
+            )
+            return [str(m.get("text") or "") for m in messages]
+
+        def lead_enroller(**kwargs: object) -> dict:
+            """The durable half of an enrolment, over the proxy (see _register_leads).
+
+            asyncio.TimeoutError is deliberately allowed to escape unwrapped: the
+            caller distinguishes it from a clean failure because a timeout is
+            AMBIGUOUS — the write may have landed — and must not be retried.
+            """
+            return asyncio.run(client.enrol_lead_source(**kwargs))  # type: ignore[arg-type]
+
         report = run_scan(
             paths=resolve_scan_paths(),
             dialogs=dialogs,
             dry_run=args.dry_run,
             notifier=notifier,
+            post_reader=post_reader,
+            lead_enroller=None if args.dry_run else lead_enroller,
         )
     except Exception as exc:  # noqa: BLE001 — deliberately everything, see below
         # The three likeliest failures (a missing proxy key => RuntimeError, a

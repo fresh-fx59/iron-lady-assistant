@@ -6,6 +6,14 @@ This walks the new `GET /v1/dialogs`, diffs against what the scanner has already
 seen AND what each pipeline tracks, classifies the rest by EXPLICIT RULES (no
 LLM), and enrolls the survivors.
 
+NEWS enrolment is TOPICALLY GATED (2026-07-31): a candidate broadcast channel is
+scored deterministically against an operator-editable RU/EN vocabulary over its
+own recent posts, and only a passing score reaches the PUBLIC digest. Leads
+enrolment is unchanged — private, breadth is the point — but reports the score.
+The durable half of an enrolment goes over POST /v1/sources/lead-enrol on the
+proxy, not the filesystem: /var/lib/iron-lady is 0700 iron-lady and this runs as
+claude-developer (see _register_leads for the full rationale).
+
 Three hard safety properties, because it writes live pipeline inputs:
 
   * ADD-ONLY — a bad auto-add is a one-line revert.
@@ -22,19 +30,21 @@ Reports to the operator only when something changed or broke.
 """
 from __future__ import annotations
 
+import asyncio
 import fcntl
 import json
 import logging
 import os
 import re
 import sqlite3
+import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterable, Sequence
 
 from .telegram_aggregator import parse_sources, resolve_paths
-from .telegram_digest import LEAD_SOURCE_ROLE, TelegramDigestStore, _peer_key
+from .telegram_digest import LEAD_SOURCE_ROLE, _peer_key
 from .telegram_proxy import normalize_target, parse_public_username
 
 logger = logging.getLogger(__name__)
@@ -61,6 +71,153 @@ word:zhkparusa
 
 _VAULT_MIRROR = "/home/claude-developer/personal-os/references/telegram-aggregator-sources.txt"
 _REPO_DENY = Path(__file__).resolve().parent.parent / "config" / "dialog_scan_deny.txt"
+_REPO_TOPICS = Path(__file__).resolve().parent.parent / "config" / "dialog_scan_topics.txt"
+
+# ── the topical gate ──────────────────────────────────────────────
+#
+# Built-in vocabulary = the FLOOR, exactly like DEFAULT_DENY_RULES_TEXT: deleting
+# the operator file cannot re-open the default-allow hole, it can only lose the
+# operator's ADDITIONS. Bilingual on purpose — these channels post in Russian and
+# English and the digest itself is Russian. Bare lines are STEMS (see
+# config/dialog_scan_topics.txt for the full contract and the calibration).
+DEFAULT_TOPIC_VOCABULARY_TEXT = """
+# — RU stems —
+нейросет
+нейронк
+нейросеть
+искусственн
+интеллект
+ии
+машинн
+обучени
+модел
+промпт
+генеративн
+генерац
+датасет
+алгоритм
+разработ
+программир
+кодинг
+бэкенд
+фронтенд
+девопс
+облач
+данны
+аналитик
+автоматизац
+чат-бот
+агент
+ассистент
+стартап
+технолог
+цифров
+приложени
+платформ
+релиз
+токен
+гпт
+чатгпт
+дипсик
+гигачат
+опенсорс
+вайб
+подписк
+интеграц
+сервис
+продукт
+инструмент
+запрос
+контекст
+джун
+сеньор
+вакансия
+фичи
+фича
+софт
+железо
+видеокарт
+чип
+дата-центр
+# — EN / latin —
+ai
+llm
+llms
+gpt
+chatgpt
+openai
+anthropic
+claude
+gemini
+llama
+mistral
+qwen
+deepseek
+grok
+transformer
+neural
+embedding
+rag
+agent
+agents
+dataset
+training
+inference
+benchmark
+opensource
+open-source
+github
+python
+javascript
+typescript
+docker
+kubernetes
+api
+sdk
+saas
+startup
+chatbot
+automation
+cloud
+framework
+library
+mcp
+cursor
+copilot
+codex
+devin
+prompt
+token
+model
+coding
+developer
+devops
+backend
+frontend
+nvidia
+huggingface
+langchain
+notebook
+release
+"""
+
+# THE METRIC, stated once and testable (config/dialog_scan_topics.txt repeats it
+# for the operator). Every constant here was CALIBRATED against the live account
+# on 2026-07-31, not chosen by feel — see that file's calibration block.
+TOPIC_READ_POSTS = 30          # most recent posts requested per candidate
+TOPIC_MIN_POST_CHARS = 20      # shorter posts carry no lexical signal
+MIN_SCOREABLE_POSTS = 8        # fewer than this ⇒ thin evidence ⇒ quarantine
+TOPIC_SCORE_THRESHOLD = 0.35   # empty band on live data is (0.27, 0.36)
+
+# Same pacing discipline as the linked-chat sweep (0.4 s / 80 lookups per run):
+# this gate adds ONE proxy read per NEW candidate, and the nightly steady state
+# is 0-3 of them. The bound only ever bites on a first run / a bulk join night.
+TOPIC_READ_PACING_SECONDS = 0.4
+TOPIC_READ_MAX = 80
+
+# A word STARTS here: the stem "ai" must not fire inside "said"/"chain", and the
+# stem "нейросет" must still cover "нейросети"/"нейросетью".
+_WORD_START = r"(?<![0-9A-Za-zА-Яа-яЁё_])"
 
 # notify_operator() hands the text to the Bot API sliced at 4000 chars. The
 # report is RENDERED to that budget instead of being cut by it, so the parts the
@@ -90,8 +247,15 @@ class ScanPaths:
     mirror: Path
     state: Path
     deny: Path
-    join_db: Path
-    digest_db: Path
+    topics: Path
+    # OPTIONAL, and unset in production. The durable lead-enrolment ledgers live
+    # in /var/lib/iron-lady (drwx------ iron-lady:iron-lady) and this scanner runs
+    # as claude-developer, so it cannot open them at all — the enrolment now goes
+    # through POST /v1/sources/lead-enrol on the proxy, which already runs as the
+    # owning user. They stay configurable for local tests; a path that IS
+    # configured but unreadable is still a blocking error (unchanged invariant).
+    join_db: Path | None = None
+    digest_db: Path | None = None
     lock: Path | None = None
 
     def lock_path(self) -> Path:
@@ -107,6 +271,10 @@ class Decision:
     decision: str  # enroll-news | enroll-leads | enroll-both | quarantine | skip
     reason: str
     news_target: str | None = None  # "sources" | "chat_sources" | None
+    # The topical score that GATED this decision (the candidate's own for a
+    # channel; its parent channel's for a discussion chat). None only when no
+    # gate applied — a DM, a bot, an own-publishing channel, a deny hit.
+    topic_score: "TopicScore | None" = None
 
 
 @dataclass
@@ -158,8 +326,12 @@ def resolve_scan_paths() -> ScanPaths:
         # repo checkout is `git checkout --force`-ed by the draft runner, which
         # would discard (or block) an operator edit made in place.
         deny=Path(env("DIALOG_SCAN_DENY_PATH") or _REPO_DENY),
-        join_db=Path(env("TELEGRAM_PROXY_JOIN_DB_PATH") or "/var/lib/iron-lady/memory/telegram_join.db"),
-        digest_db=Path(env("TELEGRAM_DIGEST_DB_PATH") or "/var/lib/iron-lady/memory/telegram_digest.db"),
+        # Same reasoning as the deny file: the live copy is the operator-editable
+        # one beside sources.txt, the in-repo file is only the seed.
+        topics=Path(env("DIALOG_SCAN_TOPICS_PATH") or _REPO_TOPICS),
+        # Unset by default — see ScanPaths. Only a DELIBERATE override reads them.
+        join_db=Path(env("DIALOG_SCAN_JOIN_DB_PATH")) if env("DIALOG_SCAN_JOIN_DB_PATH") else None,
+        digest_db=Path(env("DIALOG_SCAN_DIGEST_DB_PATH")) if env("DIALOG_SCAN_DIGEST_DB_PATH") else None,
         lock=Path(env("DIALOG_SCAN_LOCK_PATH") or agg.state_dir / "dialog-scan.lock"),
     )
 
@@ -283,23 +455,230 @@ def deny_match(rules: Sequence[DenyRule], candidate: dict[str, Any]) -> DenyRule
     return None
 
 
+# ── topical scoring (deterministic, no LLM) ───────────────────────
+
+
+@dataclass(frozen=True)
+class TopicRule:
+    kind: str  # stem | word | re | invalid
+    value: str
+    error: str = ""
+
+
+@dataclass(frozen=True)
+class TopicScore:
+    """One candidate's topical fit, and the evidence it rests on.
+
+    `status` is the part that keeps the gate honest:
+      ok         — enough readable posts to decide (>= MIN_SCOREABLE_POSTS)
+      thin       — the channel exists but has too little readable text
+      unreadable — the proxy read itself failed / was never attempted
+    Only `ok` may ever produce an enrolment; the other two QUARANTINE.
+    """
+
+    score: float
+    hits: int
+    scored: int
+    read: int
+    status: str
+    detail: str = ""
+    terms: tuple[str, ...] = ()
+
+    def passes(self) -> bool:
+        return self.status == "ok" and self.score >= TOPIC_SCORE_THRESHOLD
+
+    def label(self) -> str:
+        if self.status == "unreadable":
+            return f"unreadable ({self.detail})" if self.detail else "unreadable"
+        return f"{self.score:.2f} ({self.hits}/{self.scored} posts)"
+
+
+def parse_topic_rules(text: str) -> list[TopicRule]:
+    """One term per line: a bare STEM, or the `word:` / `re:` escape hatches.
+
+    Deliberately the same three-shape grammar as the deny file so the operator
+    learns one syntax; the only difference is what a BARE line means (a handle
+    there, a stem here), which config/dialog_scan_topics.txt states up front.
+    """
+    rules: list[TopicRule] = []
+    for raw in text.splitlines():
+        line = raw.split("#", 1)[0].strip()
+        if not line:
+            continue
+        prefix, sep, value = line.partition(":")
+        kind, value = prefix.strip().lower(), value.strip()
+        if sep and kind in {"word", "re"}:
+            if not value:
+                rules.append(TopicRule("invalid", line, f"empty {kind}: rule"))
+            elif kind == "re":
+                try:
+                    re.compile(value)
+                except re.error as exc:
+                    rules.append(TopicRule("invalid", line, f"invalid regex ({exc})"))
+                else:
+                    rules.append(TopicRule("re", value))
+            else:
+                rules.append(TopicRule("word", value.lower()))
+            continue
+        rules.append(TopicRule("stem", line.lower()))
+    return rules
+
+
+def load_topic_rules(path: Path | None) -> list[TopicRule]:
+    """Built-ins are the FLOOR; the operator file only ever ADDS to them.
+
+    A missing or unreadable vocabulary file must never widen the gate — that is
+    exactly the default-allow hole this change closes — so the fallback is the
+    full built-in vocabulary, not an empty one.
+    """
+    rules = parse_topic_rules(DEFAULT_TOPIC_VOCABULARY_TEXT)
+    if path is None:
+        return rules
+    try:
+        if path.exists():
+            rules.extend(parse_topic_rules(path.read_text(encoding="utf-8")))
+    except OSError as exc:
+        rules.append(TopicRule("invalid", str(path), f"topic file unreadable ({exc})"))
+    return rules
+
+
+def topic_rule_errors(rules: Sequence[TopicRule]) -> list[str]:
+    return [
+        f"topic rule ignored (it scores NOTHING): {rule.value!r} — {rule.error}"
+        for rule in rules
+        if rule.kind == "invalid"
+    ]
+
+
+def _compile_topic_rules(rules: Sequence[TopicRule]) -> list[tuple[str, "re.Pattern[str]"]]:
+    compiled: list[tuple[str, re.Pattern[str]]] = []
+    for rule in rules:
+        try:
+            if rule.kind == "stem":
+                compiled.append((rule.value, re.compile(_WORD_START + re.escape(rule.value), re.IGNORECASE)))
+            elif rule.kind == "word":
+                compiled.append((rule.value, re.compile(re.escape(rule.value), re.IGNORECASE)))
+            elif rule.kind == "re":
+                compiled.append((rule.value, re.compile(rule.value, re.IGNORECASE)))
+        except re.error:
+            continue  # already surfaced by topic_rule_errors()
+    return compiled
+
+
+def score_posts(texts: Sequence[str], rules: Sequence[TopicRule]) -> TopicScore:
+    """THE metric. hits / scoreable posts, over the posts we could actually read.
+
+    * scoreable post = at least TOPIC_MIN_POST_CHARS of text. A media-only or
+      one-word post carries no lexical signal and must not dilute (or inflate)
+      the denominator.
+    * a post HITS when at least ONE vocabulary term matches. Measured against the
+      live account, requiring 2+ distinct terms per post collapsed a genuine
+      source (@naiznankuo) to 0.00 while barely moving the off-topic ones — so
+      one term it is, and the THRESHOLD does the separating.
+    * the score is a FRACTION, so a chatty 30-post chat and a terse 10-post feed
+      are comparable; the post COUNT is kept separately as the evidence gate.
+    """
+    scoreable = [t for t in texts if len(str(t or "").strip()) >= TOPIC_MIN_POST_CHARS]
+    compiled = _compile_topic_rules(rules)
+    hits = 0
+    seen_terms: dict[str, int] = {}
+    for text in scoreable:
+        matched = [label for label, pattern in compiled if pattern.search(text)]
+        if matched:
+            hits += 1
+            for label in matched:
+                seen_terms[label] = seen_terms.get(label, 0) + 1
+    score = (hits / len(scoreable)) if scoreable else 0.0
+    status = "ok" if len(scoreable) >= MIN_SCOREABLE_POSTS else "thin"
+    terms = tuple(t for t, _ in sorted(seen_terms.items(), key=lambda kv: (-kv[1], kv[0]))[:5])
+    return TopicScore(
+        score=score, hits=hits, scored=len(scoreable), read=len(texts), status=status, terms=terms
+    )
+
+
+def unreadable_score(detail: str) -> TopicScore:
+    return TopicScore(score=0.0, hits=0, scored=0, read=0, status="unreadable", detail=detail)
+
+
+def collect_topic_scores(
+    candidates: Sequence[tuple[str, int]],
+    *,
+    reader: Callable[[str, int], Sequence[str]] | None,
+    rules: Sequence[TopicRule],
+    sleeper: Callable[[float], Any] | None = None,
+) -> tuple[dict[tuple[str, int], TopicScore], list[str]]:
+    """Read each candidate's recent posts ONCE, paced and bounded.
+
+    Same discipline the linked-chat sweep already uses (0.4 s apart, 80 per run):
+    a nightly enrolment path must not turn into a rate-limit incident. Reads are
+    keyed by (kind, entity_id) and cached for the run, so a channel that is also
+    the parent of a new discussion chat costs one read, not two. Anything beyond
+    the bound is NOT guessed at — it becomes an `unreadable` score, i.e. a
+    quarantine with a stated reason, and the overflow is reported.
+    """
+    scores: dict[tuple[str, int], TopicScore] = {}
+    errors: list[str] = []
+    if reader is None:
+        for key in candidates:
+            scores[key] = unreadable_score("no post reader configured")
+        return scores, errors
+    sleep = sleeper or time.sleep
+    for index, key in enumerate(dict.fromkeys(candidates)):
+        if index >= TOPIC_READ_MAX:
+            scores[key] = unreadable_score(f"bounded at {TOPIC_READ_MAX} post reads/run")
+            continue
+        if index:
+            sleep(TOPIC_READ_PACING_SECONDS)
+        kind, entity_id = key
+        try:
+            texts = list(reader(kind, entity_id))
+        except Exception as exc:  # noqa: BLE001 — per-candidate isolation
+            scores[key] = unreadable_score(f"{type(exc).__name__}: {exc}")
+            continue
+        scores[key] = score_posts(texts, rules)
+    overflow = sum(1 for s in scores.values() if s.detail.startswith("bounded at"))
+    if overflow:
+        errors.append(
+            f"topical gate bounded at {TOPIC_READ_MAX} post reads this run; {overflow} candidate(s) "
+            "were left UNREAD rather than guessed at (an unread channel is quarantined, an unread "
+            "discussion chat is held out of chat_sources and goes to leads only). They stay out of "
+            "`seen`, so the next run reads them first as the decided ones drop off the fresh list"
+        )
+    return scores, errors
+
+
 # ── the one classification policy decision ────────────────────────
 
 
-def broadcast_channel_is_a_news_source(candidate: dict[str, Any], rules: Sequence[DenyRule]) -> bool:
-    """DEFAULT-ALLOW: any broadcast channel with an undenied handle IS a news source.
+def broadcast_channel_is_a_news_source(
+    candidate: dict[str, Any],
+    rules: Sequence[DenyRule],
+    *,
+    topic_score: TopicScore | None,
+) -> bool:
+    """GATED (2026-07-31): a broadcast channel is a news source only if its OWN
+    RECENT POSTS score topical.
 
-    THE one classification policy decision in this module, isolated here so that
-    gating it is a one-place change. Today the only bars are: it must be a
-    broadcast channel, it must have a public handle, it must not be one of the
-    operator's own publishing channels, and no deny rule may fire.
+    THE one classification policy decision in this module, still isolated here.
+    It used to be DEFAULT-ALLOW: any broadcast channel with an undenied handle
+    became a source of the PUBLIC @ai_daily_summary digest on the next 01:47 UTC
+    scan — a shop, a friend's blog, a one-off announcement feed — and the deny
+    list was the entire brake. The operator's decision (2026-07-31) replaced that
+    with a deterministic score over the channel's real posts; no LLM, because a
+    nightly enrolment path has to be testable and auditable, and because this
+    pipeline already delivers its critical decisions by code.
 
-    Consequence of default-allow, stated plainly: a channel the account joins for
-    ANY reason — a shop, a friend's blog, a one-off announcement feed — becomes a
-    source of the PUBLIC @ai_daily_summary digest on the next 01:47 UTC scan
-    unless the operator denied it FIRST. There is no topic check; the deny list is
-    the entire brake. (An operator-facing gate — propose-only, or a topic
-    allow-list — replaces the body of this function and nothing else.)
+    SCOPE — this gate governs NEWS enrolment only, i.e. the PUBLIC surface:
+      * pass  -> the channel is a news source (sources.txt + the digest);
+      * fail with real evidence -> NOT a news source, but still enrolled into the
+        LEAD pipeline, which is private and where breadth is the point. Its score
+        is reported either way, so the operator can see what is arriving;
+      * thin / unreadable evidence -> neither. `classify` quarantines it with a
+        stated reason. NEVER guess on evidence we do not have: a coin-flip
+        enrolment here is a public-channel problem, and the retry is free.
+
+    `topic_score=None` is deliberately NOT a pass — that is the default-allow
+    hole, and it must stay closed if a caller forgets to score.
     """
     handle = (candidate.get("username") or "").lower()
     return bool(
@@ -307,6 +686,8 @@ def broadcast_channel_is_a_news_source(candidate: dict[str, Any], rules: Sequenc
         and handle
         and handle not in OWN_PUBLISHING_CHANNELS
         and deny_match(rules, candidate) is None
+        and topic_score is not None
+        and topic_score.passes()
     )
 
 
@@ -326,14 +707,24 @@ def classify(
     tracked: Tracked | None,
     deny_rules: Sequence[DenyRule],
     linked_parents: dict[int, dict[str, Any]],
+    topic_scores: dict[tuple[str, int], TopicScore] | None = None,
 ) -> Decision:
     """Explicit rules only, checked in order. When unsure: never enroll."""
     kind = str(candidate.get("kind") or "user")
     handle = (candidate.get("username") or "").strip() or None
     entity_id = int(candidate.get("entity_id") or 0)
+    # `or {}` would discard an EMPTY-but-present mapping — identity, not truthiness.
+    scores: dict[tuple[str, int], TopicScore] = {} if topic_scores is None else topic_scores
 
-    def out(decision: str, reason: str, news_target: str | None = None) -> Decision:
-        return Decision(entity_id, str(candidate.get("title") or ""), kind, handle, decision, reason, news_target)
+    def out(
+        decision: str,
+        reason: str,
+        news_target: str | None = None,
+        score: TopicScore | None = None,
+    ) -> Decision:
+        return Decision(
+            entity_id, str(candidate.get("title") or ""), kind, handle, decision, reason, news_target, score
+        )
 
     if kind in {"user", "bot"}:
         return out("skip", f"never-enroll: {kind} dialog (DM / bot / Saved Messages)")
@@ -346,25 +737,85 @@ def classify(
     if kind == "channel":
         if not handle:
             return out("skip", "never-enroll: broadcast channel with no username (unaddressable)")
-        if broadcast_channel_is_a_news_source(candidate, deny_rules):
-            return out("enroll-both", f"broadcast channel @{handle} -> news + leads", "sources")
-        return out("enroll-leads", f"broadcast channel @{handle} -> leads only (not a news source)")
+        score = scores.get(("channel", entity_id))
+        # NEVER GUESS: no evidence is not "probably fine", and it is not "probably
+        # bad" either — it is a quarantine the operator sees, with the reason.
+        if score is None or score.status == "unreadable":
+            detail = score.detail if score is not None else "not scored"
+            return out("quarantine", f"topical gate: posts unreadable ({detail}) — refusing to guess", score=score)
+        if score.status == "thin":
+            return out(
+                "quarantine",
+                f"topical gate: too few readable posts ({score.scored} scoreable of {score.read} read, "
+                f"need {MIN_SCOREABLE_POSTS}) — refusing to guess",
+                score=score,
+            )
+        if broadcast_channel_is_a_news_source(candidate, deny_rules, topic_score=score):
+            return out(
+                "enroll-both",
+                f"broadcast channel @{handle} scores {score.label()} >= {TOPIC_SCORE_THRESHOLD:.2f} "
+                f"[{', '.join(score.terms)}] -> news + leads",
+                "sources",
+                score,
+            )
+        return out(
+            "enroll-leads",
+            f"broadcast channel @{handle} scores {score.label()} < {TOPIC_SCORE_THRESHOLD:.2f} "
+            "-> NOT a news source; leads only (private pipeline, breadth is the point)",
+            score=score,
+        )
 
     if kind in {"megagroup", "group"}:
         parent = linked_parents.get(entity_id)
-        if parent is not None and broadcast_channel_is_a_news_source(parent, deny_rules):
-            return out(
-                "enroll-both",
-                f"discussion chat of news channel @{parent.get('username')} -> leads + chat_sources",
-                "chat_sources",
-            )
+        # A discussion chat reaches the PUBLIC digest only behind a parent that
+        # passed the gate. The chat's own score is reported as evidence but does
+        # not gate: there is no labelled set of discussion chats to calibrate a
+        # chat threshold against, and inventing one would be picking a number by
+        # feel. This is what makes the @Music_Producers_Chat case (parent
+        # @erdman_music scores 0.27) a RULE rather than a hand-added deny line.
+        own_score = scores.get(("linked_chat", entity_id))
+        if parent is not None:
+            parent_score = scores.get(("channel", int(parent.get("entity_id") or 0)))
+            if broadcast_channel_is_a_news_source(parent, deny_rules, topic_score=parent_score):
+                # The parent is the GATED entity, but a chat whose own posts we
+                # could not read at all is still a guess, and chat_sources is the
+                # same public digest lane. No new threshold is invented here —
+                # the chat's score does not have to PASS, it just has to EXIST.
+                if own_score is None or own_score.status == "unreadable":
+                    detail = own_score.detail if own_score is not None else "not scored"
+                    return out(
+                        "enroll-leads",
+                        f"discussion chat of news channel @{parent.get('username')} "
+                        f"(parent {parent_score.label()}), but its OWN posts are unreadable ({detail}) "
+                        "-> leads only; chat_sources needs evidence we could not get",
+                        score=own_score,
+                    )
+                return out(
+                    "enroll-both",
+                    f"discussion chat of news channel @{parent.get('username')} "
+                    f"(parent scores {parent_score.label()}, chat itself {own_score.label()}) "
+                    "-> leads + chat_sources",
+                    "chat_sources",
+                    own_score,
+                )
         if handle:
-            return out("enroll-leads", f"group @{handle} -> leads (news needs an operator chat_sources add)")
+            reason = f"group @{handle} -> leads"
+            if parent is not None:
+                parent_score = scores.get(("channel", int(parent.get("entity_id") or 0)))
+                shown = parent_score.label() if parent_score is not None else "not scored"
+                reason += f" (parent @{parent.get('username')} scores {shown} — not a news source)"
+            else:
+                reason += " (news needs an operator chat_sources add)"
+            return out("enroll-leads", reason, score=own_score)
         # No handle of its own, but a tracked parent makes it verifiable and the
         # joins door keys on entity_id, so leads still works. News does not: the
         # parent is not a news source, so its chat has no business in the digest.
         if parent is not None and _parent_tracked(parent, tracked):
-            return out("enroll-leads", f"discussion chat of tracked non-news channel {parent.get('title')!r} -> leads")
+            return out(
+                "enroll-leads",
+                f"discussion chat of tracked non-news channel {parent.get('title')!r} -> leads",
+                score=own_score,
+            )
         return out("skip", "never-enroll: no username AND no linked parent (unaddressable, unverifiable)")
 
     return out("quarantine", f"unknown peer kind {kind!r} — refusing to guess")
@@ -425,7 +876,7 @@ def load_tracked(paths: ScanPaths) -> Tracked:
             # safe here because the pipeline ledgers are the real dedup authority.
             logger.warning("dialog-scan state unreadable (%s); treating every dialog as new", exc)
     try:
-        if paths.digest_db.exists():
+        if paths.digest_db is not None and paths.digest_db.exists():
             with sqlite3.connect(paths.digest_db, timeout=10) as con:
                 con.execute("PRAGMA busy_timeout=5000")
                 for peer_key, entity_id, role in con.execute(
@@ -437,7 +888,7 @@ def load_tracked(paths: ScanPaths) -> Tracked:
     except (sqlite3.Error, OSError) as exc:
         tracked.errors.append(f"digest db unreadable ({paths.digest_db}): {exc}")
     try:
-        if paths.join_db.exists():
+        if paths.join_db is not None and paths.join_db.exists():
             with sqlite3.connect(paths.join_db, timeout=10) as con:
                 con.execute("PRAGMA busy_timeout=5000")
                 tracked.join_targets = {str(r[0]) for r in con.execute("SELECT target FROM joins").fetchall()}
@@ -530,33 +981,45 @@ class LeadEnrolment:
     notes: list[str] = field(default_factory=list)
 
 
-def _register_leads(paths: ScanPaths, items: Sequence[Decision], tracked: Tracked) -> LeadEnrolment:
-    """The DURABLE half of an enrolment: sqlite, per item, isolated failures.
+def _register_leads(
+    paths: ScanPaths,
+    items: Sequence[Decision],
+    tracked: Tracked,
+    enroller: Callable[..., Any] | None,
+) -> LeadEnrolment:
+    """The DURABLE half of an enrolment — now ONE authenticated proxy call per item.
 
-    ORDERING RATIONALE (the 2026-07-30 silent half-write): sources.txt and the
-    vault mirror feed the PUBLIC digest, while these sqlite writes are the
-    durable, transactional record. When the text files went first, a read-only
-    digest db left a channel live in the public digest with nothing recording
-    that it had never been lead-enrolled — and the state file then hid it
-    forever. So the durable write happens FIRST and per item; the caller appends
-    a sources.txt line only for `ok_ids`; and only fully-completed ids reach
-    `seen`. Every failure names its item, so the report says exactly what was and
-    was not written.
+    WHY IT MOVED OFF THE FILESYSTEM (2026-07-31). This used to open
+    /var/lib/iron-lady/memory/{telegram_join,telegram_digest}.db directly. That
+    directory is `drwx------ iron-lady:iron-lady` and the scanner unit runs as
+    `claude-developer`, which cannot even traverse it — so the lead half could
+    never work as written. Of the two ways out, the operator took the endpoint:
+    `telegram-proxy-giedi.service` ALREADY runs as the user that owns those dbs,
+    already has Bearer auth, and every other claude-developer-side job in this
+    fleet reaches iron-lady state exactly this way (telegram-lead-scorer.nix
+    LoadCredentials the same key and reads /v1/lead-candidates). Relaxing a 0700
+    directory holding session-adjacent state is a far wider blast radius than one
+    authenticated, narrowly-scoped route that can only ever add a lead role.
 
-    A broadcast channel cannot go through sync_joined_sources (it hard-codes
-    kind="linked_chat" — right for a joined megagroup, wrong for a channel), so
-    it is inserted directly with kind="channel". Either way an EXISTING
-    peer_key/target is left completely alone.
+    ORDERING RATIONALE, unchanged and now stretched across HTTP (the 2026-07-30
+    silent half-write): sources.txt and the vault mirror feed the PUBLIC digest,
+    the proxy call is the durable record. The durable write happens FIRST and per
+    item; the caller appends a sources.txt line only for `ok_ids`; and only
+    fully-completed ids reach `seen`. Every failure names its item.
+
+    THE ONE NEW FAILURE MODE the HTTP boundary adds is AMBIGUITY: a timeout means
+    the write may or may not have landed. That id is treated exactly like a
+    failure (no news line, no `seen` entry) and is NOT retried inside this run —
+    a blind retry is how you double-write. It is safe to re-attempt NEXT run
+    because the endpoint is idempotent by construction (INSERT OR IGNORE on the
+    joins row, `add_source_role` never rewriting an existing digest row).
     """
     result = LeadEnrolment()
     if not items:
         return result
-    now = datetime.now(timezone.utc).isoformat()
-    try:
-        store = TelegramDigestStore(paths.digest_db)
-    except (sqlite3.Error, OSError) as exc:
+    if enroller is None:
         result.errors.append(
-            f"lead enrolment IMPOSSIBLE (digest db {paths.digest_db} unusable: {exc}); "
+            "lead enrolment IMPOSSIBLE (no proxy enroller configured); "
             f"NOTHING was written for {[d.username or d.entity_id for d in items]}"
         )
         return result
@@ -571,29 +1034,29 @@ def _register_leads(paths: ScanPaths, items: Sequence[Decision], tracked: Tracke
             result.ok_ids.add(item.entity_id)
             continue
         try:
-            if kind == "linked_chat":
-                join_kind, target = join_ledger_key(item.username, item.entity_id)
-                if not _insert_join_row(
-                    paths.join_db, target=target, kind=join_kind, entity_id=item.entity_id, now=now
-                ):
-                    result.notes.append(
-                        f"joins ledger already owns target {target!r} ({who}) — its row was left untouched"
-                    )
-            store.add_source_role(
-                peer_key=peer_key,
+            response = enroller(
                 entity_id=item.entity_id,
+                kind=kind,
                 title=item.title or f"{kind}:{item.entity_id}",
                 username=item.username,
-                kind=kind,
-                linked_channel_key=None,
-                role=LEAD_SOURCE_ROLE,
             )
-        except (sqlite3.Error, OSError) as exc:
+        except (TimeoutError, asyncio.TimeoutError) as exc:
             result.errors.append(
-                f"lead enrolment FAILED for {who} (id={item.entity_id}): {exc}; "
+                f"lead enrolment AMBIGUOUS for {who} (id={item.entity_id}): the proxy call timed out "
+                f"({type(exc).__name__}: {exc}) — the write MAY have landed. Nothing else was written "
+                "for it (no news line, no state entry) and it was NOT retried this run; the endpoint is "
+                "idempotent, so the next run re-attempts it safely"
+            )
+            continue
+        except Exception as exc:  # noqa: BLE001 — per-item isolation, every one reported
+            result.errors.append(
+                f"lead enrolment FAILED for {who} (id={item.entity_id}): {type(exc).__name__}: {exc}; "
                 "NOTHING was written for it (no news line, no state entry) — it retries next run"
             )
             continue
+        payload = response if isinstance(response, dict) else {}
+        if payload.get("join_note"):
+            result.notes.append(f"{payload['join_note']} ({who})")
         result.ok_ids.add(item.entity_id)
         result.added.append(item.entity_id)
     return result
@@ -671,12 +1134,23 @@ def render_report(report: ScanReport, *, max_chars: int = MAX_REPORT_CHARS) -> s
     if not report.decisions:
         return fixed
 
+    def _score_cell(d: Decision) -> str:
+        if d.topic_score is None:
+            return "     -"
+        if d.topic_score.status == "unreadable":
+            return "  n/a "
+        return f"{d.topic_score.score:>6.2f}"
+
     rows = [
-        f"{d.decision:<13} {d.kind:<10} {d.entity_id:>14}  "
+        f"{d.decision:<13} {d.kind:<10} {_score_cell(d)}  {d.entity_id:>14}  "
         f"{('@' + d.username) if d.username else (d.title or f'dialog:{d.entity_id}')} — {d.reason}"
         for d in sorted(report.decisions, key=lambda d: (_DECISION_ORDER.get(d.decision, 9), d.kind))
     ]
-    header = f"\n\n{'decision':<13} {'kind':<10} {'id':>14}  handle / title — why"
+    header = (
+        f"\n\n{'decision':<13} {'kind':<10} {'score':>6}  {'id':>14}  handle / title — why"
+        f"\n(topical score = share of the last {TOPIC_READ_POSTS} readable posts matching the topic "
+        f"vocabulary; pass >= {TOPIC_SCORE_THRESHOLD:.2f} with >= {MIN_SCOREABLE_POSTS} posts)"
+    )
     notice_room = 120  # room for the explicit truncation notice
     budget = max_chars - len(fixed) - len(header) - notice_room
     shown: list[str] = []
@@ -705,6 +1179,8 @@ def run_scan(
     dry_run: bool = False,
     notifier: Callable[[str], Any] | None = None,
     max_report_chars: int = MAX_REPORT_CHARS,
+    post_reader: Callable[[str, int], Sequence[str]] | None = None,
+    lead_enroller: Callable[..., Any] | None = None,
 ) -> ScanReport:
     report = ScanReport(dry_run=dry_run)
     dialogs = list(dialogs)
@@ -734,6 +1210,8 @@ def run_scan(
             dry_run=dry_run,
             notifier=notifier,
             max_report_chars=max_report_chars,
+            post_reader=post_reader,
+            lead_enroller=lead_enroller,
         )
     finally:
         _release_lock(lock_fd)
@@ -767,6 +1245,8 @@ def _run_scan_locked(
     dry_run: bool,
     notifier: Callable[[str], Any] | None,
     max_report_chars: int,
+    post_reader: Callable[[str, int], Sequence[str]] | None = None,
+    lead_enroller: Callable[..., Any] | None = None,
 ) -> ScanReport:
     tracked = load_tracked(paths)
     report.errors.extend(tracked.errors)
@@ -792,7 +1272,41 @@ def _run_scan_locked(
 
     fresh = [d for d in dialogs if not _already_tracked(d, tracked)]
     report.new_dialogs = [int(d.get("entity_id") or 0) for d in fresh]
-    decisions = [classify(d, tracked=tracked, deny_rules=deny_rules, linked_parents=linked_parents) for d in fresh]
+
+    # Score ONLY what the gate actually needs, in the order the report shows it:
+    # every fresh broadcast channel, every fresh discussion chat (evidence for the
+    # operator), and the PARENT of a fresh discussion chat even when that parent is
+    # already tracked — a chat cannot reach the public digest without its parent
+    # passing. Reads are deduped by key, paced, and bounded; see collect_topic_scores.
+    topic_rules = load_topic_rules(paths.topics)
+    report.errors.extend(topic_rule_errors(topic_rules))
+    wanted: list[tuple[str, int]] = []
+    for candidate in fresh:
+        entity_id = int(candidate.get("entity_id") or 0)
+        kind = str(candidate.get("kind") or "")
+        if kind == "channel" and (candidate.get("username") or ""):
+            if not (_all_handles(candidate) & OWN_PUBLISHING_CHANNELS) and deny_match(deny_rules, candidate) is None:
+                wanted.append(("channel", entity_id))
+        elif kind in {"megagroup", "group"}:
+            if deny_match(deny_rules, candidate) is not None:
+                continue
+            wanted.append(("linked_chat", entity_id))
+            parent = linked_parents.get(entity_id)
+            if parent is not None and deny_match(deny_rules, parent) is None:
+                wanted.append(("channel", int(parent.get("entity_id") or 0)))
+    topic_scores, topic_errors = collect_topic_scores(wanted, reader=post_reader, rules=topic_rules)
+    report.errors.extend(topic_errors)
+
+    decisions = [
+        classify(
+            d,
+            tracked=tracked,
+            deny_rules=deny_rules,
+            linked_parents=linked_parents,
+            topic_scores=topic_scores,
+        )
+        for d in fresh
+    ]
     # A quarantine the state file already knows about is NOT news: report it the
     # first time, then only as a count, so the same deny hit never pages nightly.
     report.requarantined = [
@@ -814,7 +1328,7 @@ def _run_scan_locked(
         )
     elif not dry_run:
         # 1. DURABLE half first (sqlite, per item) — see _register_leads.
-        enrolment = _register_leads(paths, lead_items, tracked)
+        enrolment = _register_leads(paths, lead_items, tracked, lead_enroller)
         report.added_leads = enrolment.added
         report.errors.extend(enrolment.errors)
         report.ledger_notes.extend(enrolment.notes)

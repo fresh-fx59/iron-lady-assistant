@@ -1,0 +1,58 @@
+# dialog-scan TOPIC vocabulary — the news gate's dictionary. ONE file, edit it.
+#
+# THIS in-repo copy is only the SEED. The file the scanner actually reads is the
+# operator-editable copy in the aggregator state dir, beside sources.txt:
+#   /home/claude-developer/telegram-aggregator/dialog_scan_topics.txt
+# (env DIALOG_SCAN_TOPICS_PATH). Edit THAT one. This checkout is `git checkout
+# --force`-ed by the aggregator draft runner, so an edit made here is discarded.
+# The unit copies this file into place if the state-dir copy is missing, and
+# mirrors the live copy into the vault after every run.
+#
+# ── what the gate does ──────────────────────────────────────────────────────
+# Before 2026-07-31 any newly-subscribed broadcast channel with a handle became a
+# source of the PUBLIC @ai_daily_summary digest with no topical check at all
+# (default-allow; the deny list was the entire brake). Now the scanner READS the
+# candidate's own recent posts through the proxy and scores them against this
+# vocabulary:
+#
+#   scored posts = the 30 most recent posts with at least 20 characters of text
+#                  (media-only posts carry no lexical signal and never count)
+#   a post HITS  = at least ONE term below matches its text
+#   score        = hits / scored posts          (0.00 … 1.00)
+#   PASS         = score >= 0.35 AND at least 8 scored posts
+#
+# A pass auto-enrols the channel as a news source. A fail with REAL evidence
+# still reaches the lead pipeline (breadth is the point there) — only the public
+# digest is gated. Too few readable posts, or a proxy read failure, is NOT a
+# fail: it is a QUARANTINE with a stated reason, because guessing on thin
+# evidence is exactly what this gate exists to stop. Every decision reports its
+# score, so the vocabulary can be tuned from evidence rather than from feel.
+#
+# ── calibration (2026-07-31, against the LIVE account) ──────────────────────
+# 59 readable broadcast channels the parser account is in:
+#   * the 52 handles in sources.txt (known-good) scored 0.36 … 1.00, median 0.89
+#   * @erdman_music (music-production; its linked chat is the one entry the deny
+#     list had to be patched with by hand) scored 0.27
+#   * @Music_Producers_Chat itself scored 0.00 over 17 posts
+# The band between 0.27 and 0.36 is EMPTY across all 59, and 0.35 sits at the top
+# of it: strict by design, because a false pass poisons a public channel while a
+# false quarantine is reported with its score and fixed by one line here.
+#
+# ── rule forms (one per line, `#` comments and blanks ignored) ──────────────
+#   нейросет            a STEM: matches any word STARTING with it, case-
+#                       insensitively — "нейросети", "нейросетью", "Нейросеть".
+#                       This is what makes one line cover Russian morphology.
+#                       It anchors at a word start, so "ai" does NOT fire inside
+#                       "said" or "chain".
+#   word:вайбкодинг     raw substring anywhere in the post (escape hatch, e.g.
+#                       for a term that appears glued inside another word)
+#   re:gpt-?[0-9]       regular expression over the post text
+#
+# A rule that cannot be parsed (a typo'd regex, an empty word:) is REPORTED in
+# the run's ERRORS instead of silently scoring nothing.
+#
+# The BUILT-IN vocabulary (DEFAULT_TOPIC_VOCABULARY_TEXT in
+# src/telegram_dialog_scan.py) always applies and is the floor — deleting this
+# file cannot re-open the default-allow hole. This file only ADDS terms.
+#
+# Operator additions below this line:

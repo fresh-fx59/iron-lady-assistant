@@ -27,6 +27,57 @@ from src.telegram_dialog_scan import (
 from src.telegram_digest import LEAD_SOURCE_ROLE, TelegramDigestStore, sync_joined_sources
 from src.telegram_proxy import normalize_target
 
+# ── shim: run_scan's durable half now goes over POST /v1/sources/lead-enrol ──
+# These tests were written when the scanner opened the join/digest dbs itself.
+# The write MOVED to the proxy (it runs as the user that owns 0700
+# /var/lib/iron-lady; the scanner does not) — so the assertions below still pin
+# the SAME invariants, now through the real endpoint implementation, against the
+# same temp dbs. Two injected callables replace what used to be direct sqlite:
+# a post_reader (the topical gate's evidence) and a lead_enroller (the endpoint).
+from src.telegram_digest import TelegramDigestStore as _DigestStore  # noqa: E402
+from src.telegram_dialog_scan import run_scan as _run_scan  # noqa: E402
+from src.telegram_proxy import JoinStore as _JoinStore, TelegramProxy as _Proxy  # noqa: E402
+
+class _AlwaysPass(dict):
+    """topic_scores stand-in for the tests that predate the gate: every lookup is
+    a clean pass, so these cases keep testing what they were written to test."""
+
+    def get(self, key, default=None):
+        from src.telegram_dialog_scan import TopicScore
+
+        return TopicScore(score=1.0, hits=20, scored=20, read=20, status="ok")
+
+
+_PASS = _AlwaysPass()
+
+
+_TOPICAL_POST = "Новая модель OpenAI ускоряет инференс агентов в проде на 40 процентов"
+
+
+class _LocalEnroller(_Proxy):
+    """The REAL proxy method, pointed at the test's temp dbs."""
+
+    def __init__(self, digest_db, join_db):
+        self._digest_store = _DigestStore(digest_db)
+        self._join_store = _JoinStore(join_db)
+
+
+def _default_reader(kind, entity_id):
+    return [_TOPICAL_POST] * 20
+
+
+def run_scan(*, paths, post_reader=None, lead_enroller="default", **kwargs):
+    if lead_enroller == "default":
+        def lead_enroller(**payload):
+            return _LocalEnroller(paths.digest_db, paths.join_db).enrol_lead_source(**payload)
+    return _run_scan(
+        paths=paths,
+        post_reader=post_reader or _default_reader,
+        lead_enroller=lead_enroller,
+        **kwargs,
+    )
+
+
 
 def dialog(
     entity_id: int,
@@ -69,6 +120,7 @@ def paths(tmp_path: Path) -> ScanPaths:
         mirror=vault / "mirror.txt",
         state=state / "dialog_scan_seen.json",
         deny=state / "deny.txt",
+        topics=state / "topics.txt",
         join_db=state / "telegram_join.db",
         digest_db=state / "telegram_digest.db",
     )
@@ -131,6 +183,7 @@ def _paths_in(tmp_path: Path) -> ScanPaths:
         mirror=state / "mirror.txt",
         state=state / "seen.json",
         deny=state / "deny.txt",
+        topics=state / "topics.txt",
         join_db=state / "join.db",
         digest_db=state / "digest.db",
     )
@@ -308,7 +361,7 @@ def test_every_deny_rule_form_actually_quarantines(rule_line, candidate, paths: 
     rules = load_deny_rules(paths.deny)
 
     assert deny_match(rules, candidate) is not None, f"{rule_line} matched nothing"
-    decision = classify(candidate, tracked=None, deny_rules=rules, linked_parents={})
+    decision = classify(candidate, tracked=None, deny_rules=rules, linked_parents={}, topic_scores=_PASS)
     assert decision.decision == "quarantine", decision.reason
 
 

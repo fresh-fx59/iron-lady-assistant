@@ -22,6 +22,57 @@ from src.telegram_dialog_scan import (
 )
 from src.telegram_digest import LEAD_SOURCE_ROLE, TelegramDigestStore
 
+# ── shim: run_scan's durable half now goes over POST /v1/sources/lead-enrol ──
+# These tests were written when the scanner opened the join/digest dbs itself.
+# The write MOVED to the proxy (it runs as the user that owns 0700
+# /var/lib/iron-lady; the scanner does not) — so the assertions below still pin
+# the SAME invariants, now through the real endpoint implementation, against the
+# same temp dbs. Two injected callables replace what used to be direct sqlite:
+# a post_reader (the topical gate's evidence) and a lead_enroller (the endpoint).
+from src.telegram_digest import TelegramDigestStore as _DigestStore  # noqa: E402
+from src.telegram_dialog_scan import run_scan as _run_scan  # noqa: E402
+from src.telegram_proxy import JoinStore as _JoinStore, TelegramProxy as _Proxy  # noqa: E402
+
+class _AlwaysPass(dict):
+    """topic_scores stand-in for the tests that predate the gate: every lookup is
+    a clean pass, so these cases keep testing what they were written to test."""
+
+    def get(self, key, default=None):
+        from src.telegram_dialog_scan import TopicScore
+
+        return TopicScore(score=1.0, hits=20, scored=20, read=20, status="ok")
+
+
+_PASS = _AlwaysPass()
+
+
+_TOPICAL_POST = "Новая модель OpenAI ускоряет инференс агентов в проде на 40 процентов"
+
+
+class _LocalEnroller(_Proxy):
+    """The REAL proxy method, pointed at the test's temp dbs."""
+
+    def __init__(self, digest_db, join_db):
+        self._digest_store = _DigestStore(digest_db)
+        self._join_store = _JoinStore(join_db)
+
+
+def _default_reader(kind, entity_id):
+    return [_TOPICAL_POST] * 20
+
+
+def run_scan(*, paths, post_reader=None, lead_enroller="default", **kwargs):
+    if lead_enroller == "default":
+        def lead_enroller(**payload):
+            return _LocalEnroller(paths.digest_db, paths.join_db).enrol_lead_source(**payload)
+    return _run_scan(
+        paths=paths,
+        post_reader=post_reader or _default_reader,
+        lead_enroller=lead_enroller,
+        **kwargs,
+    )
+
+
 
 def dialog(
     entity_id: int,
@@ -61,6 +112,7 @@ def paths(tmp_path: Path) -> ScanPaths:
         mirror=vault / "mirror.txt",
         state=state / "dialog_scan_seen.json",
         deny=state / "deny.txt",
+        topics=state / "topics.txt",
         join_db=state / "telegram_join.db",
         digest_db=state / "telegram_digest.db",
     )
@@ -128,7 +180,7 @@ def test_deny_file_extends_the_defaults(paths: ScanPaths) -> None:
     ],
 )
 def test_classification_matrix(candidate, expected_decision, paths: ScanPaths) -> None:
-    result = classify(candidate, tracked=None, deny_rules=load_deny_rules(paths.deny), linked_parents={})
+    result = classify(candidate, tracked=None, deny_rules=load_deny_rules(paths.deny), linked_parents={}, topic_scores=_PASS)
 
     assert result.decision == expected_decision, result.reason
     assert result.reason
@@ -144,6 +196,7 @@ def test_quarantine_reports_which_rule_fired(paths: ScanPaths) -> None:
         tracked=None,
         deny_rules=load_deny_rules(paths.deny),
         linked_parents={},
+        topic_scores=_PASS,
     )
 
     assert result.decision == "quarantine"
@@ -160,6 +213,7 @@ def test_no_username_group_is_enrolled_when_it_is_a_tracked_channels_discussion_
         tracked=None,
         deny_rules=[],
         linked_parents={21: parent},
+        topic_scores=_PASS,
     )
 
     assert result.decision == "enroll-both"
@@ -173,7 +227,7 @@ def test_handle_less_chat_of_a_tracked_but_not_news_eligible_parent_goes_to_lead
     parent = dialog(23, "channel", username=None, title="AI для своих", linked_chat_id=24)
     tracked = Tracked(digest_peer_keys={"channel:23"})
 
-    result = classify(dialog(24, "megagroup", username=None), tracked=tracked, deny_rules=[], linked_parents={24: parent})
+    result = classify(dialog(24, "megagroup", username=None), tracked=tracked, deny_rules=[], linked_parents={24: parent}, topic_scores=_PASS)
 
     assert result.decision == "enroll-leads"
     assert result.news_target is None
@@ -191,7 +245,7 @@ def test_handle_less_chat_of_an_untracked_parent_is_never_enrolled() -> None:
 
 
 def test_group_with_a_username_goes_to_leads_only_not_the_news_feed(paths: ScanPaths) -> None:
-    result = classify(dialog(22, "megagroup", username="random_chat"), tracked=None, deny_rules=[], linked_parents={})
+    result = classify(dialog(22, "megagroup", username="random_chat"), tracked=None, deny_rules=[], linked_parents={}, topic_scores=_PASS)
 
     assert result.decision == "enroll-leads"
     assert result.news_target is None

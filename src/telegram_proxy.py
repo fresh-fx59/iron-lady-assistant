@@ -6,6 +6,7 @@ import json
 import logging
 import os
 import random
+import re
 import sqlite3
 import time
 from dataclasses import asdict, dataclass
@@ -16,7 +17,7 @@ from typing import Any
 from aiohttp import web
 
 from . import config
-from .telegram_digest import TelegramDigestStore
+from .telegram_digest import LEAD_SOURCE_ROLE, TelegramDigestStore, _peer_key
 from .telegram_proxy_crypto import (
     TelegramProxyCredentials,
     decrypt_credentials,
@@ -205,6 +206,31 @@ class JoinStore:
             )
 
     # ── queue mutations ───────────────────────────────────────────
+    def record_existing_membership(self, target: str, kind: str, entity_id: int | None) -> bool:
+        """INSERT OR IGNORE a status='joined' row for a dialog we are ALREADY in.
+
+        Two properties this method exists to guarantee, both load-bearing for the
+        dialog scanner (see src/telegram_dialog_scan.py):
+          * INSERT OR IGNORE — an EXISTING row is never touched. A genuine
+            outstanding `request_sent` must not be duplicated (the joins PK is
+            `target`, so a second row under a different spelling dangles the real
+            one) nor overwritten into `joined`.
+          * status='joined' is both TRUE and INERT: the paced join loop only ever
+            selects pending/floodwait rows, so this can never cause a network
+            join. Returns True only when a new row was actually created.
+        """
+        now = _isoformat(_utc_now())
+        with self._connect() as con:
+            cur = con.execute(
+                """
+                INSERT OR IGNORE INTO joins(target, kind, status, entity_id,
+                                            created_at, updated_at, joined_at)
+                VALUES (?, ?, 'joined', ?, ?, ?, ?)
+                """,
+                (target, kind, entity_id, now, now, now),
+            )
+            return cur.rowcount == 1
+
     def upsert_pending(self, target: str, kind: str) -> bool:
         """Insert a pending row; leave an existing row untouched. Idempotent.
 
@@ -1047,6 +1073,68 @@ class TelegramProxy:
             self._digest_store = TelegramDigestStore()
         return self._digest_store
 
+    # Everything this route may write, in one place. `role` is NOT a parameter:
+    # a lead enrolment can only ever ADD the lead role.
+    ENROLLABLE_KINDS = ("channel", "linked_chat")
+
+    def enrol_lead_source(
+        self, *, entity_id: int, kind: str, title: str, username: str | None
+    ) -> dict[str, Any]:
+        """Add ONE dialog to the lead-source set. The narrowest write we can offer.
+
+        Exists because the daily dialog scanner runs as `claude-developer` while
+        /var/lib/iron-lady is `drwx------ iron-lady:iron-lady` — it cannot open
+        the join/digest dbs at all. This proxy already runs as the owning user and
+        already authenticates, which is how every other claude-developer-side job
+        in this fleet reaches iron-lady state (telegram-lead-scorer reads
+        /v1/lead-candidates the same way).
+
+        What it CANNOT do, deliberately:
+          * it cannot join anything or change join state — the only joins write is
+            `record_existing_membership`, an INSERT OR IGNORE of an INERT
+            status='joined' row for a dialog the account is already in; an
+            outstanding `request_sent` is left exactly as it is;
+          * it cannot write an arbitrary source row — `role` is hard-coded to the
+            lead role and `linked_channel_key` to None, neither is read from the
+            request, and `add_source_role` never rewrites an existing row (so a
+            lead enrolment can never evict a chat from the digest: the role column
+            is a SET and only ever grows);
+          * it cannot address anything but a `channel` / `linked_chat` peer id.
+
+        Idempotent by construction, which is what lets a caller whose request
+        TIMED OUT re-attempt on its next run without risking a double write.
+        """
+        peer_key = _peer_key(kind, entity_id)
+        join_note: str | None = None
+        join_row_created = False
+        if kind == "linked_chat":
+            # normalize_target() is the joins-table key convention, not a display
+            # string: it lowercases, strips the @/t.me wrapper and returns the
+            # `public`/`private` kind the proxy itself emits. A handle-less chat
+            # reuses the proxy's own linked-chat convention: kind='linked',
+            # target='id:<n>'.
+            join_kind, target = normalize_target(username) if username else ("linked", f"id:{entity_id}")
+            join_row_created = self._get_join_store().record_existing_membership(
+                target, join_kind, entity_id
+            )
+            if not join_row_created:
+                join_note = f"joins ledger already owns target {target!r} — its row was left untouched"
+        created = self._get_digest_store().add_source_role(
+            peer_key=peer_key,
+            entity_id=entity_id,
+            title=title,
+            username=username,
+            kind=kind,
+            linked_channel_key=None,
+            role=LEAD_SOURCE_ROLE,
+        )
+        return {
+            "peer_key": peer_key,
+            "created": created,
+            "join_row_created": join_row_created,
+            "join_note": join_note,
+        }
+
     def lead_candidates(
         self, *, since_id: int, limit: int, since_ts: str | None = None
     ) -> dict[str, Any]:
@@ -1868,6 +1956,64 @@ async def _lead_user(request: web.Request) -> web.Response:
     return web.json_response(await proxy.resolve_sender(sender_id))
 
 
+_ENROL_USERNAME_RE = re.compile(r"^[A-Za-z0-9_]{3,32}$")
+_ENROL_MAX_TITLE_CHARS = 256
+
+
+async def _enrol_lead_source(request: web.Request) -> web.Response:
+    """POST /v1/sources/lead-enrol — add ONE dialog to the lead-source set.
+
+    Every field is validated here and NOTHING else is read from the body: a
+    `role`, a `status`, a `linked_channel_key` or a `target` in the payload is
+    ignored, so the route cannot be talked into writing an arbitrary source row,
+    triggering a join, or altering join-request state. See
+    TelegramProxy.enrol_lead_source for the full contract.
+    """
+    _check_auth(request)
+    proxy: TelegramProxy = request.app["proxy"]
+    try:
+        payload = await request.json()
+    except Exception:
+        raise web.HTTPBadRequest(text="Invalid JSON body.") from None
+    if not isinstance(payload, dict):
+        raise web.HTTPBadRequest(text="Body must be a JSON object.")
+
+    raw_id = payload.get("entity_id")
+    if isinstance(raw_id, bool) or not isinstance(raw_id, (int, str)):
+        raise web.HTTPBadRequest(text="`entity_id` must be a positive integer.")
+    try:
+        entity_id = int(raw_id)
+    except (TypeError, ValueError):
+        raise web.HTTPBadRequest(text="`entity_id` must be a positive integer.") from None
+    if entity_id <= 0:
+        raise web.HTTPBadRequest(text="`entity_id` must be a positive integer.")
+
+    kind = str(payload.get("kind") or "").strip()
+    if kind not in TelegramProxy.ENROLLABLE_KINDS:
+        raise web.HTTPBadRequest(
+            text=f"`kind` must be one of {list(TelegramProxy.ENROLLABLE_KINDS)}."
+        )
+
+    username = payload.get("username")
+    if username is not None:
+        username = parse_public_username(str(username))
+        if not _ENROL_USERNAME_RE.match(username):
+            raise web.HTTPBadRequest(text="`username` must be a Telegram handle (3-32 [A-Za-z0-9_]).")
+        username = username or None
+
+    title = str(payload.get("title") or "").strip()[:_ENROL_MAX_TITLE_CHARS] or f"{kind}:{entity_id}"
+
+    try:
+        result = proxy.enrol_lead_source(
+            entity_id=entity_id, kind=kind, title=title, username=username
+        )
+    except web.HTTPException:
+        raise
+    except Exception as exc:
+        raise web.HTTPBadGateway(text=f"Lead-source enrolment failed: {exc}") from exc
+    return web.json_response({"ok": True, **result})
+
+
 async def _join_enqueue(request: web.Request) -> web.Response:
     _check_auth(request)
     proxy: TelegramProxy = request.app["proxy"]
@@ -1945,6 +2091,7 @@ def create_app() -> web.Application:
     app.router.add_get("/v1/leads/candidates", _leads_candidates)
     app.router.add_get("/v1/users/{sender_id}", _lead_user)
     app.router.add_post("/v1/telegram/createGroup", _create_group)
+    app.router.add_post("/v1/sources/lead-enrol", _enrol_lead_source)
     app.router.add_post("/v1/join/enqueue", _join_enqueue)
     app.router.add_post("/v1/join/sync-linked", _join_sync_linked)
     app.router.add_get("/v1/join/status", _join_status)

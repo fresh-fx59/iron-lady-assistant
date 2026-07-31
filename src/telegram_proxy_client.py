@@ -61,6 +61,39 @@ class TelegramProxyClient:
         )
         return list(payload.get("messages", []))
 
+    async def enrol_lead_source(
+        self, *, entity_id: int, kind: str, title: str, username: str | None
+    ) -> dict[str, Any]:
+        """POST /v1/sources/lead-enrol — the ONLY write this client makes.
+
+        The dialog scanner cannot open /var/lib/iron-lady (0700 iron-lady) so the
+        durable half of a lead enrolment goes through the proxy, which runs as the
+        owning user. A timeout is deliberately allowed to propagate as
+        `asyncio.TimeoutError`: the caller must treat it as AMBIGUOUS (the write
+        may have landed) rather than retry into a possible double write — the
+        route is idempotent, so the retry belongs to the next run.
+        """
+        return await self._post(
+            "/v1/sources/lead-enrol",
+            json_body={"entity_id": int(entity_id), "kind": kind, "title": title, "username": username},
+        )
+
+    async def _post(self, path: str, *, json_body: dict[str, Any]) -> dict[str, Any]:
+        session, url = self._prepare(path)
+        async with session as opened:
+            async with opened.post(url, json=json_body) as response:
+                response.raise_for_status()
+                return await response.json()
+
+    def _prepare(self, path: str):
+        if not self._base_url:
+            raise RuntimeError("TELEGRAM_PROXY_BASE_URL is not configured.")
+        if not self._api_key:
+            raise RuntimeError("TELEGRAM_PROXY_API_KEY is not configured.")
+        headers = {"Authorization": f"Bearer {self._api_key}"}
+        timeout = aiohttp.ClientTimeout(total=self._timeout)
+        return aiohttp.ClientSession(timeout=timeout, headers=headers), f"{self._base_url}{path}"
+
     async def _get(self, path: str, *, params: dict[str, str]) -> dict[str, Any]:
         if not self._base_url:
             raise RuntimeError("TELEGRAM_PROXY_BASE_URL is not configured.")

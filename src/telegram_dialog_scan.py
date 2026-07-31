@@ -53,6 +53,8 @@ from pathlib import Path
 from typing import Any, Callable, Iterable, Sequence
 
 from .telegram_aggregator import parse_sources, resolve_paths
+from .telegram_aggregator_gates import is_citable_link
+from .telegram_aggregator_publish import OPERATOR_ALERT_CAP
 from .telegram_digest import LEAD_SOURCE_ROLE, _peer_key
 from .telegram_proxy import normalize_target, parse_public_username
 
@@ -228,15 +230,48 @@ TOPIC_READ_MAX = 80
 # stem "нейросет" must still cover "нейросети"/"нейросетью".
 _WORD_START = r"(?<![0-9A-Za-zА-Яа-яЁё_])"
 
-# notify_operator() hands the text to the Bot API sliced at 4000 chars. The
-# report is RENDERED to that budget instead of being cut by it, so the parts the
-# operator must act on can never be the parts that fall off the end.
-MAX_REPORT_CHARS = 4000
+# notify_operator() hands the text to the Bot API sliced at OPERATOR_ALERT_CAP.
+# The report is RENDERED to that budget instead of being cut by it, so the parts
+# the operator must act on can never be the parts that fall off the end. The cap
+# is IMPORTED, not re-typed: two modules agreeing on 4000 by coincidence is how
+# the truncation marker itself ends up sliced off.
+MAX_REPORT_CHARS = OPERATOR_ALERT_CAP
+
+# Appended when the report is cut. render_report() guarantees the finished text
+# ends with this and fits the cap, so "truncated" is never itself truncated.
+TRUNCATION_MARKER = "\n… REPORT TRUNCATED (full report: journalctl -u telegram-dialog-scan)"
+
+def citable_handle(candidate: dict[str, Any]) -> str | None:
+    """The handle a PUBLISHED citation of this peer would be built from — or None.
+
+    ONE derivation, taken from the SAME field the message link is: the proxy
+    builds `link = https://t.me/<handle>/<id>` from `entity_username(entity)`,
+    and /v1/dialogs reports that very value as the record's `username` (it is
+    `_dialog_usernames(entity)[0]`, same legacy-then-`usernames` order). This is
+    deliberately NOT `_all_handles()`, which is the wider set used for deny
+    matching — the two CAN disagree, and citability must follow the link.
+
+    The shape is then checked against the publish gate's own pattern, so a peer
+    is "citable" only if the link the digest would emit is one the gate accepts.
+
+    Why it gates enrolment (prod 2026-07-31): a handle-less peer's messages get
+    `link=None`, `build_draft_input` drops link-less rows, and the gate rejects
+    the `t.me/c/<id>/<msg>` form a private peer would otherwise produce. Staging
+    such a peer as a digest input buys nothing and costs a read of it on every
+    collect run (5 chats x 5 runs/day) plus the corpus rows.
+    """
+    handle = str(candidate.get("username") or "").strip().lstrip("@")
+    if not handle:
+        return None
+    return handle if is_citable_link(f"https://t.me/{handle}/1") else None
+
 
 # A username Telegram would actually accept (used to reject a malformed deny rule).
 _HANDLE_RE = re.compile(r"^[a-z0-9_]{3,32}$")
 
-_STATE_VERSION = 2
+# 3 adds `pending_citable`. No migration needed: every key is read with .get(),
+# so a v2 file simply starts with an empty bucket.
+_STATE_VERSION = 3
 
 
 @dataclass(frozen=True)
@@ -284,6 +319,14 @@ class Decision:
     # channel; its parent channel's for a discussion chat). None only when no
     # gate applied — a DM, a bot, an own-publishing channel, a deny hit.
     topic_score: "TopicScore | None" = None
+    # Can this peer ever be CITED in a published digest? Reported for every
+    # enrollable peer (channel / group / megagroup), None for the kinds no
+    # publication path exists for at all (a DM, a bot).
+    citable: bool | None = None
+    # True only when citability is the ONE thing standing between this peer and
+    # chat_sources: parent is a news source, but the chat has no usable handle.
+    # Those ids go to the re-evaluated bucket, not to permanent `seen`.
+    citability_blocked: bool = False
 
 
 @dataclass
@@ -295,6 +338,9 @@ class Tracked:
     join_targets: set[str] = field(default_factory=set)
     seen_ids: set[int] = field(default_factory=set)
     quarantined_ids: set[int] = field(default_factory=set)
+    # Lead-enrolled, but held back from chat_sources ONLY because they had no
+    # public handle. Re-examined every run (see _already_tracked).
+    pending_citable_ids: set[int] = field(default_factory=set)
     # DISQUALIFYING read failures: an unreadable ledger means "I don't know what
     # is already tracked", which must never be treated as "nothing is tracked".
     errors: list[str] = field(default_factory=list)
@@ -310,15 +356,26 @@ class ScanReport:
     mirror_pending: list[str] = field(default_factory=list)
     ledger_notes: list[str] = field(default_factory=list)
     requarantined: list[int] = field(default_factory=list)
+    still_pending: list[int] = field(default_factory=list)
     errors: list[str] = field(default_factory=list)
     total_dialogs: int = 0
     by_kind: dict[str, int] = field(default_factory=dict)
     dry_run: bool = False
     skipped_locked: bool = False
-    wrote_nothing: bool = False
+    # RENAMED from `wrote_nothing` (prod 2026-07-31): this flag has always meant
+    # "this run REFUSED to write" (lock held, or a ledger unreadable) — the
+    # operator read `wrote_nothing: false` on a --dry-run that provably wrote
+    # nothing, because the run simply had not refused anything.
+    refused_to_write: bool = False
+    state_written: bool = False
     text: str = ""
     notified: bool = False
     notify_failed: bool = False
+
+    @property
+    def wrote_nothing(self) -> bool:
+        """Literally what it says: this run left no durable trace anywhere."""
+        return not (self.added_news or self.added_chat or self.added_leads or self.state_written)
 
 
 def resolve_scan_paths() -> ScanPaths:
@@ -725,14 +782,20 @@ def classify(
     # `or {}` would discard an EMPTY-but-present mapping — identity, not truthiness.
     scores: dict[tuple[str, int], TopicScore] = {} if topic_scores is None else topic_scores
 
+    # Reported for every peer a publication path could exist for, whatever the
+    # decision — the operator asked to SEE citability, not just be gated by it.
+    citable = citable_handle(candidate) is not None if kind in {"channel", "megagroup", "group"} else None
+
     def out(
         decision: str,
         reason: str,
         news_target: str | None = None,
         score: TopicScore | None = None,
+        citability_blocked: bool = False,
     ) -> Decision:
         return Decision(
-            entity_id, str(candidate.get("title") or ""), kind, handle, decision, reason, news_target, score
+            entity_id, str(candidate.get("title") or ""), kind, handle, decision, reason, news_target, score,
+            citable, citability_blocked,
         )
 
     if kind in {"user", "bot"}:
@@ -746,6 +809,17 @@ def classify(
     if kind == "channel":
         if not handle:
             return out("skip", "never-enroll: broadcast channel with no username (unaddressable)")
+        if citable is False:
+            # Same class as the chat case below: sources.txt is a PUBLIC-surface
+            # write and the digest cites t.me/<handle>/<id>. A handle that cannot
+            # form a link the publish gate accepts can never be cited.
+            return out(
+                "enroll-leads",
+                f"broadcast channel @{handle} has no citable public handle "
+                "(cannot form a t.me/<handle>/<id> link the digest gate accepts) "
+                "-> leads only, never a news source",
+                score=scores.get(("channel", entity_id)),
+            )
         score = scores.get(("channel", entity_id))
         # NEVER GUESS: no evidence is not "probably fine", and it is not "probably
         # bad" either — it is a quarantine the operator sees, with the reason.
@@ -786,6 +860,22 @@ def classify(
         if parent is not None:
             parent_score = scores.get(("channel", int(parent.get("entity_id") or 0)))
             if broadcast_channel_is_a_news_source(parent, deny_rules, topic_score=parent_score):
+                # CITABILITY FIRST — it needs no evidence and no read, and it is
+                # decisive: all five chats the live 2026-07-31 run staged were
+                # handle-less, so every one of them was inert in the digest while
+                # still costing a read per collect run. Leads still take it: that
+                # pipeline keys on entity_id and never publishes a link.
+                if citable_handle(candidate) is None:
+                    return out(
+                        "enroll-leads",
+                        f"discussion chat of news channel @{parent.get('username')} "
+                        f"(parent {parent_score.label()}), but it has no public handle "
+                        "⇒ cannot be cited in a published digest (its messages carry link=None and are "
+                        "dropped before the draft) -> leads only; re-checked every run, promoted if it "
+                        "ever gains one",
+                        score=own_score,
+                        citability_blocked=True,
+                    )
                 # chat_sources.txt is a PUBLIC-SURFACE write (the chat lane merged
                 # as 1db5342 and is deployed: the digest reads that file the moment
                 # it exists), so a passing PARENT is not enough — the live dry-run
@@ -959,6 +1049,7 @@ def load_tracked(
             state = json.loads(paths.state.read_text(encoding="utf-8"))
             tracked.seen_ids = {int(i) for i in state.get("seen") or []}
             tracked.quarantined_ids = {int(i) for i in state.get("quarantined") or []}
+            tracked.pending_citable_ids = {int(i) for i in state.get("pending_citable") or []}
         except Exception as exc:  # noqa: BLE001 — a corrupt state file must not stop the scan
             # Deliberately NOT a blocking error: "treat every dialog as new" is
             # safe here because the pipeline ledgers are the real dedup authority.
@@ -1000,6 +1091,16 @@ def _already_tracked(candidate: dict[str, Any], tracked: Tracked) -> bool:
     """
     entity_id = int(candidate.get("entity_id") or 0)
     handles = _all_handles(candidate)
+    if entity_id in tracked.pending_citable_ids:
+        # DELIBERATELY re-examined: it is lead-enrolled but was refused the public
+        # surface only because it had no handle, and a handle is a thing a chat
+        # GAINS. `seen` is permanent, so parking it there would mean "never
+        # reconsidered"; the quarantine bucket is the wrong home (that set means
+        # "enrolled nowhere"), so this is its own re-evaluated bucket. Re-running
+        # it is cheap and idempotent: _register_leads short-circuits on the
+        # digest peer_key it already holds, so the re-check costs one topical
+        # read and no write.
+        return False
     return bool(
         entity_id in tracked.seen_ids
         or entity_id in tracked.lead_entity_ids
@@ -1183,6 +1284,16 @@ def _release_lock(fd: int | None) -> None:
 _DECISION_ORDER = {"enroll-both": 0, "enroll-news": 1, "enroll-leads": 2, "quarantine": 3, "skip": 4}
 
 
+def _clamp(text: str, max_chars: int) -> str:
+    """LAST word on length. The row loop budgets, but the FIXED part (errors,
+    action lines) has no budget at all — a run with 40 unreadable-ledger errors
+    renders past the cap, notify_operator then slices at exactly the cap, and the
+    operator receives a report that looks complete and is not."""
+    if len(text) <= max_chars:
+        return text
+    return text[: max_chars - len(TRUNCATION_MARKER)].rstrip() + TRUNCATION_MARKER
+
+
 def render_report(report: ScanReport, *, max_chars: int = MAX_REPORT_CHARS) -> str:
     """ACTIONS and ERRORS first, the table last and BOUNDED.
 
@@ -1195,7 +1306,7 @@ def render_report(report: ScanReport, *, max_chars: int = MAX_REPORT_CHARS) -> s
     kinds = ", ".join(f"{k}={v}" for k, v in sorted(report.by_kind.items()))
     head = "dialog-scan" + (" (DRY RUN — nothing was written)" if report.dry_run else "")
     if report.skipped_locked:
-        return f"{head}: another dialog-scan run holds the lock — this pass did nothing."
+        return _clamp(f"{head}: another dialog-scan run holds the lock — this pass did nothing.", max_chars)
     lines = [f"{head}: {report.total_dialogs} dialogs ({kinds}); {len(report.new_dialogs)} new"]
 
     if report.added_news:
@@ -1216,14 +1327,22 @@ def render_report(report: ScanReport, *, max_chars: int = MAX_REPORT_CHARS) -> s
             f"({len(report.requarantined)} dialog(s) still quarantined by the deny list — unchanged; "
             "delete the rule to re-open them.)"
         )
-    if report.wrote_nothing and not report.dry_run:
+    if report.still_pending:
+        lines.append(
+            f"({len(report.still_pending)} chat(s) still lead-only: no public handle, so they cannot be "
+            "cited in the digest — re-checked every run, promoted automatically if one appears.)"
+        )
+    if report.refused_to_write and not report.dry_run:
         lines += ["", "NOTHING WAS WRITTEN THIS RUN (see ERRORS)."]
     if report.errors:
         lines += ["", "ERRORS:", *[f"- {e}" for e in report.errors]]
 
     fixed = "\n".join(lines)
     if not report.decisions:
-        return fixed
+        return _clamp(fixed, max_chars)
+
+    def _cite_cell(d: Decision) -> str:
+        return f"{('-' if d.citable is None else ('yes' if d.citable else 'no')):^5}"
 
     def _score_cell(d: Decision) -> str:
         if d.topic_score is None:
@@ -1233,14 +1352,16 @@ def render_report(report: ScanReport, *, max_chars: int = MAX_REPORT_CHARS) -> s
         return f"{d.topic_score.score:>6.2f}"
 
     rows = [
-        f"{d.decision:<13} {d.kind:<10} {_score_cell(d)}  {d.entity_id:>14}  "
+        f"{d.decision:<13} {d.kind:<10} {_score_cell(d)} {_cite_cell(d)}  {d.entity_id:>14}  "
         f"{('@' + d.username) if d.username else (d.title or f'dialog:{d.entity_id}')} — {d.reason}"
         for d in sorted(report.decisions, key=lambda d: (_DECISION_ORDER.get(d.decision, 9), d.kind))
     ]
     header = (
-        f"\n\n{'decision':<13} {'kind':<10} {'score':>6}  {'id':>14}  handle / title — why"
+        f"\n\n{'decision':<13} {'kind':<10} {'score':>6} {'cite':^5}  {'id':>14}  handle / title — why"
         f"\n(topical score = share of the last {TOPIC_READ_POSTS} readable posts matching the topic "
-        f"vocabulary; pass >= {TOPIC_SCORE_THRESHOLD:.2f} with >= {MIN_SCOREABLE_POSTS} posts)"
+        f"vocabulary; pass >= {TOPIC_SCORE_THRESHOLD:.2f} with >= {MIN_SCOREABLE_POSTS} posts. "
+        f"cite = the peer has a public handle, i.e. its messages can carry a t.me/<handle>/<id> "
+        f"link a published digest may cite; a non-citable peer is lead-only.)"
     )
     notice_room = 120  # room for the explicit truncation notice
     budget = max_chars - len(fixed) - len(header) - notice_room
@@ -1257,7 +1378,7 @@ def render_report(report: ScanReport, *, max_chars: int = MAX_REPORT_CHARS) -> s
             f"\n… TABLE TRUNCATED: {len(shown)} of {len(rows)} rows shown "
             "(full table: journalctl -u telegram-dialog-scan)"
         )
-    return text
+    return _clamp(text, max_chars)
 
 
 # ── the run ───────────────────────────────────────────────────────
@@ -1285,7 +1406,7 @@ def run_scan(
     if not dry_run:
         lock_fd, lock_error = _acquire_lock(paths.lock_path())
         if lock_fd is None:
-            report.wrote_nothing = True
+            report.refused_to_write = True
             if lock_error is None:
                 report.skipped_locked = True
                 report.text = render_report(report, max_chars=max_report_chars)
@@ -1406,7 +1527,13 @@ def _run_scan_locked(
     report.requarantined = [
         d.entity_id for d in decisions if d.decision == "quarantine" and d.entity_id in tracked.quarantined_ids
     ]
-    known = set(report.requarantined)
+    # Same discipline for a chat we already reported as "lead-enrolled, not
+    # citable": say it once, then only as a count, or the nightly scan pages the
+    # operator about the same handle-less chat forever.
+    report.still_pending = [
+        d.entity_id for d in decisions if d.citability_blocked and d.entity_id in tracked.pending_citable_ids
+    ]
+    known = set(report.requarantined) | set(report.still_pending)
     report.decisions = [d for d in decisions if d.entity_id not in known]
 
     stamp = datetime.now(timezone.utc).date().isoformat()
@@ -1415,7 +1542,7 @@ def _run_scan_locked(
     if tracked.errors:
         # An unknown ledger is NOT an empty ledger: writing now would re-enroll
         # everything that is already tracked. Refuse, and say so.
-        report.wrote_nothing = True
+        report.refused_to_write = True
         report.errors.append(
             "refusing to write this run: a pipeline ledger could not be read, and treating an "
             "unreadable ledger as empty would re-enroll sources that are already tracked"
@@ -1436,8 +1563,11 @@ def _run_scan_locked(
             and d.username.lower() not in tracked.news_handles
             and d.entity_id in enrolment.ok_ids
         ]
+        # No bare-id branch any more: `news_target == "chat_sources"` now IMPLIES a
+        # citable handle (classify refuses otherwise), so every line we write is a
+        # link the digest can actually cite.
         chat_lines = [
-            (f"https://t.me/{d.username}" if d.username else str(d.entity_id))
+            f"https://t.me/{d.username}"
             for d in decisions
             if d.news_target == "chat_sources"
             and d.entity_id in enrolment.ok_ids
@@ -1482,12 +1612,17 @@ def _run_scan_locked(
         if news_lines and not news_written:
             incomplete |= {d.entity_id for d in decisions if d.news_target == "sources"}
         quarantined = {d.entity_id for d in decisions if d.decision == "quarantine"}
+        # Blocked ONLY on citability => its own re-evaluated bucket, never `seen`.
+        pending = {d.entity_id for d in decisions if d.citability_blocked}
         all_ids = {int(d.get("entity_id") or 0) for d in dialogs}
-        seen = (tracked.seen_ids | all_ids) - incomplete - quarantined
+        seen = (tracked.seen_ids | all_ids) - incomplete - quarantined - pending
         # Quarantined ids live in their OWN set, never in `seen`: that is what
         # lets a removed deny rule genuinely re-open a dialog. Ids missing from
         # today's dialog list keep their remembered quarantine.
         state_quarantined = quarantined | (tracked.quarantined_ids - all_ids)
+        # A pending chat that GAINED a handle is in all_ids and no longer
+        # citability-blocked, so it drops out of the bucket and lands in `seen`.
+        state_pending = pending | (tracked.pending_citable_ids - all_ids)
         try:
             paths.state.parent.mkdir(parents=True, exist_ok=True)
             paths.state.write_text(
@@ -1497,6 +1632,7 @@ def _run_scan_locked(
                         "updated": stamp,
                         "seen": sorted(seen),
                         "quarantined": sorted(state_quarantined),
+                        "pending_citable": sorted(state_pending),
                     },
                     ensure_ascii=False,
                 )
@@ -1506,6 +1642,8 @@ def _run_scan_locked(
                 f"state file write FAILED ({paths.state}): {exc}; this run's enrolments ARE live "
                 "but will be re-proposed next run (the pipeline ledgers still dedup them)"
             )
+        else:
+            report.state_written = True
 
     report.text = render_report(report, max_chars=max_report_chars)
     # Problems-and-changes only: a run whose new dialogs are all skips (a DM, a

@@ -8,6 +8,7 @@ on the pre-fix code.
 from __future__ import annotations
 
 import fcntl
+import io
 import json
 import os
 import sqlite3
@@ -416,11 +417,17 @@ def test_the_report_calls_a_chat_sources_write_a_PUBLIC_surface(paths: ScanPaths
     deployed, so the file is a live digest input the moment it exists. Telling
     the operator a public write is inert is worse than saying nothing."""
     parent = dialog(900, "channel", username="already_news", linked_chat_id=901)
-    child = dialog(901, "megagroup", username=None, title="Discussion")
+    # NOTE (2026-07-31): this child used to be handle-less and was asserted to
+    # land in chat_sources as the bare id "901". The live run proved that write
+    # inert — a handle-less chat's messages carry link=None and never survive to
+    # the draft — so citability is now a precondition and the case that reaches
+    # chat_sources is the citable one. The report's WORDING is what this test is
+    # about, and that is unchanged.
+    child = dialog(901, "megagroup", username="already_news_chat", title="Discussion")
 
     report = run_scan(paths=paths, dialogs=[parent, child])
 
-    assert report.added_chat == ["901"]
+    assert report.added_chat == ["https://t.me/already_news_chat"]
     assert "STAGED" not in report.text
     assert "PUBLIC" in report.text
     assert "chat_sources" in report.text
@@ -549,3 +556,241 @@ def test_a_run_that_changed_nothing_notifies_nobody(paths: ScanPaths) -> None:
 
     assert sent == []
     assert report.notified is False
+
+
+# ===========================================================================
+# PROD RUN 2026-07-31 08:54 — three defects found by running the scanner for
+# real on contabo-prod. All three are the "silent write" shape again: the write
+# lands, the telling fails.
+# ===========================================================================
+
+
+class _FakeResp:
+    def __init__(self, message_id=256):
+        self._mid = message_id
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+    def read(self):
+        return json.dumps({"result": {"message_id": self._mid}}).encode()
+
+
+def _telegram_like_urlopen(captured: dict):
+    """Stand-in for api.telegram.org that behaves the way the REAL API did:
+    with parse_mode=HTML an unescaped `<` is a hard 400, not a warning."""
+    import urllib.error
+    import urllib.parse
+
+    def fake_urlopen(request, timeout=None):
+        payload = dict(urllib.parse.parse_qsl(request.data.decode()))
+        captured.update(payload)
+        captured["url"] = request.full_url
+        if payload.get("parse_mode") == "HTML" and "<" in payload.get("text", ""):
+            raise urllib.error.HTTPError(
+                request.full_url, 400, "Bad Request", {},  # type: ignore[arg-type]
+                io.BytesIO(json.dumps({"ok": False, "description": "can't parse entities"}).encode()),
+            )
+        return _FakeResp()
+
+    return fake_urlopen
+
+
+def test_operator_report_with_angle_brackets_is_actually_delivered(paths: ScanPaths, monkeypatch) -> None:
+    """PROD 2026-07-31: `HTTP Error 400` — notify_operator sent the plain-text
+    report with parse_mode=HTML, and Telegram rejected the WHOLE message because
+    the report says `... scores 0.19 < 0.35 ...`. The report reached nobody."""
+    import src.telegram_aggregator_publish as pub
+
+    monkeypatch.setenv("AGGREGATOR_ALERT_BOT_TOKEN", "tok123")
+    monkeypatch.setenv("AGGREGATOR_OPERATOR_CHAT_ID", "1000000001")
+    captured: dict = {}
+    monkeypatch.setattr(pub.urllib.request, "urlopen", _telegram_like_urlopen(captured))
+
+    parent = dialog(100, "channel", username="ai_news_parent", linked_chat_id=200)
+    chat = dialog(200, "megagroup", username="ai_news_chat")  # off-topic => "... < 0.35 ..."
+    other = dialog(101, "channel", username="ai_news_two", linked_chat_id=300)
+    naked = dialog(300, "megagroup", title="R&D <lab> chat")  # title reaches the table verbatim
+
+    def reader(kind, entity_id):
+        return ["просто болтовня о погоде и котиках"] * 20 if kind == "linked_chat" else [_TOPICAL_POST] * 20
+
+    report = run_scan(
+        paths=paths,
+        dialogs=[parent, chat, other, naked],
+        post_reader=reader,
+        notifier=pub.notify_operator,
+    )
+
+    assert "<" in report.text and "&" in report.text and "@ai_news_parent" in report.text
+    assert report.notified is True, report.errors
+    assert report.notify_failed is False
+    assert "parse_mode" not in captured, "an operator report is PLAIN TEXT, not HTML"
+    assert captured["text"] == report.text, "the operator must receive the report verbatim"
+
+
+def test_report_cap_matches_the_alert_cap_and_the_marker_survives(paths: ScanPaths) -> None:
+    """The renderer budgets to MAX_REPORT_CHARS and notify_operator slices at its
+    own cap: if they ever disagree, the truncation marker itself gets cut off and
+    the operator cannot tell a truncated report from a complete one."""
+    from src.telegram_aggregator_publish import OPERATOR_ALERT_CAP
+    from src.telegram_dialog_scan import MAX_REPORT_CHARS, TRUNCATION_MARKER, ScanReport
+
+    assert MAX_REPORT_CHARS == OPERATOR_ALERT_CAP
+
+    report = ScanReport(total_dialogs=3)
+    report.errors = [f"ledger {i} unreadable: " + "x" * 200 for i in range(40)]  # blows the budget alone
+    report.decisions = [
+        classify(dialog(900 + i, "channel", username=f"chan_{i}"), tracked=None, deny_rules=[],
+                 linked_parents={}, topic_scores=_PASS)
+        for i in range(5)
+    ]
+    text = render_report(report)
+    assert len(text) <= MAX_REPORT_CHARS
+    assert text.endswith(TRUNCATION_MARKER), text[-160:]
+    assert text[:OPERATOR_ALERT_CAP] == text
+
+
+# ── 2. the topical gate staged five chats that can NEVER be published ──
+
+
+def test_handle_less_chat_of_a_news_parent_goes_to_leads_only(paths: ScanPaths) -> None:
+    """PROD: all five staged chats were handle-less (username: null). Their
+    messages get link=None from the proxy, build_draft_input drops link-less
+    rows, and _T_ME rejects the t.me/c/<id>/<msg> shape — so chat_sources bought
+    nothing and cost a read of each chat on every collect run."""
+    parent = dialog(100, "channel", username="ai_news_parent")
+    chat = dialog(2771751570, "megagroup", title="закрытый чат", linked_chat_id=100)
+
+    d = classify(chat, tracked=None, deny_rules=[], linked_parents={2771751570: parent}, topic_scores=_PASS)
+
+    assert d.decision == "enroll-leads"
+    assert d.news_target is None
+    assert d.citable is False
+    assert "no public handle" in d.reason
+    assert d.citability_blocked is True
+
+
+def test_citable_chat_of_a_news_parent_still_reaches_chat_sources(paths: ScanPaths) -> None:
+    parent = dialog(100, "channel", username="ai_news_parent")
+    chat = dialog(200, "megagroup", username="ai_news_chat", linked_chat_id=100)
+
+    d = classify(chat, tracked=None, deny_rules=[], linked_parents={200: parent}, topic_scores=_PASS)
+
+    assert d.decision == "enroll-both"
+    assert d.news_target == "chat_sources"
+    assert d.citable is True
+    assert d.citability_blocked is False
+
+
+def test_citability_uses_the_link_shape_the_digest_will_publish(paths: ScanPaths) -> None:
+    """A handle Telegram would never mint (too short) cannot form a t.me link the
+    publish gate accepts — derive citability from THAT, not from 'is truthy'."""
+    from src.telegram_aggregator_gates import is_citable_link
+    from src.telegram_dialog_scan import citable_handle
+
+    assert is_citable_link("https://t.me/ai_news_chat/17") is True
+    assert is_citable_link("https://t.me/c/2771751570/17") is False
+    assert citable_handle({"username": "ab"}) is None
+    assert citable_handle({"username": None}) is None
+    assert citable_handle({"username": "@ai_news_chat"}) == "ai_news_chat"
+
+
+def test_every_chat_decision_reports_citability_in_the_table(paths: ScanPaths) -> None:
+    parent = dialog(100, "channel", username="ai_news_parent", linked_chat_id=200)
+    other = dialog(101, "channel", username="ai_news_two", linked_chat_id=300)
+    handled = dialog(200, "megagroup", username="ai_news_chat")
+    naked = dialog(300, "megagroup", title="без хэндла")
+    report = run_scan(paths=paths, dialogs=[parent, other, handled, naked], dry_run=True)
+
+    by_id = {d.entity_id: d for d in report.decisions}
+    assert by_id[200].citable is True and by_id[300].citable is False
+    assert "cite" in report.text
+    naked_row = next(line for line in report.text.splitlines() if "без хэндла" in line)
+    assert " no " in naked_row
+
+
+def test_a_non_citable_chat_is_re_examined_next_run_and_promoted_when_it_gains_a_handle(
+    paths: ScanPaths,
+) -> None:
+    """`seen` is permanent, so a chat parked there can never be reconsidered. A
+    chat blocked ONLY on citability goes into the re-evaluated bucket instead."""
+    parent = dialog(100, "channel", username="ai_news_parent", linked_chat_id=300)
+    naked = dialog(300, "megagroup", title="чат без хэндла")
+
+    first = run_scan(paths=paths, dialogs=[parent, naked])
+    assert 300 in first.added_leads
+    state = json.loads(paths.state.read_text())
+    assert 300 in state["pending_citable"]
+    assert 300 not in state["seen"]
+
+    # it gains a public handle
+    now_public = dialog(300, "megagroup", title="чат без хэндла", username="ai_news_chat")
+    second = run_scan(paths=paths, dialogs=[parent, now_public])
+    assert second.added_chat == ["https://t.me/ai_news_chat"]
+    assert 300 in json.loads(paths.state.read_text())["seen"]
+    assert 300 not in json.loads(paths.state.read_text())["pending_citable"]
+
+
+def test_a_still_non_citable_chat_does_not_page_the_operator_every_night(paths: ScanPaths) -> None:
+    parent = dialog(100, "channel", username="ai_news_parent", linked_chat_id=300)
+    naked = dialog(300, "megagroup", title="чат без хэндла")
+    run_scan(paths=paths, dialogs=[parent, naked])
+
+    sent: list[str] = []
+    second = run_scan(paths=paths, dialogs=[parent, naked], notifier=_notifier(sent))
+
+    assert [d.entity_id for d in second.decisions] == []
+    assert second.still_pending == [300]
+    assert sent == []
+
+
+# ── 3. `wrote_nothing` said the opposite of what it means ──
+
+
+def test_dry_run_reports_that_it_wrote_nothing(paths: ScanPaths) -> None:
+    """PROD: a --dry-run that provably wrote nothing reported wrote_nothing:false.
+    The field measured 'this run did not REFUSE to write'."""
+    before = paths.sources.read_text()
+    report = run_scan(paths=paths, dialogs=[dialog(400, "channel", username="fresh_ai_chan")], dry_run=True)
+
+    assert paths.sources.read_text() == before
+    assert not paths.chat_sources.exists()
+    assert not paths.state.exists()
+    assert report.wrote_nothing is True
+    assert report.refused_to_write is False
+
+
+def test_a_run_that_writes_reports_wrote_nothing_false(paths: ScanPaths) -> None:
+    report = run_scan(paths=paths, dialogs=[dialog(400, "channel", username="fresh_ai_chan")])
+    assert report.added_news == ["https://t.me/fresh_ai_chan"]
+    assert report.wrote_nothing is False
+    assert report.refused_to_write is False
+
+
+def test_cli_json_reports_wrote_nothing_truthfully_on_a_dry_run(tmp_path: Path, monkeypatch, capsys) -> None:
+    """The operator reads this JSON line, not the dataclass."""
+    from src import telegram_dialog_scan_tool as tool
+
+    class FakeClient:
+        def __init__(self, **kwargs) -> None:
+            pass
+
+        async def list_dialogs(self, *, limit: int, with_linked: bool = False):
+            return [dialog(400, "channel", username="fresh_ai_chan")]
+
+        async def read_messages(self, **kwargs):
+            return [{"text": _TOPICAL_POST}] * 20
+
+    monkeypatch.setenv("TELEGRAM_PROXY_API_KEY", "k")
+    monkeypatch.setattr(tool, "TelegramProxyClient", FakeClient)
+    monkeypatch.setattr(tool, "resolve_scan_paths", lambda: _paths_in(tmp_path))
+
+    tool._cmd_scan(types.SimpleNamespace(limit=500, dry_run=True, no_notify=True))
+
+    line = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
+    assert line["wrote_nothing"] is True
+    assert line["refused_to_write"] is False

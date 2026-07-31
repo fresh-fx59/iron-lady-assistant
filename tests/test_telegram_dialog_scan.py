@@ -216,8 +216,14 @@ def test_no_username_group_is_enrolled_when_it_is_a_tracked_channels_discussion_
         topic_scores=_PASS,
     )
 
-    assert result.decision == "enroll-both"
-    assert result.news_target == "chat_sources"
+    # UPDATED 2026-07-31 (live run): enrolled, yes — but into LEADS only. A
+    # handle-less chat cannot be cited in a published digest, so chat_sources
+    # would stage a permanently inert input. See the citability tests in
+    # test_telegram_dialog_scan_defects.py.
+    assert result.decision == "enroll-leads"
+    assert result.news_target is None
+    assert result.citable is False
+    assert result.citability_blocked is True
     assert "already_news" in result.reason
 
 
@@ -267,14 +273,16 @@ def test_run_scan_enrolls_a_new_channel_into_news_and_leads(paths: ScanPaths) ->
 
 def test_run_scan_writes_groups_to_chat_sources_in_the_shared_format(paths: ScanPaths) -> None:
     parent = dialog(40, "channel", username="already_news", linked_chat_id=41)
-    child = dialog(41, "megagroup", username=None, title="Already chat")
+    child = dialog(41, "megagroup", username="already_news_chat", title="Already chat")
 
     report = run_scan(paths=paths, dialogs=[parent, child])
 
-    # Numeric-id form: the discussion chat has no handle (chat_sources.txt
-    # accepts either a t.me URL or a bare entity id — the other branch's format).
-    assert paths.chat_sources.read_text().strip().splitlines()[-1] == "41"
-    assert report.added_chat == ["41"]
+    # t.me URL form — the ONLY form written now. The bare-id form the reader
+    # still accepts (the other branch's format) can only ever describe a
+    # handle-less chat, and those are refused chat_sources outright since the
+    # 2026-07-31 live run proved them inert in the digest.
+    assert paths.chat_sources.read_text().strip().splitlines()[-1] == "https://t.me/already_news_chat"
+    assert report.added_chat == ["https://t.me/already_news_chat"]
 
 
 def test_run_scan_never_touches_existing_lines(paths: ScanPaths) -> None:

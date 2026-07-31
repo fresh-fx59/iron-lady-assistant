@@ -242,14 +242,45 @@ def test_notify_operator_resolves_file_delivered_token(tmp_path, monkeypatch):
         def __init__(self, token):
             captured["token"] = token
 
-        def send_message(self, chat, text):
+        def send_message(self, chat, text, *, parse_mode="HTML"):
             captured["chat"] = chat
             captured["text"] = text
+            captured["parse_mode"] = parse_mode
             return 1
 
     monkeypatch.setattr(pub, "BotApiTransport", CapturingTransport)
     assert pub.notify_operator("привет") is True
-    assert captured == {"token": "file-token-123", "chat": "42", "text": "привет"}
+    assert captured == {
+        "token": "file-token-123",
+        "chat": "42",
+        "text": "привет",
+        # an operator alert is PLAIN TEXT: with parse_mode=HTML a report saying
+        # "scores 0.19 < 0.35" is a hard 400 and reaches nobody (prod 2026-07-31)
+        "parse_mode": None,
+    }
+
+
+def test_botapi_send_message_defaults_to_html_but_can_send_plain(monkeypatch):
+    """The digest's own posts ARE HTML; operator alerts are not. One transport,
+    the parse mode chosen by the caller — and omitted entirely when plain."""
+    import urllib.parse
+
+    import src.telegram_aggregator_publish as pub
+
+    bodies = []
+
+    def fake_urlopen(request, timeout=None):
+        bodies.append(dict(urllib.parse.parse_qsl(request.data.decode())))
+        return _FakeResp(11)
+
+    monkeypatch.setattr(pub.urllib.request, "urlopen", fake_urlopen)
+
+    BotApiTransport("tok").send_message("@chan", "<b>digest</b>")
+    BotApiTransport("tok").send_message("42", "0.19 < 0.35 & @handle", parse_mode=None)
+
+    assert bodies[0]["parse_mode"] == "HTML"
+    assert "parse_mode" not in bodies[1]
+    assert bodies[1]["text"] == "0.19 < 0.35 & @handle"
 
 
 # ===========================================================================

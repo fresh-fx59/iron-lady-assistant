@@ -13,6 +13,20 @@ import unicodedata
 from dataclasses import dataclass
 
 _T_ME = re.compile(r"^https://t\.me/[A-Za-z][A-Za-z0-9_]{3,31}/\d+$")
+
+
+def is_citable_link(link: str) -> bool:
+    """The ONE definition of a message link this pipeline may PUBLISH.
+
+    The publish gate below rejects every story link that does not match `_T_ME`,
+    so anything upstream that decides "can this peer ever be cited?" has to ask
+    the same question of the same pattern — otherwise a peer gets staged as a
+    digest input whose messages can never survive the gate (2026-07-31: five
+    handle-less chats staged into chat_sources.txt; their messages carry
+    `link=None`, and the `t.me/c/<id>/<msg>` form a private peer would produce is
+    rejected here anyway).
+    """
+    return bool(_T_ME.match(link))
 _OVERLAP_WORDS = 12
 
 

@@ -316,7 +316,14 @@ def _cmd_publish(args: argparse.Namespace) -> int:
     # Problems-only alerting (operator 2026-07-15): success is silent — the
     # published post itself is the signal.
     if result["status"] in ("failed", "blocked"):
-        notify_operator(f"❌ Публикация дайджеста: {result['status']} — {result.get('error', 'см. журнал')}")
+        # Sibling of the dialog-scan report and the same rule: an alert must say
+        # what to DO, not only what happened.
+        notify_operator(
+            f"❌ Публикация дайджеста: {result['status']} — {result.get('error', 'см. журнал')}\n"
+            f"ЧТО ДЕЛАТЬ: посмотреть журнал, затем повторить публикацию вручную:\n"
+            f"    journalctl -u telegram-aggregator-publish --since today --no-pager\n"
+            f"    python -m src.telegram_aggregator_tool publish"
+        )
     return 0 if result["status"] in ("posted", "dry-run", "skipped") else 1
 
 

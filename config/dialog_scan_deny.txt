@@ -51,7 +51,13 @@
 # allowlist. A music-production chat carries no AI/dev signal. Found by the
 # 2026-07-30 live dry-run — the first concrete instance of the poisoning path the
 # deny list exists for. (Open question for the operator: @erdman_music itself is
-# arguably off-topic for an AI digest and has been silent since 2026-07-14.)
+# arguably OFF-TOPIC for an AI digest. Off-topic is the only reason on the table
+# here: SILENCE IS NOT A REMOVAL REASON — a channel that stops posting
+# contributes nothing to the digest and costs nothing to keep, so it is kept.
+# Four channels were removed for going quiet on 2026-07-30 and had to be
+# restored: @indie_nomad, @aienge, @balexeyinsight, @hack_n_vibe. Never add a
+# deny line for dormancy: the topical gate re-adds a dormant channel for free the
+# moment it posts again, and a deny line is what blocks that self-healing.)
 #
 # 1609072825 is the CHAT's OWN entity id, re-confirmed against the 2026-07-30
 # dry-run table: every table row is one dialog, and that id sits on the

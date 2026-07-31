@@ -3,8 +3,10 @@
     python -m src.telegram_dialog_scan_tool scan [--dry-run] [--limit N]
 
 Prints the classification table on stdout plus one JSON summary line (same shape
-as the other pipeline tools), and notifies the operator ONLY when something
-changed or broke — including when the run itself failed, because a silent nightly
+as the other pipeline tools). The operator is messaged ONLY when the run contains
+something they must DO (see `operator_actions`) — a night that enrolled sources
+but needs nothing from them sends nothing at all. The one thing that always
+messages is the run FAILING before it could report, because a silent nightly
 failure is indistinguishable from "no new dialogs".
 """
 from __future__ import annotations
@@ -88,7 +90,13 @@ def _cmd_scan(args: argparse.Namespace) -> int:
         # run_scan can notify, and this job's ONLY output is that notification:
         # an uncaught traceback in the journal looks exactly like a quiet "no new
         # dialogs" night.
-        detail = f"dialog-scan FAILED before it could report: {type(exc).__name__}: {exc}"
+        # This alert says what to DO, like every other one: an operator woken by
+        # a message with no next step is the defect the report itself was fixing.
+        detail = (
+            f"dialog-scan: NEEDS YOU: 1\n\nACTION 1/1 — the run FAILED before it could report "
+            f"({type(exc).__name__}: {exc}). Nothing was scanned or enrolled; the next timer run retries. "
+            "Read the traceback:\n    journalctl -u telegram-dialog-scan --since today --no-pager"
+        )
         logger.error("%s\n%s", detail, traceback.format_exc())
         delivered = bool(notifier(detail)) if notifier is not None else False
         print(
@@ -121,8 +129,11 @@ def _cmd_scan(args: argparse.Namespace) -> int:
                 "refused_to_write": report.refused_to_write,
                 "skipped_locked": report.skipped_locked,
                 "errors": report.errors,
+                # Three outcomes, never two: sent / tried-and-failed / nothing
+                # needed the operator so nothing was sent (the healthy night).
                 "notified": report.notified,
                 "notify_failed": report.notify_failed,
+                "notify_skipped": report.notify_skipped,
             },
             ensure_ascii=False,
         )
@@ -142,7 +153,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--dry-run",
         action="store_true",
-        help="print the table and write nothing — but STILL notify, so 'watch it for a night' works",
+        help="print the table and write nothing (a message is still sent if something needs the operator)",
     )
     p.add_argument("--no-notify", action="store_true", help="never message the operator (local runs)")
     p.set_defaults(func=_cmd_scan)

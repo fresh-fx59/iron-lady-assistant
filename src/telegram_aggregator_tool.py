@@ -15,9 +15,13 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from .telegram_aggregator import (
+    CHAT_MAX_PER_RUN,
+    CHAT_READ_LIMIT,
     build_draft_input,
     collect,
+    collect_chats,
     load_file_env,
+    parse_chat_sources,
     parse_sources,
     resolve_paths,
 )
@@ -91,6 +95,55 @@ def _print(payload: dict) -> None:
     print(json.dumps(payload, ensure_ascii=False))
 
 
+def _proxy_client() -> TelegramProxyClient:
+    return TelegramProxyClient(
+        api_key=os.environ.get("TELEGRAM_PROXY_API_KEY") or None,
+        base_url=os.environ.get("TELEGRAM_PROXY_BASE_URL") or None,
+    )
+
+
+def _chat_allowlist(paths) -> list:
+    """The discussion-chat allowlist — the ON switch for the chat lane.
+
+    Default OFF, and the *file* is the flag: no `chat_sources.txt`, or a file that
+    parses to nothing, means the chat lane never runs. Merging this code therefore
+    cannot change today's digest by itself.
+
+    A file whose lines ALL fail to parse is deliberately not "nothing": the entries
+    come back as `ChatSource("invalid", …)` so the run reports the typos in
+    `unresolved` instead of looking like a lane that was never switched on.
+    """
+    if not paths.chat_sources_path.exists():
+        return []
+    return parse_chat_sources(paths.chat_sources_path.read_text())
+
+
+async def _collect_all(client, store, sources, chat_sources, args) -> dict:
+    """Both lanes on ONE dialog sweep.
+
+    ``list_channels`` is a full dialog enumeration plus one GetFullChannel per
+    channel (~60 RPCs on this account); the chat lane resolves its handles from the
+    SAME records, so it must never trigger a second sweep in the same run.
+    """
+    channels = await client.list_channels(limit=500)
+    payload = {
+        "status": "ok",
+        **await collect(
+            client, store, sources, collect_limit=args.collect_limit, channels=channels
+        ),
+    }
+    if chat_sources:
+        payload["chats"] = await collect_chats(
+            client,
+            store,
+            chat_sources,
+            channels=channels,
+            read_limit=args.chat_read_limit,
+            max_per_run=args.chat_max_per_run,
+        )
+    return payload
+
+
 def _cmd_collect(args: argparse.Namespace) -> int:
     load_file_env()
     paths = resolve_paths()
@@ -99,11 +152,38 @@ def _cmd_collect(args: argparse.Namespace) -> int:
         return 1
     sources = parse_sources(paths.sources_path.read_text())
     store = TelegramDigestStore(paths.db_path)
-    client = TelegramProxyClient(
-        api_key=os.environ.get("TELEGRAM_PROXY_API_KEY") or None,
-        base_url=os.environ.get("TELEGRAM_PROXY_BASE_URL") or None,
+    _print(
+        asyncio.run(
+            _collect_all(_proxy_client(), store, sources, _chat_allowlist(paths), args)
+        )
     )
-    result = asyncio.run(collect(client, store, sources, collect_limit=args.collect_limit))
+    return 0
+
+
+def _cmd_chats_dry_run(args: argparse.Namespace) -> int:
+    """Print exactly what the chat lane WOULD add — writes nothing."""
+    load_file_env()
+    paths = resolve_paths()
+    chat_sources = _chat_allowlist(paths)
+    if not chat_sources:
+        _print(
+            {
+                "status": "error",
+                "error": f"no chat sources: {paths.chat_sources_path} is missing or empty",
+            }
+        )
+        return 1
+    store = TelegramDigestStore(paths.db_path)
+    result = asyncio.run(
+        collect_chats(
+            _proxy_client(),
+            store,
+            chat_sources,
+            read_limit=args.chat_read_limit,
+            max_per_run=args.chat_max_per_run,
+            dry_run=True,
+        )
+    )
     _print({"status": "ok", **result})
     return 0
 
@@ -255,9 +335,18 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="python -m src.telegram_aggregator_tool")
     sub = parser.add_subparsers(dest="command", required=True)
 
+    def _add_chat_flags(parser_: argparse.ArgumentParser) -> None:
+        parser_.add_argument("--chat-read-limit", type=int, default=CHAT_READ_LIMIT)
+        parser_.add_argument("--chat-max-per-run", type=int, default=CHAT_MAX_PER_RUN)
+
     p = sub.add_parser("collect")
     p.add_argument("--collect-limit", type=int, default=200)
+    _add_chat_flags(p)
     p.set_defaults(func=_cmd_collect)
+
+    p = sub.add_parser("chats-dry-run")
+    _add_chat_flags(p)
+    p.set_defaults(func=_cmd_chats_dry_run)
 
     p = sub.add_parser("render-input")
     p.add_argument("--window-hours", type=int, default=24)

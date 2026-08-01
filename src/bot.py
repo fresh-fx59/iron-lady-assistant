@@ -11,11 +11,13 @@ import re
 import shutil
 import subprocess
 from uuid import uuid4
+from collections.abc import Awaitable, Callable
 from datetime import datetime, timezone as tz
 from pathlib import Path
+from typing import Any
 from aiogram import Router, F
 from aiogram.filters import Command, CommandObject, CommandStart
-from aiogram.types import Message, CallbackQuery, ErrorEvent
+from aiogram.types import Message, CallbackQuery, ErrorEvent, TelegramObject
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from aiogram.enums import ChatAction
 from aiogram.exceptions import TelegramAPIError, TelegramRetryAfter
@@ -303,6 +305,40 @@ def _should_ignore_passive_message(message: Message) -> bool:
     if not _is_passive_chat(getattr(message.chat, "id", None)):
         return False
     return not _message_explicitly_targets_bot(message)
+
+
+async def passive_chat_gate(
+    handler: Callable[[TelegramObject, dict[str, Any]], Awaitable[Any]],
+    event: TelegramObject,
+    data: dict[str, Any],
+) -> Any:
+    """Drop passive-chat messages that do not explicitly address the bot.
+
+    This is the input gate. It used to be an opt-in check inside individual
+    handlers, and only 4 of the 13 message handlers opted in — so a captioned
+    video in a passive chat ran a full agent turn and streamed its tool calls
+    into the channel (2026-08-01). Enforcing it here means every current
+    handler, every command, and every handler added later is covered by
+    construction rather than by remembering.
+
+    The rule itself is unchanged: silent in a passive chat unless the message
+    @-mentions the bot or replies to it.
+    """
+    if isinstance(event, Message) and _should_ignore_passive_message(event):
+        logger.info(
+            "Passive chat gate: ignoring message chat=%s thread=%s message=%s type=%s",
+            getattr(event.chat, "id", None),
+            getattr(event, "message_thread_id", None),
+            getattr(event, "message_id", None),
+            getattr(event, "content_type", None),
+        )
+        return None
+    return await handler(event, data)
+
+
+router.message.outer_middleware(passive_chat_gate)
+router.channel_post.outer_middleware(passive_chat_gate)
+router.edited_message.outer_middleware(passive_chat_gate)
 
 
 def _scope_key_from_message(message: Message) -> str:

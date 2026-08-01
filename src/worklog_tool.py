@@ -10,8 +10,8 @@ import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from . import config
 from .memory import MemoryManager
+from .memory_paths import resolve_memory_dir
 from .sessions import SessionManager
 
 
@@ -19,7 +19,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="worklog-tool")
     parser.add_argument(
         "--memory-dir",
-        default=str(config.MEMORY_DIR),
+        default=str(resolve_memory_dir()),
         help="Path to memory directory (default: MEMORY_DIR env/config).",
     )
     sub = parser.add_subparsers(dest="command", required=True)

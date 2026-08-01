@@ -7,15 +7,15 @@ import json
 import sys
 from pathlib import Path
 
-from . import config
 from .memory import MemoryManager
+from .memory_paths import resolve_memory_dir
 
 
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="memory-tool")
     parser.add_argument(
         "--memory-dir",
-        default=str(config.MEMORY_DIR),
+        default=str(resolve_memory_dir()),
         help="Path to memory directory (default: MEMORY_DIR env/config).",
     )
     sub = parser.add_subparsers(dest="command", required=True)

@@ -15,6 +15,21 @@ fi
 
 export PYTHONPATH="${REPO_ROOT}${PYTHONPATH:+:${PYTHONPATH}}"
 
+# Falling back to the system python3 is only safe if it actually has the
+# dependencies. Probe up front so a missing dep is an actionable message
+# instead of a bare ModuleNotFoundError traceback from deep inside an import.
+if ! "${PYTHON_BIN}" -c "import yaml" >/dev/null 2>&1; then
+  cat >&2 <<EOF
+ERROR: ${PYTHON_BIN} cannot import 'yaml' — this checkout has no usable venv.
+
+  Fix:  cd ${REPO_ROOT} && python3 -m venv venv && ./venv/bin/pip install -r requirements.txt
+
+(This tool only reads and writes files under memory/ — it needs no bot token,
+ no .env and no network. It just needs the Python dependencies.)
+EOF
+  exit 1
+fi
+
 if [[ $# -gt 0 && "$1" == "--memory-dir" ]]; then
   exec "${PYTHON_BIN}" -m src.memory_tool "$@"
 fi

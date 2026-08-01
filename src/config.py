@@ -4,6 +4,8 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 
+from .memory_paths import resolve_memory_dir
+
 load_dotenv()
 
 VERSION: str = "0.51.48"
@@ -309,10 +311,9 @@ TELEGRAM_DIGEST_WINDOW_HOURS: int = max(1, int(os.getenv("TELEGRAM_DIGEST_WINDOW
 DIGEST_RECIPIENT_NAME: str = os.getenv("DIGEST_RECIPIENT_NAME", "the user").strip() or "the user"
 
 # ── Memory system ─────────────────────────────────────────
-_raw_memory_dir = os.getenv("MEMORY_DIR") or None
-MEMORY_DIR: Path = Path(
-    os.path.expanduser(_raw_memory_dir) if _raw_memory_dir else "memory"
-)
+# Resolution lives in memory_paths so the offline CLIs can reuse it without
+# importing this module (which requires a bot token). One definition, no drift.
+MEMORY_DIR: Path = resolve_memory_dir()
 os.makedirs(MEMORY_DIR, exist_ok=True)
 MONITORING_WATCHDOG_STATE_PATH: Path = Path(
     os.path.expanduser(

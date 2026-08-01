@@ -4,7 +4,7 @@ import argparse
 import sys
 import time
 
-from .config import LIFECYCLE_DB_PATH
+from .memory_paths import resolve_lifecycle_db_path
 from .lifecycle_queue import LifecycleQueueStore
 
 
@@ -45,7 +45,7 @@ def _build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     parser = _build_parser()
     args = parser.parse_args(argv)
-    store = LifecycleQueueStore(LIFECYCLE_DB_PATH)
+    store = LifecycleQueueStore(resolve_lifecycle_db_path())
 
     if args.command == "begin-deploy":
         operation_id = store.begin_deploy(

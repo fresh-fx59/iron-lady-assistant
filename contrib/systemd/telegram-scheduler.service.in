@@ -1,0 +1,17 @@
+[Unit]
+Description=iron-lady scheduler daemon
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=@USER@
+WorkingDirectory=@DIR@
+EnvironmentFile=@ENVFILE@
+Environment=PYTHONUNBUFFERED=1
+ExecStart=@PYTHON@ -m src.scheduler_daemon
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

@@ -77,6 +77,7 @@ async def cb_rollback_confirm(
     clear_errors_fn: Callable[[str], None],
     scope_key_from_message_fn: Callable[[Any], str],
     restart_service_fn: Callable[[int, Any, int | None], Any],
+    bot_service: str,
     thread_id_fn: Callable[[Any], int | None],
 ) -> None:
     if not is_admin(callback.from_user and callback.from_user.id):
@@ -101,7 +102,7 @@ async def cb_rollback_confirm(
 
     clear_errors_fn(scope_key_from_message_fn(callback.message))
     await callback.message.answer(
-        f"Rollback complete: <code>{short_hash}</code>\nRestarting <code>telegram-bot.service</code>...",
+        f"Rollback complete: <code>{short_hash}</code>\nRestarting <code>{bot_service}</code>...",
         parse_mode="HTML",
     )
     asyncio.create_task(

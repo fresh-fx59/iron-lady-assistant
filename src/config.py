@@ -462,3 +462,20 @@ GMAIL_GATEWAY_GOOGLE_CLIENT_SECRET: str = os.getenv(
     "GMAIL_GATEWAY_GOOGLE_CLIENT_SECRET",
     GMAIL_BOOTSTRAP_GOOGLE_CLIENT_SECRET,
 ).strip()
+
+# ── Service topology ──────────────────────────────────────
+# Unit names differ per platform: the operator's NixOS box uses iron-lady-bot,
+# a generic install uses whatever setup.sh wrote. Nothing downstream may
+# hardcode one — `telegram-bot.service` was hardcoded in four call sites and
+# existed nowhere, so self-restart and rollback failed while reporting success.
+# Input gate: a bare name gains the .service suffix here, so no caller guesses.
+def _unit_name(env_var: str, default: str) -> str:
+    raw = (os.getenv(env_var) or "").strip()
+    name = raw or default
+    return name if name.endswith(".service") else f"{name}.service"
+
+
+BOT_SERVICE: str = _unit_name("ILA_BOT_SERVICE", "iron-lady-bot.service")
+SCHEDULER_SERVICE: str = _unit_name("ILA_SCHEDULER_SERVICE", "telegram-scheduler.service")
+GMAIL_SERVICE: str = _unit_name("ILA_GMAIL_SERVICE", "gmail-gateway.service")
+PROXY_SERVICE: str = _unit_name("ILA_PROXY_SERVICE", "telegram-proxy-giedi.service")

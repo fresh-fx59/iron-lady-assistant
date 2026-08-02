@@ -9,6 +9,42 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 
+# ── Non-interactive mode ─────────────────────────────────────────────
+# Every prompt must be satisfiable from the environment, so the installer is
+# testable in a container and reproducible on a rebuild.
+NON_INTERACTIVE=0
+for arg in "$@"; do
+  case "$arg" in
+    --non-interactive) NON_INTERACTIVE=1 ;;
+  esac
+done
+
+# ask VAR "prompt" [default] — reads ILA_SETUP_<VAR> when non-interactive.
+ask() {
+  local __var="$1" __prompt="$2" __default="${3:-}"
+  local __env_name="ILA_SETUP_${__var}"
+  local __env_value="${!__env_name:-}"
+  if [[ "$NON_INTERACTIVE" == "1" ]]; then
+    printf -v "$__var" '%s' "${__env_value:-$__default}"
+    return 0
+  fi
+  if [[ -n "$__env_value" ]]; then
+    printf -v "$__var" '%s' "$__env_value"
+    return 0
+  fi
+  local __reply
+  ask __reply "$__prompt"
+  printf -v "$__var" '%s' "${__reply:-$__default}"
+}
+
+require() {
+  local __var="$1"
+  if [[ -z "${!__var:-}" ]]; then
+    error "ILA_SETUP_${__var} is required in --non-interactive mode."
+    exit 1
+  fi
+}
+
 # ── Colors ───────────────────────────────────────────────────────────
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -32,12 +68,19 @@ if ! command -v python3 &>/dev/null; then
     MISSING+=("python3")
 fi
 
-if ! command -v pip3 &>/dev/null && ! python3 -m pip --version &>/dev/null 2>&1; then
-    MISSING+=("pip (python3-pip)")
+# pip is only needed if this run actually builds the venv.
+if [[ "${ILA_SETUP_SKIP_VENV:-0}" != "1" ]]; then
+    if ! command -v pip3 &>/dev/null && ! python3 -m pip --version &>/dev/null 2>&1; then
+        MISSING+=("pip (python3-pip)")
+    fi
 fi
 
 if ! command -v node &>/dev/null || ! command -v npm &>/dev/null; then
-    MISSING+=("node + npm (Node.js 18+)")
+    if [[ "$NON_INTERACTIVE" == "1" ]]; then
+        warn "node/npm not found — continuing (non-interactive)."
+    else
+        MISSING+=("node + npm (Node.js 18+)")
+    fi
 fi
 
 if [ ${#MISSING[@]} -gt 0 ]; then
@@ -54,12 +97,16 @@ if [ ${#MISSING[@]} -gt 0 ]; then
 fi
 
 success "Python 3 found: $(python3 --version)"
-success "Node found:     $(node --version)"
+command -v node &>/dev/null && success "Node found:     $(node --version)" || true
 
 # ── Codex CLI (primary provider) ─────────────────────────────────────
 header "Codex CLI"
 
-if command -v codex &>/dev/null; then
+# A global npm install is a side effect an unattended run must not perform
+# silently — it mutates state outside this directory. Opt in explicitly.
+if [[ "$NON_INTERACTIVE" == "1" && "${ILA_SETUP_INSTALL_CODEX:-0}" != "1" ]]; then
+    info "Skipping Codex CLI install (set ILA_SETUP_INSTALL_CODEX=1 to enable)."
+elif command -v codex &>/dev/null; then
     success "Codex CLI found: $(codex --version 2>/dev/null || echo 'installed')"
 else
     info "Codex CLI not found. Installing @openai/codex globally..."
@@ -117,7 +164,7 @@ echo "It lets the bot use your ChatGPT Codex subscription over an"
 echo "OpenAI-compatible endpoint on 127.0.0.1:8317, and makes a second"
 echo "codex-proxy provider available for fallback alongside the native CLI."
 echo ""
-read -rp "Install CLIProxyAPI? [y/N]: " INSTALL_CLIPROXYAPI
+ask INSTALL_CLIPROXYAPI "Install CLIProxyAPI? [y/N]: "
 INSTALL_CLIPROXYAPI="${INSTALL_CLIPROXYAPI:-N}"
 
 if [[ "$INSTALL_CLIPROXYAPI" =~ ^[Yy]$ ]]; then
@@ -223,8 +270,9 @@ echo ""
 
 BOT_TOKEN=""
 while [ -z "$BOT_TOKEN" ]; do
-    read -rp "Paste your bot token here: " BOT_TOKEN
+    ask BOT_TOKEN "Paste your bot token here: "
     if [ -z "$BOT_TOKEN" ]; then
+        if [[ "$NON_INTERACTIVE" == "1" ]]; then require BOT_TOKEN; fi
         warn "Token cannot be empty. Please try again."
     fi
 done
@@ -243,8 +291,9 @@ echo ""
 
 USER_IDS=""
 while [ -z "$USER_IDS" ]; do
-    read -rp "Enter your user ID (or multiple IDs separated by commas): " USER_IDS
+    ask USER_IDS "Enter your user ID (or multiple IDs separated by commas): "
     if [ -z "$USER_IDS" ]; then
+        if [[ "$NON_INTERACTIVE" == "1" ]]; then require USER_IDS; fi
         warn "At least one user ID is required, otherwise the bot won't respond to anyone."
     fi
 done
@@ -262,7 +311,7 @@ echo ""
 
 DEFAULT_MODEL=""
 while true; do
-    read -rp "Choose model [sonnet/opus/haiku] (press Enter for sonnet): " DEFAULT_MODEL
+    ask DEFAULT_MODEL "Choose model [sonnet/opus/haiku] (press Enter for sonnet): "
     DEFAULT_MODEL="${DEFAULT_MODEL:-sonnet}"
     if [[ "$DEFAULT_MODEL" =~ ^(sonnet|opus|haiku)$ ]]; then
         break
@@ -274,30 +323,35 @@ success "Default model: $DEFAULT_MODEL"
 # ── Step 4: Optional Settings ────────────────────────────────────────
 header "Step 4 — Optional Settings (press Enter to skip any)"
 
-read -rp "Working directory for Claude (press Enter for none): " WORKING_DIR
+ask WORKING_DIR "Working directory for Claude (press Enter for none): "
 WORKING_DIR="${WORKING_DIR:-}"
 
-read -rp "Response timeout in seconds (press Enter for 300): " TIMEOUT
+ask TIMEOUT "Response timeout in seconds (press Enter for 300): "
 TIMEOUT="${TIMEOUT:-300}"
 
-read -rp "Metrics port (press Enter for 9101): " METRICS_PORT
+ask METRICS_PORT "Metrics port (press Enter for 9101): "
 METRICS_PORT="${METRICS_PORT:-9101}"
 
-read -rp "Browser takeover public base URL (optional, e.g. https://your-host.example/browser-takeover): " BROWSER_TAKEOVER_PUBLIC_BASE_URL
+ask BROWSER_TAKEOVER_PUBLIC_BASE_URL "Browser takeover public base URL (optional, e.g. https://your-host.example/browser-takeover): "
 BROWSER_TAKEOVER_PUBLIC_BASE_URL="${BROWSER_TAKEOVER_PUBLIC_BASE_URL:-}"
 
-read -rp "Run recurring schedules in a separate scheduler service? [y/N]: " EXTERNAL_SCHEDULER
+ask EXTERNAL_SCHEDULER "Run recurring schedules in a separate scheduler service? [y/N]: "
 EXTERNAL_SCHEDULER="${EXTERNAL_SCHEDULER:-N}"
 
 SCHEDULER_NOTIFY_CHAT_ID=""
 SCHEDULER_NOTIFY_THREAD_ID=""
 if [[ "$EXTERNAL_SCHEDULER" =~ ^[Yy]$ ]]; then
     info "The polling bot will keep /schedule_* commands, and a standalone daemon will execute due runs."
-    read -rp "Optional scheduler notification chat ID (press Enter to skip): " SCHEDULER_NOTIFY_CHAT_ID
+    ask SCHEDULER_NOTIFY_CHAT_ID "Optional scheduler notification chat ID (press Enter to skip): "
     SCHEDULER_NOTIFY_CHAT_ID="${SCHEDULER_NOTIFY_CHAT_ID:-}"
-    read -rp "Optional scheduler notification topic/thread ID (press Enter to skip): " SCHEDULER_NOTIFY_THREAD_ID
+    ask SCHEDULER_NOTIFY_THREAD_ID "Optional scheduler notification topic/thread ID (press Enter to skip): "
     SCHEDULER_NOTIFY_THREAD_ID="${SCHEDULER_NOTIFY_THREAD_ID:-}"
 fi
+
+# ── Service topology ─────────────────────────────────────────────────
+# These land in .env so src/config.py and the installed units agree on one name.
+ask BOT_SERVICE       "systemd unit name for the bot (Enter for iron-lady-bot.service): " "iron-lady-bot.service"
+ask SCHEDULER_SERVICE "systemd unit name for the scheduler (Enter for telegram-scheduler.service): " "telegram-scheduler.service"
 
 # ── Write .env file ──────────────────────────────────────────────────
 header "Writing configuration"
@@ -321,21 +375,61 @@ BROWSER_TAKEOVER_PUBLIC_BASE_URL=$BROWSER_TAKEOVER_PUBLIC_BASE_URL
 EMBEDDED_SCHEDULER_ENABLED=$([[ "$EXTERNAL_SCHEDULER" =~ ^[Yy]$ ]] && echo 0 || echo 1)
 SCHEDULER_NOTIFY_CHAT_ID=$SCHEDULER_NOTIFY_CHAT_ID
 SCHEDULER_NOTIFY_THREAD_ID=$SCHEDULER_NOTIFY_THREAD_ID
+ILA_BOT_SERVICE=$BOT_SERVICE
+ILA_SCHEDULER_SERVICE=$SCHEDULER_SERVICE
 EOF
 
 success ".env file created."
 
+
+# ── System packages ──────────────────────────────────────────────────
+# The bot shells out to these; they were previously assumed present, which is
+# why it only ever ran where nix had already provided them.
+SYSTEM_PACKAGES_APT="ffmpeg tesseract-ocr espeak-ng git ripgrep nodejs"
+SYSTEM_PACKAGES_DNF="ffmpeg tesseract espeak-ng git ripgrep nodejs"
+SYSTEM_PACKAGES_PACMAN="ffmpeg tesseract espeak-ng git ripgrep nodejs"
+
+detect_distro() {
+  if [[ -n "${ILA_SETUP_FORCE_DISTRO:-}" ]]; then echo "${ILA_SETUP_FORCE_DISTRO}"; return; fi
+  if [[ -r /etc/os-release ]]; then . /etc/os-release; echo "${ID_LIKE:-$ID}"; return; fi
+  echo "unknown"
+}
+
+install_system_packages() {
+  if [[ "${ILA_SETUP_SKIP_DEPS:-0}" == "1" ]]; then
+    info "Skipping system packages (ILA_SETUP_SKIP_DEPS=1)."
+    return 0
+  fi
+  local distro; distro="$(detect_distro)"
+  case "$distro" in
+    *debian*|*ubuntu*) sudo apt-get update && sudo apt-get install -y $SYSTEM_PACKAGES_APT ;;
+    *rhel*|*fedora*)   sudo dnf install -y $SYSTEM_PACKAGES_DNF ;;
+    *arch*)            sudo pacman -Sy --noconfirm $SYSTEM_PACKAGES_PACMAN ;;
+    *)
+      # Not fatal: print the list and continue. Do not stop a user who can read.
+      warn "Unrecognised distribution '$distro'. Install these yourself, then re-run:"
+      echo "  $SYSTEM_PACKAGES_APT"
+      ;;
+  esac
+}
+
+header "System packages"
+install_system_packages
+
 # ── Set up Python virtual environment ────────────────────────────────
 header "Installing dependencies"
 
-if [ ! -d "venv" ]; then
-    info "Creating Python virtual environment..."
-    python3 -m venv venv
+if [[ "${ILA_SETUP_SKIP_VENV:-0}" == "1" ]]; then
+    info "Skipping venv creation (ILA_SETUP_SKIP_VENV=1)."
+else
+    if [ ! -d "venv" ]; then
+        info "Creating Python virtual environment..."
+        python3 -m venv venv
+    fi
+    info "Installing Python packages..."
+    venv/bin/pip install --quiet -r requirements.txt
+    success "Dependencies installed."
 fi
-
-info "Installing Python packages..."
-venv/bin/pip install --quiet -r requirements.txt
-success "Dependencies installed."
 
 # ── Optionally install as system service ─────────────────────────────
 header "Auto-start on boot (optional)"
@@ -344,69 +438,30 @@ echo "Would you like the bot to start automatically when your server boots?"
 echo "This uses systemd and requires sudo. If you enabled the external scheduler,"
 echo "setup.sh will install both the bot service and the scheduler daemon service."
 echo ""
-read -rp "Set up auto-start? [y/N]: " INSTALL_SERVICE
+ask INSTALL_SERVICE "Set up auto-start? [y/N]: "
+
+if [[ "${ILA_SETUP_SKIP_SYSTEMD:-0}" == "1" ]] || ! command -v systemctl >/dev/null 2>&1; then
+    info "systemd not available — skipping unit installation."
+    info "Run the bot with:  $SCRIPT_DIR/venv/bin/python -m src.main"
+    INSTALL_SERVICE="n"
+fi
 
 if [[ "$INSTALL_SERVICE" =~ ^[Yy]$ ]]; then
-    SERVICE_USER="$(whoami)"
-    BOT_SERVICE_FILE="$SCRIPT_DIR/telegram-bot.service"
-    SCHEDULER_SERVICE_FILE="$SCRIPT_DIR/telegram-scheduler.service"
+    SERVICE_USER="$(id -un)"
+    # Units come from contrib/systemd templates, shared with the NixOS example,
+    # so the two platforms cannot drift into different topologies.
+    render_unit() {
+        python3 contrib/systemd/render.py "contrib/systemd/$1" \
+            --user "$SERVICE_USER" --dir "$SCRIPT_DIR" \
+            --python "$SCRIPT_DIR/venv/bin/python" --envfile "$SCRIPT_DIR/.env"
+    }
 
-    # Generate a service file with correct paths.
-    cat > "$BOT_SERVICE_FILE" << SVCEOF
-[Unit]
-Description=Telegram Claude Code Bot
-After=network-online.target
-Wants=network-online.target
-
-[Service]
-Type=simple
-User=$SERVICE_USER
-WorkingDirectory=$SCRIPT_DIR
-ExecStart=$SCRIPT_DIR/run.sh
-Restart=always
-RestartSec=5
-EnvironmentFile=$SCRIPT_DIR/.env
-Environment=PATH=$HOME/.npm-$SERVICE_USER/bin:$HOME/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
-
-# Hardening
-NoNewPrivileges=true
-ProtectSystem=strict
-ReadWritePaths=$HOME
-PrivateTmp=true
-
-[Install]
-WantedBy=multi-user.target
-SVCEOF
-
-    sudo cp "$BOT_SERVICE_FILE" /etc/systemd/system/telegram-bot.service
+    render_unit iron-lady-bot.service.in | sudo tee "/etc/systemd/system/$BOT_SERVICE" > /dev/null
+    success "Installed $BOT_SERVICE"
 
     if [[ "$EXTERNAL_SCHEDULER" =~ ^[Yy]$ ]]; then
-        cat > "$SCHEDULER_SERVICE_FILE" << SCHSVCEOF
-[Unit]
-Description=Iron Lady Assistant Scheduler Daemon
-After=network-online.target
-Wants=network-online.target
-
-[Service]
-Type=simple
-User=$SERVICE_USER
-WorkingDirectory=$SCRIPT_DIR
-ExecStart=$SCRIPT_DIR/venv/bin/python3 -m src.scheduler_daemon
-Restart=always
-RestartSec=5
-EnvironmentFile=$SCRIPT_DIR/.env
-Environment=PATH=$HOME/.npm-$SERVICE_USER/bin:$HOME/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
-
-NoNewPrivileges=true
-ProtectSystem=strict
-ReadWritePaths=$HOME
-PrivateTmp=true
-
-[Install]
-WantedBy=multi-user.target
-SCHSVCEOF
-
-        sudo cp "$SCHEDULER_SERVICE_FILE" /etc/systemd/system/telegram-scheduler.service
+        render_unit telegram-scheduler.service.in | sudo tee "/etc/systemd/system/$SCHEDULER_SERVICE" > /dev/null
+        success "Installed $SCHEDULER_SERVICE"
     fi
 
     if [[ "$INSTALL_CLIPROXYAPI" =~ ^[Yy]$ ]] && [ -x "$SCRIPT_DIR/third_party/cli-proxy-api/cli-proxy-api" ]; then

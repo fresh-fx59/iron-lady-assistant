@@ -22,7 +22,7 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 from aiogram.enums import ChatAction
 from aiogram.exceptions import TelegramAPIError, TelegramRetryAfter
 
-from . import bridge, config, metrics, transcribe
+from . import bridge, config, metrics, service_control, transcribe
 from .core.context_plugins import ContextPluginRegistry
 from .sessions import ChatSession, SessionManager
 from .formatter import markdown_to_html, split_message, strip_html
@@ -1040,17 +1040,8 @@ async def _show_rollback_options(chat_id: int, bot, message_thread_id: int | Non
 
 async def _restart_service(chat_id: int, bot, message_thread_id: int | None = None) -> None:
     await asyncio.sleep(1)
-    proc = await asyncio.create_subprocess_exec(
-        "sudo",
-        "systemctl",
-        "restart",
-        "telegram-bot.service",
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-    )
-    _, stderr = await proc.communicate()
-    if proc.returncode != 0:
-        err = (stderr or b"").decode().strip() or f"exit code {proc.returncode}"
+    ok, err = await service_control.restart_unit(config.BOT_SERVICE)
+    if not ok:
         await bot.send_message(
             chat_id,
             f"Rollback completed, but restart failed: {err[:500]}",
@@ -1615,6 +1606,7 @@ async def cb_rollback_confirm(callback: CallbackQuery) -> None:
         clear_errors_fn=_clear_errors,
         scope_key_from_message_fn=_scope_key_from_message,
         restart_service_fn=_restart_service,
+        bot_service=config.BOT_SERVICE,
         thread_id_fn=_thread_id,
     )
 

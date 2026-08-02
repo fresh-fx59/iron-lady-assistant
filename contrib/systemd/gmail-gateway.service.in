@@ -1,0 +1,17 @@
+[Unit]
+Description=iron-lady gmail gateway
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=@USER@
+WorkingDirectory=@DIR@
+EnvironmentFile=@ENVFILE@
+Environment=PYTHONUNBUFFERED=1
+ExecStart=@PYTHON@ -m src.gmail_gateway.http --host 127.0.0.1 --port 8791 --db-path memory/gmail_gateway.db
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

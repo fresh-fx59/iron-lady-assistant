@@ -19,6 +19,7 @@ from zoneinfo import ZoneInfo
 
 from aiogram import Bot
 
+from . import config
 from .provider_errors import is_stale_codex_session_error
 from .tasks import BackgroundTask, TaskManager, TaskNotificationMode
 
@@ -1590,7 +1591,7 @@ class ScheduleManager:
         if not ({"scrape_up", "series_presence", "f08_series_presence"} & check_names):
             return []
         return [
-            ("telegram-bot.service status", ["systemctl", "status", "telegram-bot.service", "--no-pager"]),
+            (f"{config.BOT_SERVICE} status", ["systemctl", "status", config.BOT_SERVICE, "--no-pager"]),
             (
                 "metrics endpoint presence",
                 [
@@ -1599,7 +1600,7 @@ class ScheduleManager:
                     "curl -fsS http://127.0.0.1:9101/metrics | rg -n 'telegrambot_messages_total|telegrambot_f08_governance_events_total' || true",
                 ],
             ),
-            ("telegram-bot.service journal", ["journalctl", "-u", "telegram-bot.service", "-n", "40", "--no-pager"]),
+            (f"{config.BOT_SERVICE} journal", ["journalctl", "-u", config.BOT_SERVICE, "-n", "40", "--no-pager"]),
         ]
 
     @staticmethod
@@ -1613,7 +1614,7 @@ class ScheduleManager:
             if isinstance(item, dict) and str(item.get("status")) in {"warn", "critical"}
         }
         if {"scrape_up", "series_presence", "f08_series_presence"} & check_names:
-            return ["systemctl", "restart", "telegram-bot.service"]
+            return ["systemctl", "restart", config.BOT_SERVICE]
         return None
 
     @staticmethod

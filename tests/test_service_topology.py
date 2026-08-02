@@ -66,6 +66,10 @@ def test_the_dead_literal_is_gone_from_src() -> None:
     for path in sorted(SRC_ROOT.rglob("*.py")):
         text = path.read_text(encoding="utf-8")
         for line_no, line in enumerate(text.splitlines(), start=1):
+            # A comment naming the dead unit is documentation, not a call. Only
+            # code can restart the wrong thing.
+            if line.strip().startswith("#"):
+                continue
             if "telegram-bot.service" in line:
                 offenders.append(f"{path.relative_to(SRC_ROOT.parent)}:{line_no}: {line.strip()}")
     assert not offenders, (

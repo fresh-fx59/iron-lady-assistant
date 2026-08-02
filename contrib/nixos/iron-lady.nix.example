@@ -1,0 +1,300 @@
+# Example NixOS module for iron-lady-assistant.
+#
+# This mirrors a working deployment with every site-specific value replaced by a
+# placeholder. Replace `your-host`, `myaccount`, `/path/to/your/vault`, the
+# `yourservice_*` sops key names and the `000000000` IDs before use.
+#
+# Generic (non-NixOS) installs do not need this file — run `bash setup.sh`.
+
+# iron-lady-assistant: telegram-proxy + scheduler + gmail-gateway, run from the
+# deployed source with a nixpkgs python env. A render-env oneshot writes the 0600
+# /run/iron-lady/env (host config + tokens from sops) BEFORE the app services
+# load it as EnvironmentFile. The telegram-proxy's Fernet key is delivered via
+# systemd LoadCredential. (codex_proxy does not exist in this source revision;
+# claude-code-as-assistant is handled separately.)
+{ config, lib, pkgs, ... }:
+let
+  dir = "/var/lib/iron-lady";
+  pyEnv = pkgs.python312.withPackages (ps: with ps; [
+    aiogram aiohttp pyyaml watchdog python-dotenv cryptography prometheus-client telethon edge-tts
+  ]);
+  tools = [ pkgs.espeak-ng pkgs.ffmpeg pkgs.tesseract ];
+  # obsidian-cli pinned to v0.2.3 — the last release whose binary is `obsidian-cli`
+  # with set-default/print-default/search-content (v0.3.x renamed it to notesmd-cli
+  # and changed the verbs); matches the bot's tools/obsidian.yaml verbatim.
+  obsidian-cli = pkgs.buildGoModule rec {
+    pname = "obsidian-cli";
+    version = "0.2.3";
+    src = pkgs.fetchFromGitHub {
+      owner = "Yakitrak";
+      repo = "obsidian-cli";
+      rev = "v${version}";
+      hash = "sha256-zVl7dBOl9UAIclAV7dx5WQes9w9PY7iS9pkby/8oaHM=";
+    };
+    vendorHash = null; # deps are vendored in-tree
+  };
+  # CLIs the assistant bot shells out to per message (providers spawn `claude`/`codex`,
+  # which need node + git + ripgrep at runtime; the agent also drives `obsidian-cli`).
+  # claude-code/codex are unfree (allowed in base.nix). The bot reaches LinkAPI directly
+  # (Anthropic-compatible) — no cliproxyapi.
+  cliTools = [ pkgs.claude-code pkgs.codex pkgs.nodejs pkgs.git pkgs.ripgrep obsidian-cli ];
+  # Standard shell environment for Claude Code's Bash tool — NixOS has no populated
+  # /usr/bin or /bin, and the provider only prepends those, so without these the agent
+  # has no cat/grep/sed/awk/find/bash to operate the vault or run shell commands.
+  shellTools = [
+    pkgs.bashInteractive pkgs.coreutils-full pkgs.gnugrep pkgs.gnused pkgs.gawk
+    pkgs.findutils pkgs.curl pkgs.which pkgs.jq pkgs.gnutar pkgs.gzip pkgs.less
+  ];
+  tokenEnv = {
+    TELEGRAM_BOT_TOKEN = "yourservice_telegram_bot_token";
+    GEMINI_API_KEY = "yourservice_gemini_api_key";
+    OPENAI_API_KEY = "yourservice_openai_api_key";
+    CODEX_PROXY_API_KEY = "yourservice_codex_proxy_api_key";
+    TELEGRAM_PROXY_API_KEY = "yourservice_telegram_proxy_api_key";
+    # LinkAPI key for the claude/codex subprocess (providers.json references ${LINKAPI_API_KEY}).
+    LINKAPI_API_KEY = "yourservice_linkapi_key";
+  };
+  renderEnv = pkgs.writeShellScript "iron-lady-render-env" ''
+    set -eu
+    install -d -m700 -o iron-lady -g iron-lady /run/iron-lady
+    {
+      cat ${dir}/env.config
+      ${lib.concatStringsSep "\n" (lib.mapAttrsToList
+        (envk: sk: ''echo "${envk}=$(cat /run/secrets/${sk})"'') tokenEnv)}
+      # override stale paths from the captured env.config (later key wins in EnvironmentFile)
+      echo "CLAUDE_WORKING_DIR=${dir}/work-dir"
+      # codex CLI -> local cliproxyapi broker auth. Render the broker's OWN api-key
+      # (decrypted by the co-located cliproxyapi module) so codex's env_key can never
+      # drift from what the broker checks. ~/.codex/config.toml references this name.
+      echo "CODEX_BROKER_API_KEY=$(cat /run/secrets/yourservice_broker_api_key)"
+    } > /run/iron-lady/env
+    chown iron-lady:iron-lady /run/iron-lady/env
+    chmod 600 /run/iron-lady/env
+    # Per-account telegram-proxy env (one file per parser account): its OWN encrypted
+    # blob + port + lock, kept OUT of the shared env so accounts stay isolated. Add a
+    # block per account (+ its yourservice_tgproxy_<name> sops key + a telegram-proxy-<name>
+    # service). Account identity is thus decoupled from the service.
+    {
+      echo "TELEGRAM_PROXY_ENCRYPTED_CREDENTIALS=$(cat /run/secrets/yourservice_tgproxy_myaccount)"
+      echo "TELEGRAM_PROXY_BIND_PORT=8787"
+      echo "TELEGRAM_PROXY_LOCK_PATH=/run/iron-lady/telegram_proxy_myaccount.lock"
+    } > /run/iron-lady/tgproxy-myaccount.env
+    chown iron-lady:iron-lady /run/iron-lady/tgproxy-myaccount.env
+    chmod 600 /run/iron-lady/tgproxy-myaccount.env
+  '';
+  # The ONE Obsidian vault: the syncthing-managed copy. The bot used to own a second,
+  # unsynced copy at ${dir}/obsidian/DefaultObsidianVault — so every note it wrote was
+  # invisible to the operator's Mac and phone (and it never saw notes they wrote after
+  # 2026-06-08). We bind-mount the synced vault onto that same path, so the bot's vault
+  # path is unchanged (obsidian-cli registry, tool doc, and any stale reference keep
+  # working) but the bytes are the ones syncthing replicates. See syncthing.nix.
+  vaultPath = "${dir}/obsidian/DefaultObsidianVault";
+  syncedVault = "/path/to/your/vault";
+  # Register the vault with obsidian-cli so the bot's obsidian tool
+  # (print-default/search-content/move/...) resolves it. obsidian-cli reads the Obsidian
+  # desktop registry (~/.config/obsidian/obsidian.json); on this headless box we write a
+  # minimal one.
+  obsidianSetup = pkgs.writeShellScript "iron-lady-obsidian-setup" ''
+    set -eu
+    V=${vaultPath}
+    [ -d "$V" ] || { echo "obsidian vault not present at $V (restore it); skipping"; exit 0; }
+    install -d -m700 ${dir}/.config/obsidian
+    printf '{"vaults":{"vault0001":{"path":"%s","ts":1700000000000,"open":true}}}' "$V" > ${dir}/.config/obsidian/obsidian.json
+    ${obsidian-cli}/bin/obsidian-cli set-default "DefaultObsidianVault" || true
+    # Registry is written first (the bot keeps working either way) — THEN assert the
+    # bind mount. Without it the bot would silently write to the old unsynced copy
+    # underneath, which is exactly the bug this mount exists to prevent. Fail loudly.
+    if ! ${pkgs.util-linux}/bin/findmnt --mountpoint "$V" >/dev/null; then
+      echo "FATAL: $V is NOT the syncthing bind mount — bot notes will NOT sync to the Mac." >&2
+      echo "       expected source: ${syncedVault}" >&2
+      exit 1
+    fi
+    echo "vault OK: $V is bind-mounted from ${syncedVault}"
+  '';
+  # Make the synced vault writable by the bot: group `syncthing`, setgid dirs so new
+  # files inherit the group, group-write on both. Paired with UMask=0002 on the bot and
+  # on syncthing, and ignorePerms on the folder so syncthing doesn't reset these modes.
+  # Scoped to the vault subtree ONLY — must never touch the 0600 KeePass DBs alongside it.
+  vaultPerms = pkgs.writeShellScript "iron-lady-vault-perms" ''
+    set -eu
+    V=${syncedVault}
+    [ -d "$V" ] || { echo "synced vault not present at $V — skipping"; exit 0; }
+    ${pkgs.coreutils}/bin/chgrp -R syncthing "$V"
+    ${pkgs.findutils}/bin/find "$V" -type d -exec ${pkgs.coreutils}/bin/chmod 2775 {} +
+    ${pkgs.findutils}/bin/find "$V" -type f -exec ${pkgs.coreutils}/bin/chmod 0664 {} +
+  '';
+  base = {
+    User = "iron-lady";
+    Group = "iron-lady";
+    WorkingDirectory = dir;
+    EnvironmentFile = "/run/iron-lady/env";
+    Environment = [ "PATH=${pyEnv}/bin:${lib.makeBinPath tools}" "PYTHONUNBUFFERED=1" "HOME=${dir}" ];
+    Restart = "on-failure";
+    RestartSec = 5;
+    # notes the bot writes into the shared vault must stay group-writable so syncthing
+    # (and a later bot run) can rewrite them — see the vault sharing in syncthing.nix.
+    UMask = "0002";
+  };
+  appAfter = [ "iron-lady-env.service" "network-online.target" ];
+in
+{
+  # `syncthing` is a supplementary group so the bot can read+write the shared Obsidian
+  # vault (group-owned by syncthing, setgid + group-writable — see vaultPerms).
+  users.users.iron-lady = {
+    isSystemUser = true; group = "iron-lady"; home = dir; createHome = true;
+    extraGroups = [ "syncthing" ];
+  };
+  users.groups.iron-lady = { };
+
+  # Bind the syncthing-managed vault over the bot's vault path. Deliberately a
+  # systemd.mount (wantedBy multi-user.target) and NOT a fileSystems entry: a bind whose
+  # source went missing must never fail local-fs.target and strand this box in emergency
+  # mode — it's remote, and the tailnet is the only way in. If the mount is absent,
+  # iron-lady-obsidian.service fails loudly instead (RequiresMountsFor below).
+  systemd.mounts = [{
+    what = syncedVault;
+    where = vaultPath;
+    type = "none";
+    options = "bind";
+    wantedBy = [ "multi-user.target" ];
+  }];
+
+  # make the synced vault group-writable for the bot before it is registered/used
+  systemd.services.iron-lady-vault-perms = {
+    description = "share the synced Obsidian vault with the iron-lady bot (group syncthing)";
+    wantedBy = [ "multi-user.target" ];
+    before = [ "iron-lady-obsidian.service" ];
+    serviceConfig = { Type = "oneshot"; RemainAfterExit = true; ExecStart = vaultPerms; };
+  };
+
+  # Claude Code subprocess working directory (env.config's path was server-specific).
+  # Plus: pin the bot's app config (obsidian tool doc + providers.json) to nix-managed
+  # versions via L+ symlinks, so the out-of-band source deploy can't drift them.
+  systemd.tmpfiles.rules = [
+    "d ${dir}/work-dir 0750 iron-lady iron-lady -"
+    "L+ ${dir}/tools/obsidian.yaml - - - - ${./iron-lady-files/obsidian.yaml}"
+    "L+ ${dir}/providers.json - - - - ${./iron-lady-files/providers.json}"
+    # Route the `codex` CLI subprocess through the local cliproxyapi broker. codex only
+    # reads model_provider/model_providers from the user-level ~/.codex/config.toml, so
+    # the provider can't be set via providers.json env — pin it here like providers.json.
+    "d ${dir}/.codex 0750 iron-lady iron-lady -"
+    "L+ ${dir}/.codex/config.toml - - - - ${./iron-lady-files/codex-config.toml}"
+  ];
+
+  sops.secrets = lib.listToAttrs (map
+    (sk: { name = sk; value = { sopsFile = ../../secrets/il.yaml; key = sk; }; })
+    (lib.attrValues tokenEnv ++ [ "yourservice_telegram_proxy_key" "yourservice_tgproxy_myaccount" ]));
+
+  # render the runtime EnvironmentFile BEFORE the app units load it
+  systemd.services.iron-lady-env = {
+    description = "render iron-lady runtime env from sops";
+    wantedBy = [ "multi-user.target" ];
+    serviceConfig = { Type = "oneshot"; RemainAfterExit = true; ExecStart = renderEnv; };
+  };
+
+  # configure obsidian-cli's default vault for the assistant bot's obsidian tool
+  systemd.services.iron-lady-obsidian = {
+    description = "register the Obsidian vault with obsidian-cli (iron-lady bot)";
+    wantedBy = [ "multi-user.target" ];
+    after = [ "iron-lady-vault-perms.service" ];
+    # pull in + require the vault bind mount; this unit is the loud alarm if it's missing
+    unitConfig.RequiresMountsFor = vaultPath;
+    serviceConfig = {
+      Type = "oneshot";
+      RemainAfterExit = true;
+      User = "iron-lady";
+      Group = "iron-lady";
+      Environment = [ "HOME=${dir}" ];
+      ExecStart = obsidianSetup;
+    };
+  };
+
+  # Per-account telegram read proxy — one service per parser account, so the account
+  # identity is DECOUPLED from the service. Each reads its OWN sops blob + port + lock via
+  # a per-account env file (rendered by renderEnv). To add an account: (1) sops key
+  # yourservice_tgproxy_<name>, (2) a render block in renderEnv, (3) copy this service (new
+  # name + a distinct port). needs an authorized Telethon session (see
+  # references/telegram-parser-enrollment-runbook.md); stops crash-looping after a few tries.
+  systemd.services.telegram-proxy-myaccount = {
+    description = "iron-lady telegram proxy (account: myaccount)";
+    after = appAfter;
+    requires = [ "iron-lady-env.service" ];
+    wants = [ "network-online.target" ];
+    wantedBy = [ "multi-user.target" ];
+    unitConfig = { StartLimitIntervalSec = 120; StartLimitBurst = 3; };
+    serviceConfig = base // {
+      # per-account env (blob + port + lock) loaded LAST so it wins over the shared env
+      EnvironmentFile = [ "/run/iron-lady/env" "/run/iron-lady/tgproxy-myaccount.env" ];
+      ExecStart = "${pyEnv}/bin/python -m src.telegram_proxy";
+      LoadCredential = [ "telegram_proxy_key:${config.sops.secrets.yourservice_telegram_proxy_key.path}" ];
+    };
+  };
+  systemd.services.telegram-scheduler = {
+    description = "iron-lady scheduler daemon";
+    after = appAfter ++ [ "telegram-proxy-myaccount.service" ];
+    requires = [ "iron-lady-env.service" ];
+    wantedBy = [ "multi-user.target" ];
+    serviceConfig = base // { ExecStart = "${pyEnv}/bin/python -m src.scheduler_daemon"; };
+  };
+  systemd.services.gmail-gateway = {
+    description = "iron-lady gmail gateway";
+    after = appAfter;
+    requires = [ "iron-lady-env.service" ];
+    wantedBy = [ "multi-user.target" ];
+    serviceConfig = base // {
+      ExecStart = "${pyEnv}/bin/python -m src.gmail_gateway.http --host 127.0.0.1 --port 8791 --db-path memory/gmail_gateway.db";
+    };
+  };
+
+  # Lead-finder ingestion: periodically read @myaccount_reader's JOINED lead groups (role='lead')
+  # into the digest store via the proxy's HTTP API (one-session-safe — no 2nd Telethon
+  # client). `collect --role lead` first syncs joined groups from telegram_join.db into
+  # digest_sources, then reads only role='lead' sources incrementally (never the legacy
+  # digest sources). Reading is near-zero ban risk; the timer is paced at 30m. The
+  # one-time role-column migration was run manually before enabling this (avoids a
+  # first-run lock race). Feeds the (next) tiered lead scorer.
+  systemd.services.telegram-lead-collect = {
+    description = "collect @myaccount_reader joined lead-group messages into the digest store";
+    after = appAfter ++ [ "telegram-proxy-myaccount.service" ];
+    wants = [ "telegram-proxy-myaccount.service" ];
+    serviceConfig = {
+      Type = "oneshot";
+      User = "iron-lady";
+      Group = "iron-lady";
+      WorkingDirectory = dir;
+      EnvironmentFile = "/run/iron-lady/env";     # TELEGRAM_PROXY_API_KEY + config (no per-account blob needed)
+      Environment = [ "PATH=${pyEnv}/bin:${lib.makeBinPath tools}" "PYTHONUNBUFFERED=1" "HOME=${dir}" ];
+      ExecStart = "${pyEnv}/bin/python -m src.telegram_digest_tool collect --role lead";
+      TimeoutStartSec = "10m";
+    };
+  };
+  systemd.timers.telegram-lead-collect = {
+    wantedBy = [ "timers.target" ];
+    timerConfig = {
+      OnBootSec = "10m";
+      OnUnitActiveSec = "30m";
+      AccuracySec = "2m";
+      Persistent = true;
+    };
+  };
+
+  # The MAIN iron-lady assistant bot (aiogram). Per inbound message it spawns a
+  # `claude`/`codex` CLI subprocess (providers.json) that talks to LinkAPI directly.
+  # Needs the CLIs on PATH; reaches the LLM with no cliproxyapi dependency.
+  systemd.services.iron-lady-bot = {
+    description = "iron-lady assistant Telegram bot (Claude Code via LinkAPI)";
+    after = appAfter ++ [ "iron-lady-obsidian.service" ];
+    requires = [ "iron-lady-env.service" ];
+    wants = [ "network-online.target" ];
+    wantedBy = [ "multi-user.target" ];
+    serviceConfig = base // {
+      ExecStart = "${pyEnv}/bin/python -m src.main";
+      # PATH = python + provider CLIs + a full shell toolset (for Claude Code's Bash tool)
+      Environment = [
+        "PATH=${pyEnv}/bin:${lib.makeBinPath (cliTools ++ shellTools ++ tools)}"
+        "PYTHONUNBUFFERED=1"
+        "HOME=${dir}"
+      ];
+    };
+  };
+}

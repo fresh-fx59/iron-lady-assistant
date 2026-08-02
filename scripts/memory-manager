@@ -5,28 +5,45 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 MEMORY_DIR_DEFAULT="${REPO_ROOT}/memory"
 
-if [[ -x "${REPO_ROOT}/venv/bin/python3" ]]; then
-  PYTHON_BIN="${REPO_ROOT}/venv/bin/python3"
-elif [[ -x "${REPO_ROOT}/venv/bin/python" ]]; then
-  PYTHON_BIN="${REPO_ROOT}/venv/bin/python"
-else
-  PYTHON_BIN="$(command -v python3)"
-fi
-
 export PYTHONPATH="${REPO_ROOT}${PYTHONPATH:+:${PYTHONPATH}}"
 
-# Falling back to the system python3 is only safe if it actually has the
-# dependencies. Probe up front so a missing dep is an actionable message
-# instead of a bare ModuleNotFoundError traceback from deep inside an import.
-if ! "${PYTHON_BIN}" -c "import yaml" >/dev/null 2>&1; then
-  cat >&2 <<EOF
-ERROR: ${PYTHON_BIN} cannot import 'yaml' — this checkout has no usable venv.
+# Pick the first interpreter that can ACTUALLY import the dependencies, rather
+# than the first one that merely exists. A deployment without a venv (the box
+# runs the bot from a Nix python env) used to fall through to the bare system
+# python3 and die with `ModuleNotFoundError: No module named 'yaml'` — an
+# interpreter-selection failure wearing a dependency error's clothes.
+#
+# Order: explicit override, repo venv, everything named python3/python on PATH.
+CANDIDATES=()
+[[ -n "${ILA_PYTHON:-}" ]] && CANDIDATES+=("${ILA_PYTHON}")
+CANDIDATES+=("${REPO_ROOT}/venv/bin/python3" "${REPO_ROOT}/venv/bin/python")
+while IFS= read -r found; do
+  [[ -n "$found" ]] && CANDIDATES+=("$found")
+done < <(type -aP python3 python 2>/dev/null || true)
 
-  Fix:  cd ${REPO_ROOT} && python3 -m venv venv && ./venv/bin/pip install -r requirements.txt
+PYTHON_BIN=""
+for candidate in "${CANDIDATES[@]}"; do
+  [[ -x "$candidate" ]] || continue
+  if "$candidate" -c "import yaml" >/dev/null 2>&1; then
+    PYTHON_BIN="$candidate"
+    break
+  fi
+done
 
-(This tool only reads and writes files under memory/ — it needs no bot token,
- no .env and no network. It just needs the Python dependencies.)
-EOF
+if [[ -z "${PYTHON_BIN}" ]]; then
+  {
+    echo "ERROR: no Python interpreter here can import 'yaml'. Tried:"
+    for candidate in "${CANDIDATES[@]}"; do
+      if [[ -x "$candidate" ]]; then echo "  - $candidate (missing deps)"
+      else echo "  - $candidate (not executable)"; fi
+    done
+    echo
+    echo "  Fix:  cd ${REPO_ROOT} && python3 -m venv venv && ./venv/bin/pip install -r requirements.txt"
+    echo "  Or:   set ILA_PYTHON to an interpreter that already has them."
+    echo
+    echo "(This tool only reads and writes files under memory/ — it needs no bot"
+    echo " token, no .env and no network. It just needs the Python dependencies.)"
+  } >&2
   exit 1
 fi
 

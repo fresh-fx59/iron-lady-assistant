@@ -9,10 +9,13 @@ Covers the five load-bearing properties of the chat lane:
 """
 from __future__ import annotations
 
-from datetime import datetime
+import re
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 from src.telegram_aggregator import (
     AGG_ROLE,
+    CHAT_DEDUP_WINDOW_HOURS,
     CHAT_KIND,
     CHAT_MAX_PER_RUN,
     CHAT_MIN_CHARS,
@@ -70,6 +73,18 @@ class FakeProxyClient:
         return [m for m in newest_first if m["message_id"] > min_id][:limit]
 
 
+
+def _recent(hours_ago: float = 1.0) -> str:
+    """A timestamp comfortably inside CHAT_DEDUP_WINDOW_HOURS (72h).
+
+    These seed defaults used to be absolute (`2026-07-30T09:00:00+00:00`), so
+    the tests silently expired: that post left the 72h dedup window at 09:00 on
+    2026-08-02 and two tests started failing with no code change. Seed relative
+    to now — the window is what is under test, not a particular calendar day.
+    """
+    return (datetime.now(timezone.utc) - timedelta(hours=hours_ago)).isoformat()
+
+
 def _cmsg(
     mid,
     text=LONG,
@@ -81,7 +96,7 @@ def _cmsg(
     reply_top=None,
     via_bot=None,
     action=None,
-    posted="2026-07-30T10:00:00+00:00",
+    posted=None,
     link=None,
 ):
     body = text + (" https://example.com/post" if url else "")
@@ -106,7 +121,7 @@ def _cmsg(
         raw["action"] = action
     return {
         "message_id": mid,
-        "posted_at": posted,
+        "posted_at": posted or _recent(),
         "sender_id": 500 + mid,
         "views": None,
         "forwards": None,
@@ -310,7 +325,8 @@ async def test_collect_chats_advances_the_cursor_past_everything_seen(tmp_path):
 
 
 # ── 4. dedup against the channel corpus ───────────────────────────
-def _seed_channel_post(store, entity_id, username, mid, text, posted="2026-07-30T09:00:00+00:00"):
+def _seed_channel_post(store, entity_id, username, mid, text, posted=None):
+    posted = posted or _recent(hours_ago=2)
     peer_key = f"channel:{entity_id}"
     store.upsert_source(
         peer_key=peer_key, entity_id=entity_id, title=username, username=username,
@@ -618,3 +634,62 @@ async def test_a_failed_chat_still_gets_a_named_report_entry(tmp_path):
     # and a chat we could not read leaves NO source row behind (the upsert now runs
     # after a successful read), so digest_sources means "chats we actually read"
     assert store.list_sources(roles=(AGG_ROLE,)) == []
+
+
+# ── 7. the dedup window itself, and the time bomb that hid it ─────
+
+
+async def test_chat_echo_inside_the_dedup_window_is_dropped(tmp_path):
+    """The in-window case, seeded relative to now so it cannot expire."""
+    store = TelegramDigestStore(tmp_path / "agg.db")
+    echoed = LONG + " https://example.com/post"
+    _seed_channel_post(store, 10, "hyperllm", 5, echoed, posted=_recent(hours_ago=1))
+    chat_id = 3850100303
+    channels = [FakeChannel(10, "hyperllm", linked_chat_id=chat_id, linked_chat_username="hyper_llm")]
+    client = FakeProxyClient(channels, {chat_id: [_cmsg(1)]})
+    result = await collect_chats(
+        client, store, [ChatSource("username", "hyper_llm")], channels=channels
+    )
+    assert result["collected_messages"] == 0
+    assert result["chats"][0]["rejected"]["duplicate-text"] == 1
+
+
+async def test_chat_echo_outside_the_dedup_window_is_kept(tmp_path):
+    """The other half of the contract, never previously asserted.
+
+    A channel post older than CHAT_DEDUP_WINDOW_HOURS no longer suppresses an
+    echo. This is intended — and it is exactly what the expired seed was
+    accidentally exercising while the test still claimed to test dedup.
+    """
+    store = TelegramDigestStore(tmp_path / "agg.db")
+    echoed = LONG + " https://example.com/post"
+    stale = _recent(hours_ago=CHAT_DEDUP_WINDOW_HOURS + 6)
+    _seed_channel_post(store, 10, "hyperllm", 5, echoed, posted=stale)
+    chat_id = 3850100303
+    channels = [FakeChannel(10, "hyperllm", linked_chat_id=chat_id, linked_chat_username="hyper_llm")]
+    client = FakeProxyClient(channels, {chat_id: [_cmsg(1)]})
+    result = await collect_chats(
+        client, store, [ChatSource("username", "hyper_llm")], channels=channels
+    )
+    assert result["collected_messages"] == 1
+    assert result["chats"][0]["rejected"].get("duplicate-text", 0) == 0
+
+
+def test_no_absolute_date_is_used_as_a_seed_default():
+    """Recurrence guard for the whole class, not just the two dates.
+
+    An absolute seed date is a time bomb: it passes until real time drifts past
+    the window, then fails with no code change and no obvious cause.
+    """
+    source = Path(__file__).read_text(encoding="utf-8")
+    offenders = []
+    for line_no, line in enumerate(source.splitlines(), start=1):
+        stripped = line.strip()
+        if stripped.startswith("#") or stripped.startswith('"""'):
+            continue
+        if re.search(r'posted(_at)?\s*=\s*["\']20\d\d-', line):
+            offenders.append(f"{line_no}: {stripped}")
+    assert not offenders, (
+        "absolute date used as a seed default — use _recent() instead:\n  "
+        + "\n  ".join(offenders)
+    )

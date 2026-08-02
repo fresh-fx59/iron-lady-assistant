@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from typing import Any, Callable
 
 from ..provider_errors import is_provider_api_error
+from ..redact import redact_env
 
 
 @dataclass
@@ -141,7 +142,7 @@ async def run_provider_execution_loop(
                 scope_key,
                 provider.name,
                 provider.cli,
-                {k: v for k, v in env.items() if k.startswith("ANTHROPIC_")},
+                redact_env({k: v for k, v in env.items() if k.startswith("ANTHROPIC_")}),
             )
             resume_state_store.record_start(
                 scope_key=scope_key,

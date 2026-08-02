@@ -1,4 +1,4 @@
-aiogram>=3.25
+aiogram>=3.22,<4
 python-dotenv
 prometheus-client
 pyyaml

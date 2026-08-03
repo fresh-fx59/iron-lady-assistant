@@ -1,6 +1,9 @@
 name: memory-manager
 description: Structured management of persistent memory facts (list/upsert/delete/reclassify) without ad-hoc shell parsing.
 tier: core
+# Resolved to an absolute path against the deployment root and substituted into
+# `{{wrapper}}` below, so the agent never expands a path itself.
+wrapper: scripts/memory-manager
 triggers:
 - memory
 - remember
@@ -27,8 +30,8 @@ instructions: |
     `Do NOT update memory on every message — only when you learn something new.`
     `</memory_instructions>`
 
-  Command:
-  - `bash -lc '"${ILA_REPO_ROOT:-$HOME/iron-lady-assistant}"/scripts/memory-manager <subcommand> [flags]'`
+  Command (absolute path, run it exactly as written — do not rewrite it):
+  - `{{wrapper}} <subcommand> [flags]`
 
   Subcommands:
   - `list --type <fact_type> --min-confidence 0.6 [--include-deleted]`
@@ -48,4 +51,4 @@ instructions: |
   5. Confirm with `list`
   6. Only write memory when new durable user information is learned; skip routine turns
 
-setup: 'Ensure wrapper is available: bash -lc ''"${ILA_REPO_ROOT:-$HOME/iron-lady-assistant}"/scripts/memory-manager --help'''
+setup: 'Ensure wrapper is available: {{wrapper}} --help'

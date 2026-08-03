@@ -32,13 +32,13 @@ def _stub_repo(tmp_path: Path) -> Path:
 
 
 def _broken_python_dir(tmp_path: Path) -> Path:
-    """A PATH entry whose `python3` exists but cannot import yaml."""
+    """A PATH entry whose `python3` exists but cannot import the tool."""
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
     fake = bin_dir / "python3"
     fake.write_text(
         "#!/usr/bin/env bash\n"
-        'if [[ "$*" == *"import yaml"* ]]; then\n'
+        'if [[ "$*" == *"import src.memory_tool"* ]]; then\n'
         '  echo "ModuleNotFoundError: No module named \'yaml\'" >&2\n'
         "  exit 1\n"
         "fi\n"
@@ -81,19 +81,48 @@ def test_skips_path_python_that_lacks_deps(tmp_path: Path) -> None:
     assert result.stdout.strip().startswith("[")
 
 
+def test_a_bare_stdlib_python_is_enough(tmp_path: Path) -> None:
+    """The box's scenario: no venv, no ILA_PYTHON, just the system python3.
+
+    `src.memory_tool` is stdlib-only now (PyYAML moved behind the legacy-profile
+    migration), so the interpreter that every NixOS box already has must run it.
+    """
+    repo = _stub_repo(tmp_path)
+    env = _base_env()
+    env.pop("ILA_PYTHON", None)
+    system_python = shutil.which("python3", path="/run/current-system/sw/bin:/usr/bin:/bin")
+    if not system_python:
+        pytest.skip("no system python3 outside the test environment")
+    env["PATH"] = f"{Path(system_python).parent}:{Path(shutil.which('bash') or '/bin/bash').parent}"
+
+    result = _run(repo, env)
+    assert result.returncode == 0, (
+        f"a bare system python3 could not run the tool.\n"
+        f"stdout: {result.stdout}\nstderr: {result.stderr}"
+    )
+    assert result.stdout.strip().startswith("[")
+
+
 def test_reports_every_candidate_when_none_work(tmp_path: Path) -> None:
     """With no usable interpreter anywhere, say so and name what was tried."""
     repo = _stub_repo(tmp_path)
     env = _base_env()
-    # Keep bash reachable (the wrapper's shebang needs it) but drop every
-    # directory that might hold an interpreter with the deps installed.
-    bash_dir = Path(shutil.which("bash") or "/bin/bash").parent
-    env["PATH"] = f"{_broken_python_dir(tmp_path)}:{bash_dir}"
+    env.pop("ILA_PYTHON", None)
+    # PATH holds exactly one directory: a broken python3 plus the bash the
+    # wrapper's shebang needs. Nothing else may supply a working interpreter.
+    only_dir = _broken_python_dir(tmp_path)
+    for utility in ("bash", "dirname", "tail"):
+        found = shutil.which(utility)
+        assert found, f"{utility} is required to run the wrapper at all"
+        (only_dir / utility).symlink_to(found)
+    env["PATH"] = str(only_dir)
 
     result = _run(repo, env)
     assert result.returncode == 1
-    assert "no Python interpreter here can import 'yaml'" in result.stderr
-    assert "missing deps" in result.stderr
+    assert "no Python interpreter here can import 'src.memory_tool'" in result.stderr
+    # Each candidate is listed with the interpreter's OWN reason, so the reader
+    # sees which dependency is actually missing instead of a generic verdict.
+    assert "No module named 'yaml'" in result.stderr
     assert "python3 -m venv venv" in result.stderr
     # It must not have leaked a raw traceback instead.
     assert "Traceback" not in result.stderr

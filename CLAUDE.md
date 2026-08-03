@@ -469,7 +469,10 @@ Use the memory-manager tool to list/upsert/delete/reclassify facts.
 - `MEMORY_DIR` env var (default: `memory/` relative to working directory)
 - Facts use schema: `key`, `value`, `type`, `confidence`, `source`, `updated`, `status`, `deleted_at`
 - Supported fact types: `identity`, `preference`, `workflow`, `infrastructure`, `communication`, `project`, `operation`, `tooling`, `schedule`, `misc`
-- Optional CLI for structured edits: `bash -lc '"${ILA_REPO_ROOT:-$HOME/iron-lady-assistant}"/scripts/memory-manager list|upsert|delete|reclassify'`
+- Optional CLI for structured edits: `<deployment root>/scripts/memory-manager list|upsert|delete|reclassify`
+  (the agent is handed the resolved absolute path — `tools/memory-manager.yaml` declares
+  `wrapper: scripts/memory-manager` and the tool registry substitutes `{{wrapper}}`; it needs
+  no venv, no bot token and no third-party packages)
 - `upsert --mode append|replace` controls add-vs-replace behavior; `delete` performs soft-delete
 - Facts with confidence < 0.6 are stored but not injected into context
 - Episode search returns top 5 FTS5 matches, falls back to most recent if no keyword match
@@ -489,11 +492,22 @@ Tools are defined as YAML files in `tools/` directory with this structure:
 name: web_search
 description: Search the web for current information
 triggers: [search, google, find online, latest news, current events]
+wrapper: scripts/websearch  # Optional: path to the tool's executable, relative
+                            # to the deployment root (the parent of tools/)
 instructions: |
-  You have a web search tool. Run: websearch "query"
+  You have a web search tool. Run: {{wrapper}} "query"
   Returns JSON with title, url, snippet fields.
 setup: tools/bin/websearch  # Optional: path to executable
 ```
+
+**Never write a path the agent has to expand.** When a manifest declares `wrapper:`,
+`ToolRegistry` resolves it against the deployment root and replaces every `{{wrapper}}`
+in `instructions` and `setup` with that absolute path; a wrapper that is missing or
+not executable is logged at ERROR when the tool loads. This exists because
+`memory-manager` shipped `"${ILA_REPO_ROOT:-$HOME/iron-lady-assistant}"/scripts/...`,
+which expands to nothing real on the box (`HOME=/var/lib/iron-lady`, app deployed at
+`$HOME`), and since memory-manager is always active the dead command went into every
+turn from 2026-03-23 with no structured fact written after 2026-06-05.
 
 ### How it works
 

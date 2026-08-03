@@ -19,6 +19,7 @@ Tools are YAML files in {TOOLS_DIR}/*.yaml with this structure:
 from __future__ import annotations
 
 import logging
+import os
 import re
 from dataclasses import dataclass
 from pathlib import Path
@@ -29,6 +30,9 @@ import yaml
 logger = logging.getLogger(__name__)
 _USE_TOOL_PATTERN = re.compile(r"^\s*USE_TOOL:\s*([A-Za-z0-9_.-]+)\s*$", re.IGNORECASE | re.MULTILINE)
 _ALWAYS_ACTIVE_TOOL_NAMES = ("memory-manager",)
+#: Manifests write this in `instructions`/`setup`; the registry replaces it with
+#: the absolute path of the tool's `wrapper:`. See `_resolve_wrapper`.
+_WRAPPER_PLACEHOLDER = "{{wrapper}}"
 ToolTier = Literal["core", "extended"]
 
 
@@ -50,6 +54,7 @@ class ToolDefinition:
     manifest: ToolManifest
     instructions: str
     setup_script: str | None
+    wrapper_path: Path | None = None
 
 
 class ToolRegistry:
@@ -65,6 +70,10 @@ class ToolRegistry:
         require_approval_for_risky: bool = False,
     ) -> None:
         self._dir = tools_dir
+        # tools/ sits at the deployment root, so its parent IS the root — on the
+        # box that is /var/lib/iron-lady, in a checkout it is the repo. Wrappers
+        # resolve against this and never against $HOME or a guessed repo name.
+        self._root = Path(tools_dir).expanduser().resolve().parent
         self._manifests: list[ToolManifest] = []
         self._manifest_files: dict[str, Path] = {}
         self._cache: dict[str, ToolDefinition] = {}
@@ -76,6 +85,40 @@ class ToolRegistry:
     def _normalize_tier(raw_tier: object) -> ToolTier:
         tier = str(raw_tier or "extended").strip().lower()
         return "core" if tier == "core" else "extended"
+
+    def _resolve_wrapper(self, name: str, raw: object) -> Path | None:
+        """Turn a manifest's `wrapper:` into an absolute path, loudly.
+
+        A manifest must not make the agent expand a path itself: the old
+        `"${ILA_REPO_ROOT:-$HOME/iron-lady-assistant}"/scripts/memory-manager`
+        resolved to a directory that does not exist on the box, and because
+        memory-manager is always active the dead command was injected into
+        every turn for months with nothing to catch it. Resolve here, and if
+        the target is missing or not executable say so at ERROR — an unusable
+        tool command is a defect, not a debug detail.
+        """
+        if raw in (None, ""):
+            return None
+        candidate = Path(str(raw)).expanduser()
+        if not candidate.is_absolute():
+            candidate = self._root / candidate
+        if not candidate.exists():
+            logger.error(
+                "Tool %s declares wrapper %r, but %s does not exist — its documented "
+                "command cannot run. Deploy the wrapper or fix the manifest.",
+                name,
+                str(raw),
+                candidate,
+            )
+        elif not os.access(candidate, os.X_OK):
+            logger.error(
+                "Tool %s wrapper %r resolves to %s, which is not executable — its "
+                "documented command cannot run.",
+                name,
+                str(raw),
+                candidate,
+            )
+        return candidate
 
     def _load_manifests(self) -> None:
         """Scan YAML files, extract only manifest fields (Phase 1)."""
@@ -129,10 +172,18 @@ class ToolRegistry:
                 tier=self._normalize_tier(data.get("tier")),
                 risky=bool(data.get("risky", False)),
             )
+            wrapper_path = self._resolve_wrapper(manifest.name, data.get("wrapper"))
+            instructions = data.get("instructions", "")
+            setup_script = data.get("setup")
+            if wrapper_path is not None:
+                instructions = instructions.replace(_WRAPPER_PLACEHOLDER, str(wrapper_path))
+                if setup_script:
+                    setup_script = setup_script.replace(_WRAPPER_PLACEHOLDER, str(wrapper_path))
             definition = ToolDefinition(
                 manifest=manifest,
-                instructions=data.get("instructions", ""),
-                setup_script=data.get("setup"),
+                instructions=instructions,
+                setup_script=setup_script,
+                wrapper_path=wrapper_path,
             )
             self._cache[name] = definition
             logger.debug("Loaded full definition for tool: %s", name)

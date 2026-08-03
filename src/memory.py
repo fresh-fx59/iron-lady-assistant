@@ -14,8 +14,6 @@ import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
 
-import yaml
-
 logger = logging.getLogger(__name__)
 
 # ── Stop words for keyword extraction ────────────────────────
@@ -438,6 +436,20 @@ class MemoryManager:
 
     def _migrate_legacy_profile_yaml(self) -> None:
         if not self._legacy_profile_path.exists():
+            return
+        # PyYAML is imported here, not at module scope: facts are SQL-only and
+        # this one-shot migration is the last thing that needs YAML. A
+        # module-scope import made a third-party dependency gate all of memory,
+        # and on a deployment without it `memory-manager` died with
+        # `ModuleNotFoundError: yaml` before touching a single row.
+        try:
+            import yaml
+        except ImportError:
+            logger.warning(
+                "PyYAML is not installed, so %s cannot be migrated. SQL memory is "
+                "unaffected; install pyyaml to import the legacy profile.",
+                self._legacy_profile_path,
+            )
             return
         try:
             raw = yaml.safe_load(self._legacy_profile_path.read_text(encoding="utf-8")) or {}

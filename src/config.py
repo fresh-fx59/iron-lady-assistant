@@ -8,7 +8,7 @@ from .memory_paths import resolve_memory_dir
 
 load_dotenv()
 
-VERSION: str = "0.51.48"
+VERSION: str = "0.51.49"
 
 # ── Bot token (required) ────────────────────────────────────
 BOT_TOKEN: str = os.getenv("TELEGRAM_BOT_TOKEN", "")

@@ -7,11 +7,16 @@ MEMORY_DIR_DEFAULT="${REPO_ROOT}/memory"
 
 export PYTHONPATH="${REPO_ROOT}${PYTHONPATH:+:${PYTHONPATH}}"
 
-# Pick the first interpreter that can ACTUALLY import the dependencies, rather
-# than the first one that merely exists. A deployment without a venv (the box
-# runs the bot from a Nix python env) used to fall through to the bare system
-# python3 and die with `ModuleNotFoundError: No module named 'yaml'` — an
+# Pick the first interpreter that can ACTUALLY run the tool, rather than the
+# first one that merely exists. A deployment without a venv (the box runs the
+# bot from a Nix python env) used to fall through to the bare system python3
+# and die with `ModuleNotFoundError: No module named 'yaml'` — an
 # interpreter-selection failure wearing a dependency error's clothes.
+#
+# The probe is the real import, not a proxy for it: probing one named
+# dependency goes stale the moment the imports change (yaml left this path in
+# `src/memory.py`, and a yaml probe would then reject an interpreter that works
+# perfectly well).
 #
 # Order: explicit override, repo venv, everything named python3/python on PATH.
 CANDIDATES=()
@@ -24,7 +29,7 @@ done < <(type -aP python3 python 2>/dev/null || true)
 PYTHON_BIN=""
 for candidate in "${CANDIDATES[@]}"; do
   [[ -x "$candidate" ]] || continue
-  if "$candidate" -c "import yaml" >/dev/null 2>&1; then
+  if "$candidate" -c "import src.memory_tool" >/dev/null 2>&1; then
     PYTHON_BIN="$candidate"
     break
   fi
@@ -32,14 +37,20 @@ done
 
 if [[ -z "${PYTHON_BIN}" ]]; then
   {
-    echo "ERROR: no Python interpreter here can import 'yaml'. Tried:"
+    echo "ERROR: no Python interpreter here can import 'src.memory_tool'. Tried:"
     for candidate in "${CANDIDATES[@]}"; do
-      if [[ -x "$candidate" ]]; then echo "  - $candidate (missing deps)"
-      else echo "  - $candidate (not executable)"; fi
+      if [[ -x "$candidate" ]]; then
+        # `|| true`: the probe is expected to fail here, and `set -e` would
+        # otherwise abort the loop before printing the diagnosis it exists for.
+        reason="$("$candidate" -c "import src.memory_tool" 2>&1 | tail -1 || true)"
+        echo "  - $candidate (${reason:-import failed})"
+      else
+        echo "  - $candidate (not executable)"
+      fi
     done
     echo
     echo "  Fix:  cd ${REPO_ROOT} && python3 -m venv venv && ./venv/bin/pip install -r requirements.txt"
-    echo "  Or:   set ILA_PYTHON to an interpreter that already has them."
+    echo "  Or:   set ILA_PYTHON to an interpreter that can import it."
     echo
     echo "(This tool only reads and writes files under memory/ — it needs no bot"
     echo " token, no .env and no network. It just needs the Python dependencies.)"

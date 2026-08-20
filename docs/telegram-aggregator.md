@@ -27,7 +27,8 @@ sources.txt ──► collect ──► render-input ──► draft (LLM) ─�
    store (its own DB file, role `aggregator`).
 2. **Render input** — select candidate posts (deduped by normalized text, ordered
    by views, must have a real `t.me` link and enough text) into a `*-input.json`.
-3. **Draft** — a token-less `claude -p` call runs the `/aggregator-digest` skill,
+3. **Draft** — the shared headless-agent runner invokes the configured subscription
+   provider and runs the `aggregator-digest` skill,
    which writes a **strict JSON** draft: the 3–6 most important stories of the day,
    each with a headline, a summary in the reader's own words, and source links.
 4. **Gate** — deterministic validation of the draft (schema, link-exists,
@@ -345,9 +346,10 @@ stage, and pings the alert bot only on failure. A **separate** scheduled
 publishing on independent schedules so a slow draft never blocks the publish
 window.
 
-The draft step calls `claude -p` against the local `/aggregator-digest` skill
-without an API token (it uses the interactive session's auth), so drafting costs
-nothing beyond the existing subscription.
+The draft step calls the shared headless-agent runner against the local
+`aggregator-digest` skill. The configured Claude Code or Codex CLI uses its interactive
+subscription auth, so drafting needs no metered API token. Provider, model, effort,
+sandbox, working directory, timeout, state directory, and artifact path are explicit.
 
 ---
 
@@ -360,4 +362,4 @@ nothing beyond the existing subscription.
 | `src/telegram_aggregator_publish.py` | Rendering, message splitting, Bot API transport, the 2-phase ledger. |
 | `src/telegram_aggregator_tool.py` | The CLI (`collect`, `render-input`, `gate`, `approve`, `publish`, `status`). |
 | `scripts/aggregator_draft_runner.sh` | Daily draft runner (collect → draft → gate → auto-approve). |
-| `.claude/skills/aggregator-digest/SKILL.md` | The LLM drafting instructions. |
+| `.claude/skills/aggregator-digest/SKILL.md` | Shared drafting instructions; Codex discovers the same tree through `.agents/skills`. |

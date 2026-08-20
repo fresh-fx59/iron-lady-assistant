@@ -1,11 +1,7 @@
 #!/usr/bin/env bash
-# aggregator_draft_runner.sh — daily digest draft via token-less claude -p.
-# Invocation contract (same as drift_triage_runner.sh — must never regress):
-#  - plain `claude -p`, NEVER --bare (--bare bills the API instead of Max OAuth);
-#  - env -u both token vars so nothing shadows the OAuth session;
-#  - --dangerously-skip-permissions (headless; output is gated by code anyway);
-#  - cwd = this repo so the /aggregator-digest skill resolves;
-#  - 9>&- so no claude descendant inherits the run lock.
+# aggregator_draft_runner.sh — daily digest through the shared headless-agent runner.
+# Prompts travel on stdin. Each call must create its own fresh non-empty artifact;
+# only then is it promoted and passed to the existing domain gate.
 set -euo pipefail
 
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -17,10 +13,27 @@ export AGGREGATOR_STATE_DIR="$STATE_DIR"
 LOG_DIR="$STATE_DIR/logs"
 PY="$REPO_DIR/venv/bin/python"
 TODAY="$(date -u +%F)"
+HEADLESS_AGENT_RUNNER="${HEADLESS_AGENT_RUNNER:-/home/claude-developer/personal-os/tools/headless-agent-runner/headless_agent_runner.py}"
+HEADLESS_AGENT_PROVIDER="${HEADLESS_AGENT_PROVIDER:-claude}"
+HEADLESS_AGENT_MODEL="${HEADLESS_AGENT_MODEL:-claude-sonnet-5}"
+HEADLESS_AGENT_EFFORT="${HEADLESS_AGENT_EFFORT:-medium}"
+HEADLESS_AGENT_SANDBOX="${HEADLESS_AGENT_SANDBOX:-workspace-write}"
+HEADLESS_AGENT_CODEX_BIN="${HEADLESS_AGENT_CODEX_BIN:-codex}"
+HEADLESS_AGENT_CLAUDE_BIN="${HEADLESS_AGENT_CLAUDE_BIN:-claude}"
 mkdir -p "$LOG_DIR"
 
 exec 9>"$STATE_DIR/draft-runner.lock"
 flock -n 9 || { echo "another draft run is active; exiting"; exit 0; }
+
+notify_stage_failure() {
+  local stage="$1" rc="$2"
+  echo "stage '$stage' failed (rc=$rc)" >>"$LOG_DIR/$TODAY-runner.log"
+  AGGREGATOR_FAILED_STAGE="$stage" "$PY" - <<'EOF' || true
+import os
+from src.telegram_aggregator_publish import notify_operator
+notify_operator(f"❌ Дайджест: сбой на этапе {os.environ['AGGREGATOR_FAILED_STAGE']} — см. логи")
+EOF
+}
 
 # Deploy step. When AGGREGATOR_DEPLOY_REF is set (a reviewed commit SHA or tag),
 # check that EXACT ref out instead of advancing to whatever is newest on
@@ -30,8 +43,14 @@ flock -n 9 || { echo "another draft run is active; exiting"; exit 0; }
 # reviewed; the pin keeps the DEPLOY chosen rather than automatic. Unset = the
 # original `pull --ff-only` behavior, so this is a no-op until the ref is set.
 if [ -n "${AGGREGATOR_DEPLOY_REF:-}" ]; then
-  git -C "$REPO_DIR" fetch --quiet origin 2>>"$LOG_DIR/$TODAY-runner.log" || true
-  git -C "$REPO_DIR" checkout --quiet --force "$AGGREGATOR_DEPLOY_REF" 2>>"$LOG_DIR/$TODAY-runner.log" || true
+  git -C "$REPO_DIR" fetch --quiet origin 2>>"$LOG_DIR/$TODAY-runner.log" ||
+    echo "warning: fetch failed; trying locally available deploy ref" >>"$LOG_DIR/$TODAY-runner.log"
+  git -C "$REPO_DIR" checkout --quiet --force "$AGGREGATOR_DEPLOY_REF" \
+    2>>"$LOG_DIR/$TODAY-runner.log" || {
+      rc=$?
+      notify_stage_failure "deploy-checkout" "$rc"
+      exit "$rc"
+    }
 else
   git -C "$REPO_DIR" pull --ff-only 2>>"$LOG_DIR/$TODAY-runner.log" || true
 fi
@@ -51,15 +70,6 @@ FEEDBACK="$STATE_DIR/drafts/$TODAY-gate-errors.json"
 # ping (that was the "no digest today, no one told me" gap). Toggle -e off
 # around the call so the real exit code survives into $rc (negating via
 # `if ! cmd` loses the original code), log it, notify, then exit 1 ourselves.
-notify_stage_failure() {
-  local stage="$1" rc="$2"
-  echo "stage '$stage' failed (rc=$rc)" >>"$LOG_DIR/$TODAY-runner.log"
-  "$PY" - <<'EOF'
-from src.telegram_aggregator_publish import notify_operator
-notify_operator("❌ Дайджест: сбой на этапе render-input/draft — см. логи")
-EOF
-}
-
 set +e
 "$PY" -m src.telegram_aggregator_tool render-input --out "$INPUT" >>"$LOG_DIR/$TODAY-runner.log" 2>&1
 rc=$?
@@ -67,14 +77,46 @@ set -e
 [ "$rc" -eq 0 ] || { notify_stage_failure "render-input" "$rc"; exit 1; }
 
 run_draft() {
-  local extra="${1:-}"
-  env -u ANTHROPIC_API_KEY -u CLAUDE_CODE_OAUTH_TOKEN \
-    claude -p "/aggregator-digest $INPUT $DRAFT $extra" \
-    --model claude-sonnet-5 \
-    --output-format json \
-    --dangerously-skip-permissions \
-    >"$LOG_DIR/$TODAY-claude.json" \
-    2>"$LOG_DIR/$TODAY-claude-stderr.log" 9>&-
+  local attempt_no="$1"
+  local extra="${2:-}"
+  local attempt="$STATE_DIR/drafts/$TODAY-attempt-$$-$attempt_no.json"
+  local prompt
+
+  if [[ -e "$attempt" ]]; then
+    echo "draft attempt path already exists: $attempt" >>"$LOG_DIR/$TODAY-runner.log"
+    return 64
+  fi
+
+  if [[ "$HEADLESS_AGENT_PROVIDER" == "claude" ]]; then
+    prompt="/aggregator-digest $INPUT $attempt $extra"
+  else
+    prompt="Use \$aggregator-digest. Arguments: $INPUT $attempt $extra"
+  fi
+  printf '%s\n' "$prompt" |
+    env -u ANTHROPIC_API_KEY -u CLAUDE_CODE_OAUTH_TOKEN \
+      "$HEADLESS_AGENT_RUNNER" \
+      --provider "$HEADLESS_AGENT_PROVIDER" \
+      --cwd "$REPO_DIR" \
+      --model "$HEADLESS_AGENT_MODEL" \
+      --effort "$HEADLESS_AGENT_EFFORT" \
+      --sandbox "$HEADLESS_AGENT_SANDBOX" \
+      --timeout 5400 \
+      --add-dir "$STATE_DIR" \
+      --require-artifact "$attempt" \
+      --codex-bin "$HEADLESS_AGENT_CODEX_BIN" \
+      --claude-bin "$HEADLESS_AGENT_CLAUDE_BIN" \
+      >"$LOG_DIR/$TODAY-agent-$attempt_no.out" \
+      2>"$LOG_DIR/$TODAY-agent-$attempt_no.err" 9>&-
+  local rc=$?
+  [[ "$rc" -eq 0 ]] || return "$rc"
+
+  if [[ ! -f "$attempt" || ! -s "$attempt" ]]; then
+    echo "draft attempt $attempt_no exited 0 without a fresh non-empty artifact" \
+      >>"$LOG_DIR/$TODAY-runner.log"
+    return 65
+  fi
+
+  mv -f -- "$attempt" "$DRAFT"
 }
 
 # set -euo pipefail + `tee` inside a function used in an `if !` condition is
@@ -89,17 +131,27 @@ gate() {
     | tee "$STATE_DIR/drafts/$TODAY-gate.json"
 }
 
+attempt_no=1
 set +e
-run_draft
+run_draft "$attempt_no"
 rc=$?
 set -e
-[ "$rc" -eq 0 ] || { notify_stage_failure "draft" "$rc"; exit 1; }
+if [[ "$rc" -ne 0 ]]; then
+  echo "draft attempt 1 failed (rc=$rc); one retry" >>"$LOG_DIR/$TODAY-runner.log"
+  attempt_no=2
+  set +e
+  run_draft "$attempt_no"
+  rc=$?
+  set -e
+  [[ "$rc" -eq 0 ]] || { notify_stage_failure "draft-regen" "$rc"; exit 1; }
+fi
 
 if ! gate; then
   cp "$STATE_DIR/drafts/$TODAY-gate.json" "$FEEDBACK" 2>/dev/null || true
   echo "gate failed; one regen with feedback" >>"$LOG_DIR/$TODAY-runner.log"
+  attempt_no=$((attempt_no + 1))
   set +e
-  run_draft "$FEEDBACK"
+  run_draft "$attempt_no" "$FEEDBACK"
   rc=$?
   set -e
   [ "$rc" -eq 0 ] || { notify_stage_failure "draft-regen" "$rc"; exit 1; }
